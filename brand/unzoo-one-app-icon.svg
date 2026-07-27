@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One app icon</title>
+  <desc id="desc">Unzoo One core mark on an obsidian app tile.</desc>
+  <defs>
+    <linearGradient id="tile" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#181C26"/>
+      <stop offset="1" stop-color="#080A0F"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="56" y1="204" x2="198" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#63E6FF"/>
+      <stop offset=".5" stop-color="#6C8CFF"/>
+      <stop offset="1" stop-color="#9B6BFF"/>
+    </linearGradient>
+    <radialGradient id="halo">
+      <stop stop-color="#778DFF" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#778DFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="60" fill="url(#tile)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="59.5" fill="none" stroke="#FFFFFF" stroke-opacity=".1"/>
+  <circle cx="128" cy="131" r="59" fill="url(#halo)"/>
+  <path d="M67 67v65c0 39.5 25.8 66 61 66s61-26.5 61-66V67"
+        fill="none" stroke="url(#signal)" stroke-width="18"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M108 132c0-12 8.8-20 20-20 13.5 0 24 8 24 20s-10.5 20-24 20c-7.5 0-14-2.5-18-6.8"
+        fill="none" stroke="url(#signal)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="128" cy="132" r="7.5" fill="#F7F8FA"/>
+  <circle cx="128" cy="132" r="4" fill="#6F86FF"/>
+</svg>

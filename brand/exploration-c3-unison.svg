@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unison monogram</title>
+  <desc id="desc">An open vessel converges with a distinct one-shaped action pillar.</desc>
+  <path d="M58 54v82c0 47 27 77 68 77 34 0 57-21 65-55"
+        fill="none" stroke="#111318" stroke-width="29"
+        stroke-linecap="round"/>
+  <path d="m158 86 37-34h13v108h-32V94l-18 15z" fill="#111318"/>
+</svg>

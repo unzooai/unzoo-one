@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One Flow mark — optical small</title>
+  <desc id="desc">A simplified and optically strengthened Flow mark for 16 to 24 pixels.</desc>
+  <path d="M14 13v19c0 13 7 21 18 21s18-8 18-21V12L39 23"
+        fill="none" stroke="#6B70F6" stroke-width="8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

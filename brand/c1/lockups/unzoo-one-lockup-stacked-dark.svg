@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 420" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One stacked lockup — dark</title>
+  <desc id="desc">The Flow mark above the Unzoo One wordmark.</desc>
+  <path d="M135 62v82c0 53 30 87 75 87s75-34 75-87V56l-42 40"
+        fill="none" stroke="#111318" stroke-width="29"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="210" y="326" text-anchor="middle" fill="#111318"
+        font-family="Inter, Segoe UI, Arial, sans-serif"
+        font-size="54" font-weight="600" letter-spacing="-3">unzoo one</text>
+</svg>

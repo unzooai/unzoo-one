@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 190" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One lockup with tagline</title>
+  <desc id="desc">The Flow mark, wordmark, and One intent. Every capability. tagline.</desc>
+  <path d="M38 36v42c0 28 15 46 38 46s38-18 38-46V33L93 53"
+        fill="none" stroke="#111318" stroke-width="15"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="146" y="91" fill="#111318"
+        font-family="Inter, Segoe UI, Arial, sans-serif"
+        font-size="58" font-weight="600" letter-spacing="-3">unzoo one</text>
+  <text x="147" y="137" fill="#727987"
+        font-family="Inter, Segoe UI, Arial, sans-serif"
+        font-size="22" font-weight="450" letter-spacing="0">One intent. Every capability.</text>
+</svg>

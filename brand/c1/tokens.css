@@ -1,0 +1,66 @@
+:root {
+  /* Core identity */
+  --unzoo-one-obsidian: #080a0f;
+  --unzoo-one-ink: #111318;
+  --unzoo-one-porcelain: #f7f8fa;
+  --unzoo-one-signal: #6b70f6;
+  --unzoo-one-aqua: #5fe1ff;
+  --unzoo-one-cobalt: #657ff7;
+  --unzoo-one-iris: #926bfa;
+  --unzoo-one-signal-gradient: linear-gradient(135deg, #5fe1ff 0%, #657ff7 52%, #926bfa 100%);
+
+  /* Supporting neutrals */
+  --unzoo-one-surface-1: #0d1017;
+  --unzoo-one-surface-2: #141823;
+  --unzoo-one-surface-3: #1a1f2b;
+  --unzoo-one-surface-float: #202532;
+  --unzoo-one-border: rgba(255, 255, 255, 0.09);
+  --unzoo-one-border-strong: rgba(255, 255, 255, 0.15);
+  --unzoo-one-text-primary: #f7f8fa;
+  --unzoo-one-text-secondary: #a8afbd;
+  --unzoo-one-text-tertiary: #7f8797;
+  --unzoo-one-text-disabled: #555d6d;
+
+  /* Product semantics */
+  --unzoo-one-success: #4cdaa0;
+  --unzoo-one-attention: #f3b85b;
+  --unzoo-one-danger: #ff6b73;
+  --unzoo-one-info: #69a7ff;
+
+  /* Typography */
+  --unzoo-one-font-display: Inter, "SF Pro Display", "Segoe UI", "Noto Sans SC", sans-serif;
+  --unzoo-one-font-text: Inter, "SF Pro Text", "Segoe UI", "Noto Sans SC", sans-serif;
+  --unzoo-one-font-mono: "SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace;
+
+  /* Product spacing — four-point grid */
+  --unzoo-one-space-1: 4px;
+  --unzoo-one-space-2: 8px;
+  --unzoo-one-space-3: 12px;
+  --unzoo-one-space-4: 16px;
+  --unzoo-one-space-5: 20px;
+  --unzoo-one-space-6: 24px;
+  --unzoo-one-space-8: 32px;
+  --unzoo-one-space-10: 40px;
+  --unzoo-one-space-12: 48px;
+  --unzoo-one-space-16: 64px;
+
+  /* Flow geometry */
+  --unzoo-one-radius-control: 10px;
+  --unzoo-one-radius-card: 18px;
+  --unzoo-one-radius-panel: 26px;
+  --unzoo-one-radius-dialog: 24px;
+  --unzoo-one-radius-pill: 999px;
+
+  /* Elevation */
+  --unzoo-one-shadow-focus: 0 0 0 1px rgba(107, 112, 246, 0.4), 0 20px 70px rgba(0, 0, 0, 0.22);
+  --unzoo-one-shadow-float: 0 24px 80px rgba(0, 0, 0, 0.36);
+  --unzoo-one-shadow-modal: 0 40px 140px rgba(0, 0, 0, 0.52);
+
+  /* Motion */
+  --unzoo-one-ease-flow: cubic-bezier(0.16, 1, 0.3, 1);
+  --unzoo-one-duration-fast: 120ms;
+  --unzoo-one-duration-control: 160ms;
+  --unzoo-one-duration-panel: 220ms;
+  --unzoo-one-duration-page: 240ms;
+  --unzoo-one-duration-mark: 900ms;
+}

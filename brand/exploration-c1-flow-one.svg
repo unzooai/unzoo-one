@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Flow One monogram</title>
+  <desc id="desc">A single continuous stroke flows from an open U into the numeral one.</desc>
+  <path d="M58 54v80c0 49 29 82 70 82s70-33 70-82V54l-40 38"
+        fill="none" stroke="#111318" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

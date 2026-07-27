@@ -1,0 +1,56 @@
+:root {
+  /* Foundation */
+  --one-ink-950: #080a0f;
+  --one-ink-900: #0d1017;
+  --one-ink-850: #121620;
+  --one-ink-800: #181d28;
+  --one-ink-700: #252b38;
+  --one-silver-500: #8d94a4;
+  --one-silver-300: #b9bfca;
+  --one-porcelain-100: #f7f8fa;
+  --one-porcelain-50: #fbfbfc;
+
+  /* Product signal — never used as large background decoration */
+  --one-ice: #63e6ff;
+  --one-cobalt: #6c8cff;
+  --one-iris: #9b6bff;
+  --one-signal: linear-gradient(135deg, var(--one-ice), var(--one-cobalt) 52%, var(--one-iris));
+
+  /* Semantics */
+  --one-success: #4cdaa0;
+  --one-attention: #f3b85b;
+  --one-danger: #ff6b73;
+  --one-info: #69a7ff;
+
+  /* Type */
+  --one-font-sans: Inter, "SF Pro Display", "Segoe UI", "Noto Sans SC", sans-serif;
+  --one-font-mono: "SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace;
+
+  /* Geometry */
+  --one-radius-sm: 10px;
+  --one-radius-md: 16px;
+  --one-radius-lg: 24px;
+  --one-radius-pill: 999px;
+  --one-space-1: 4px;
+  --one-space-2: 8px;
+  --one-space-3: 12px;
+  --one-space-4: 16px;
+  --one-space-5: 20px;
+  --one-space-6: 24px;
+  --one-space-8: 32px;
+  --one-space-10: 40px;
+  --one-space-12: 48px;
+
+  /* Surfaces */
+  --one-border-subtle: rgba(255, 255, 255, 0.08);
+  --one-border-strong: rgba(255, 255, 255, 0.15);
+  --one-shadow-float: 0 24px 80px rgba(0, 0, 0, 0.34);
+  --one-shadow-focus: 0 0 0 1px rgba(108, 140, 255, 0.62), 0 0 30px rgba(108, 140, 255, 0.12);
+
+  /* Motion */
+  --one-ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+  --one-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --one-duration-fast: 120ms;
+  --one-duration-standard: 220ms;
+  --one-duration-orchestration: 900ms;
+}

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One mark</title>
+  <desc id="desc">The Unzoo open vessel surrounding one intelligent core and its orbit.</desc>
+  <defs>
+    <linearGradient id="one-signal" x1="44" y1="214" x2="208" y2="42" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#63E6FF"/>
+      <stop offset=".48" stop-color="#6C8CFF"/>
+      <stop offset="1" stop-color="#9B6BFF"/>
+    </linearGradient>
+  </defs>
+  <path d="M56 52v78c0 47 30.5 78 72 78s72-31 72-78V52"
+        fill="none" stroke="url(#one-signal)" stroke-width="22"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M104 130c0-14.5 10.7-25 24-25 16.4 0 29 10.5 29 25s-12.6 25-29 25c-9 0-17-3.2-22-8.7"
+        fill="none" stroke="url(#one-signal)" stroke-width="8"
+        stroke-linecap="round"/>
+  <circle cx="128" cy="130" r="9" fill="#F7F8FA"/>
+  <circle cx="128" cy="130" r="5" fill="#6F86FF"/>
+</svg>

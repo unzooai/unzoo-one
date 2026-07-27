@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Cut One monogram</title>
+  <desc id="desc">A precise asymmetric U transitions into a sharply cut numeral one.</desc>
+  <path d="M55 52l7 87c4 45 30 70 66 70 37 0 61-28 64-70l5-87-40 36"
+        fill="none" stroke="#111318" stroke-width="25"
+        stroke-linecap="square" stroke-linejoin="miter"/>
+</svg>

@@ -1,7 +1,7 @@
 # Unzoo One 产品架构与 Unterm / Unzoo 能力审计
 
-> 状态：产品架构草案  
-> 日期：2026-07-26  
+> 状态：产品架构草案
+> 日期：2026-07-26
 > 范围：Unterm、Unzoo Browser、Codex / Claude / Gemini 等 Agent Runtime
 
 > 产品名：**Unzoo One — Your Personal AI Operating System**

@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unzoo One — C1 Flow One Brand System</title>
+  <link rel="stylesheet" href="./tokens.css">
+  <style>
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; background: var(--unzoo-one-obsidian); }
+    body {
+      margin: 0;
+      color: var(--unzoo-one-porcelain);
+      background:
+        radial-gradient(circle at 52% -10%, rgba(101,127,247,.12), transparent 27%),
+        var(--unzoo-one-obsidian);
+      font-family: var(--unzoo-one-font-text);
+      -webkit-font-smoothing: antialiased;
+    }
+    .page { width: min(1400px, calc(100% - 64px)); margin: 0 auto; }
+    header {
+      height: 78px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--unzoo-one-border);
+    }
+    .header-lockup { display: flex; align-items: center; gap: 11px; font-size: 16px; font-weight: 620; letter-spacing: -.035em; }
+    .header-lockup img { width: 30px; height: 30px; }
+    .meta, .caption { color: var(--unzoo-one-text-tertiary); font-size: 10px; }
+    .meta span { margin-left: 9px; padding: 6px 9px; border: 1px solid var(--unzoo-one-border); border-radius: 999px; }
+    .eyebrow {
+      color: var(--unzoo-one-text-tertiary);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+    }
+    .hero {
+      min-height: 700px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+      align-items: center;
+      padding: 70px 0 84px;
+    }
+    h1 {
+      margin: 18px 0 22px;
+      font-family: var(--unzoo-one-font-display);
+      font-size: clamp(60px, 7.2vw, 104px);
+      line-height: .94;
+      font-weight: 520;
+      letter-spacing: -.07em;
+    }
+    .signal-text {
+      color: transparent;
+      background: var(--unzoo-one-signal-gradient);
+      background-clip: text;
+      -webkit-background-clip: text;
+    }
+    .lead { max-width: 630px; color: var(--unzoo-one-text-secondary); font-size: 16px; line-height: 1.75; }
+    .promise { display: flex; gap: 22px; margin-top: 32px; color: var(--unzoo-one-text-tertiary); font-size: 10px; }
+    .promise span::before { content: ""; display: inline-block; width: 5px; height: 5px; margin-right: 8px; vertical-align: 1px; border-radius: 50%; background: var(--unzoo-one-signal); }
+    .hero-stage {
+      position: relative;
+      min-height: 520px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 36px;
+      background:
+        radial-gradient(circle at 50% 54%, rgba(101,127,247,.12), transparent 42%),
+        linear-gradient(145deg, rgba(255,255,255,.04), rgba(255,255,255,.01));
+      box-shadow: inset 0 1px rgba(255,255,255,.045), 0 60px 150px rgba(0,0,0,.34);
+    }
+    .hero-stage > img { width: 310px; height: 310px; }
+    .hero-label {
+      position: absolute;
+      padding: 7px 10px;
+      color: var(--unzoo-one-text-secondary);
+      font-size: 9px;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 999px;
+      background: rgba(8,10,15,.72);
+      backdrop-filter: blur(12px);
+    }
+    .hero-label.open { top: 82px; left: 48px; }
+    .hero-label.one { right: 44px; bottom: 85px; }
+    section { padding: 92px 0; border-top: 1px solid var(--unzoo-one-border); }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 36px; margin-bottom: 38px; }
+    .section-head h2 { margin: 10px 0 0; font-size: 34px; line-height: 1.1; font-weight: 540; letter-spacing: -.045em; }
+    .section-head p { max-width: 530px; margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 11px; line-height: 1.65; }
+    .essence { display: grid; grid-template-columns: 1.1fr repeat(4, 1fr); gap: 10px; }
+    .essence-card {
+      min-height: 180px;
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      justify-content: end;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 18px;
+      background: rgba(255,255,255,.018);
+    }
+    .essence-card.primary { background: var(--unzoo-one-signal-gradient); color: #fff; border: 0; }
+    .essence-card strong { font-size: 14px; font-weight: 580; }
+    .essence-card span { margin-top: 7px; color: var(--unzoo-one-text-tertiary); font-size: 10px; line-height: 1.5; }
+    .essence-card.primary span { color: rgba(255,255,255,.72); }
+    .mark-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    .mark-card {
+      min-height: 410px;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      overflow: hidden;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 22px;
+      background: rgba(255,255,255,.018);
+    }
+    .mark-visual { display: grid; place-items: center; min-height: 330px; }
+    .mark-visual.light { background: #f7f8fa; }
+    .mark-visual.dark { background: #0d1017; }
+    .mark-visual.signal { background: linear-gradient(145deg, #121724, #090b10); }
+    .mark-visual img { width: 190px; height: 190px; }
+    .mark-footer { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-top: 1px solid var(--unzoo-one-border); }
+    .mark-footer strong { font-size: 11px; font-weight: 570; }
+    .mark-footer code { color: var(--unzoo-one-text-tertiary); font: 9px var(--unzoo-one-font-mono); }
+    .construction-grid { display: grid; grid-template-columns: 1fr .95fr; gap: 14px; }
+    .construction {
+      min-height: 480px;
+      position: relative;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 22px;
+      background: #f7f8fa;
+    }
+    .construction::before {
+      content: "";
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      background-image:
+        linear-gradient(rgba(17,19,24,.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(17,19,24,.08) 1px, transparent 1px);
+      background-size: 20px 20px;
+    }
+    .construction img { z-index: 1; width: 230px; height: 230px; }
+    .safe-area { position: relative; width: 320px; height: 320px; display: grid; place-items: center; border: 1px dashed rgba(107,112,246,.7); }
+    .safe-area::after { content: "2×"; position: absolute; top: -20px; right: 0; color: #6b70f6; font: 10px var(--unzoo-one-font-mono); }
+    .safe-area img { width: 210px; height: 210px; }
+    .rules { display: grid; gap: 10px; }
+    .rule { padding: 20px; border: 1px solid var(--unzoo-one-border); border-radius: 16px; background: rgba(255,255,255,.018); }
+    .rule b { display: block; margin-bottom: 7px; font-size: 11px; font-weight: 600; }
+    .rule p { margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 10px; line-height: 1.6; }
+    .lockup-grid { display: grid; grid-template-columns: 1.3fr .7fr; gap: 14px; }
+    .lockup-card { min-height: 350px; display: grid; place-items: center; overflow: hidden; border-radius: 22px; }
+    .lockup-card.paper { background: #f7f8fa; }
+    .lockup-card.ink { background: #111318; border: 1px solid var(--unzoo-one-border); }
+    .lockup-card img { width: min(78%, 560px); }
+    .lockup-card.stacked img { width: 260px; }
+    .palette {
+      display: grid;
+      grid-template-columns: 1.45fr repeat(6, 1fr);
+      min-height: 205px;
+      overflow: hidden;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 22px;
+    }
+    .swatch { padding: 17px; display: flex; flex-direction: column; justify-content: end; color: #fff; }
+    .swatch strong { font-size: 11px; font-weight: 600; }
+    .swatch span { margin-top: 4px; font: 9px var(--unzoo-one-font-mono); opacity: .68; }
+    .swatch.gradient { background: var(--unzoo-one-signal-gradient); }
+    .swatch.obsidian { background: #080a0f; }
+    .swatch.ink { background: #111318; }
+    .swatch.porcelain { color: #111318; background: #f7f8fa; }
+    .swatch.aqua { color: #07181a; background: #5fe1ff; }
+    .swatch.cobalt { background: #657ff7; }
+    .swatch.iris { background: #926bfa; }
+    .type-specimen { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; }
+    .type-display, .type-scale { padding: 34px; border: 1px solid var(--unzoo-one-border); border-radius: 22px; background: rgba(255,255,255,.018); }
+    .type-display h3 { margin: 0; font-size: clamp(48px, 6vw, 80px); line-height: .98; font-weight: 520; letter-spacing: -.065em; }
+    .type-display p { margin: 28px 0 0; max-width: 600px; color: var(--unzoo-one-text-secondary); font-size: 14px; line-height: 1.7; }
+    .type-scale { display: grid; align-content: center; gap: 18px; }
+    .type-row { display: grid; grid-template-columns: 70px 1fr; align-items: baseline; }
+    .type-row small { color: var(--unzoo-one-text-tertiary); font: 9px var(--unzoo-one-font-mono); }
+    .type-row b { font-weight: 540; }
+    .t32 { font-size: 32px; letter-spacing: -.04em; }
+    .t20 { font-size: 20px; letter-spacing: -.025em; }
+    .t14 { font-size: 14px; }
+    .t11 { font-size: 11px; letter-spacing: .07em; }
+    .icon-grid { display: grid; grid-template-columns: 1.2fr .8fr .8fr; gap: 14px; }
+    .icon-card { min-height: 360px; display: grid; place-items: center; align-content: center; gap: 20px; border: 1px solid var(--unzoo-one-border); border-radius: 22px; background: rgba(255,255,255,.018); }
+    .icon-card img { width: 210px; height: 210px; }
+    .icon-card.small img { width: 146px; height: 146px; }
+    .size-row { display: flex; align-items: end; gap: 20px; }
+    .size-item { display: grid; justify-items: center; gap: 9px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .size-item img { width: auto; height: auto; }
+    .i16 img { width: 16px; } .i20 img { width: 20px; } .i24 img { width: 24px; } .i32 img { width: 32px; } .i48 img { width: 48px; }
+    .flow-field {
+      min-height: 490px;
+      position: relative;
+      display: flex;
+      align-items: end;
+      overflow: hidden;
+      padding: 42px;
+      border: 1px solid var(--unzoo-one-border);
+      border-radius: 24px;
+      background: url("./patterns/flow-field.svg") center/cover;
+    }
+    .flow-copy { max-width: 460px; padding: 22px; border: 1px solid rgba(255,255,255,.1); border-radius: 17px; background: rgba(8,10,15,.62); backdrop-filter: blur(14px); }
+    .flow-copy b { display: block; font-size: 17px; font-weight: 560; }
+    .flow-copy p { margin: 8px 0 0; color: var(--unzoo-one-text-secondary); font-size: 11px; line-height: 1.6; }
+    .product-shell {
+      min-height: 720px;
+      display: grid;
+      grid-template-columns: 205px 1fr 280px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.11);
+      border-radius: 26px;
+      background: #090b10;
+      box-shadow: 0 60px 160px rgba(0,0,0,.38);
+    }
+    .sidebar { display: flex; flex-direction: column; padding: 18px 13px; border-right: 1px solid var(--unzoo-one-border); background: #0a0d13; }
+    .side-brand { display: flex; align-items: center; gap: 9px; padding: 4px 7px 22px; font-size: 13px; font-weight: 610; }
+    .side-brand img { width: 24px; height: 24px; }
+    .nav { display: grid; gap: 3px; }
+    .nav span { padding: 10px 11px; color: var(--unzoo-one-text-tertiary); font-size: 10px; border-radius: 9px; }
+    .nav span.active { color: var(--unzoo-one-porcelain); background: rgba(255,255,255,.055); }
+    .side-status { margin-top: auto; padding: 10px 7px; color: var(--unzoo-one-text-tertiary); font-size: 9px; }
+    .side-status::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: #4cdaa0; }
+    .workspace { padding: 30px 34px; }
+    .workspace small { color: var(--unzoo-one-text-tertiary); font-size: 9px; }
+    .workspace h3 { margin: 7px 0 22px; font-size: 24px; font-weight: 540; letter-spacing: -.04em; }
+    .composer { padding: 19px; border: 1px solid rgba(107,112,246,.3); border-radius: 19px; background: rgba(255,255,255,.026); box-shadow: 0 20px 70px rgba(0,0,0,.22); }
+    .composer p { height: 42px; margin: 0; color: var(--unzoo-one-text-secondary); font-size: 12px; }
+    .composer-foot { display: flex; justify-content: space-between; align-items: center; }
+    .mode { padding: 6px 8px; color: var(--unzoo-one-text-tertiary); font-size: 8px; border: 1px solid var(--unzoo-one-border); border-radius: 7px; }
+    .send { width: 31px; height: 31px; display: grid; place-items: center; color: #fff; border-radius: 9px; background: var(--unzoo-one-signal); }
+    .task { margin-top: 14px; padding: 19px; border: 1px solid var(--unzoo-one-border); border-radius: 18px; background: rgba(255,255,255,.015); }
+    .task-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 17px; font-size: 10px; }
+    .task-head i { color: var(--unzoo-one-aqua); font-style: normal; font-size: 8px; letter-spacing: .08em; }
+    .steps { display: grid; gap: 13px; }
+    .step { display: grid; grid-template-columns: 16px 1fr; gap: 9px; color: var(--unzoo-one-text-secondary); font-size: 9px; }
+    .step span { width: 14px; height: 14px; border: 1px solid var(--unzoo-one-signal); border-radius: 50%; }
+    .step.done span { background: #4cdaa0; border-color: #4cdaa0; }
+    .approval { margin-top: 14px; padding: 14px; border: 1px solid rgba(243,184,91,.28); border-radius: 14px; background: rgba(243,184,91,.06); }
+    .approval b { font-size: 9px; font-weight: 580; }
+    .approval p { margin: 5px 0 0; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .activity { padding: 22px 17px; border-left: 1px solid var(--unzoo-one-border); background: #0a0d12; }
+    .activity-head { margin-bottom: 22px; font-size: 10px; font-weight: 580; }
+    .event { position: relative; padding: 0 0 23px 17px; border-left: 1px solid rgba(255,255,255,.1); }
+    .event::before { content: ""; position: absolute; top: 1px; left: -4px; width: 7px; height: 7px; border-radius: 50%; background: #343a47; box-shadow: 0 0 0 4px #0a0d12; }
+    .event.active::before { background: var(--unzoo-one-cobalt); }
+    .event time { color: var(--unzoo-one-text-tertiary); font: 8px var(--unzoo-one-font-mono); }
+    .event b { display: block; margin: 6px 0 4px; font-size: 9px; font-weight: 550; }
+    .event p { margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 8px; line-height: 1.45; }
+    .voice-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .voice-card { padding: 27px; border: 1px solid var(--unzoo-one-border); border-radius: 20px; background: rgba(255,255,255,.018); }
+    .voice-card strong { display: block; margin-bottom: 17px; font-size: 12px; font-weight: 580; }
+    .copy-row { display: grid; grid-template-columns: 92px 1fr; gap: 14px; padding: 12px 0; border-top: 1px solid var(--unzoo-one-border); }
+    .copy-row span { color: var(--unzoo-one-text-tertiary); font-size: 9px; }
+    .copy-row p { margin: 0; color: var(--unzoo-one-text-secondary); font-size: 10px; line-height: 1.5; }
+    .manifest { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .file { padding: 17px; border: 1px solid var(--unzoo-one-border); border-radius: 14px; background: rgba(255,255,255,.018); }
+    .file b { display: block; font: 9px var(--unzoo-one-font-mono); }
+    .file span { display: block; margin-top: 6px; color: var(--unzoo-one-text-tertiary); font-size: 9px; }
+    footer { padding: 42px 0 68px; display: flex; justify-content: space-between; color: var(--unzoo-one-text-tertiary); font-size: 9px; border-top: 1px solid var(--unzoo-one-border); }
+    @media (max-width: 980px) {
+      .hero, .construction-grid, .lockup-grid, .type-specimen { grid-template-columns: 1fr; }
+      .essence { grid-template-columns: repeat(2, 1fr); }
+      .icon-grid, .manifest { grid-template-columns: 1fr; }
+      .product-shell { grid-template-columns: 180px 1fr; }
+      .activity { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="page">
+    <div class="header-lockup"><img src="./marks/unzoo-one-mark-signal.svg" alt=""><span>unzoo one</span></div>
+    <div class="meta">C1 / Flow One <span>Brand system v1</span></div>
+  </header>
+
+  <main>
+    <div class="page hero">
+      <div>
+        <div class="eyebrow">Personal intelligence, orchestrated</div>
+        <h1>One intent.<br><span class="signal-text">Every capability.</span></h1>
+        <p class="lead">一条开放路径进入系统，在底部汇合，再上升成为唯一意图。C1 Flow One 不描述一个机器人，而是描述用户如何掌控一整套智能能力。</p>
+        <div class="promise"><span>Calm</span><span>Capable</span><span>Open</span><span>Sovereign</span><span>Precise</span></div>
+      </div>
+      <div class="hero-stage">
+        <img src="./motion/unzoo-one-mark-motion.svg" alt="Animated Flow One mark">
+        <span class="hero-label open">Open capability boundary</span>
+        <span class="hero-label one">One intent</span>
+      </div>
+    </div>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Brand essence</div><h2>能力被释放，控制不被释放</h2></div>
+          <p>Unzoo 的 Open 不是无边界自治；One 的 One 也不是单一模型。品牌系统同时表达开放能力与用户主权。</p>
+        </div>
+        <div class="essence">
+          <article class="essence-card primary"><strong>One intent</strong><span>一个目标成为所有行动的事实来源</span></article>
+          <article class="essence-card"><strong>Open</strong><span>Brain 与 Provider 可以进入和退出</span></article>
+          <article class="essence-card"><strong>Capable</strong><span>以真实 Artifact 和状态变化证明能力</span></article>
+          <article class="essence-card"><strong>Sovereign</strong><span>用户拥有授权、数据和停止权</span></article>
+          <article class="essence-card"><strong>Calm</strong><span>强大，但不制造噪音和焦虑</span></article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Core marks</div><h2>先满足商标，再适应数字环境</h2></div>
+          <p>纯黑主标定义结构；Signal Indigo 是默认产品版本；渐变只存在于数字环境；反白版不使用发光补偿识别。</p>
+        </div>
+        <div class="mark-grid">
+          <article class="mark-card"><div class="mark-visual light"><img src="./marks/unzoo-one-mark-black.svg" alt=""></div><div class="mark-footer"><strong>Monochrome positive</strong><code>MARK / BLACK</code></div></article>
+          <article class="mark-card"><div class="mark-visual dark"><img src="./marks/unzoo-one-mark-white.svg" alt=""></div><div class="mark-footer"><strong>Monochrome reverse</strong><code>MARK / WHITE</code></div></article>
+          <article class="mark-card"><div class="mark-visual light"><img src="./marks/unzoo-one-mark-primary.svg" alt=""></div><div class="mark-footer"><strong>Signal Indigo</strong><code>#6B70F6</code></div></article>
+          <article class="mark-card"><div class="mark-visual signal"><img src="./marks/unzoo-one-mark-signal.svg" alt=""></div><div class="mark-footer"><strong>Digital Signal</strong><code>AQUA → IRIS</code></div></article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Construction</div><h2>一条路径，两个非对称端点</h2></div>
+          <p>左端略低，代表能力进入；右端更高并形成 1 的斜肩，代表行动方向。机械对齐两端会破坏光学平衡。</p>
+        </div>
+        <div class="construction-grid">
+          <div class="construction"><div class="safe-area"><img src="./marks/unzoo-one-mark-black.svg" alt=""></div></div>
+          <div class="rules">
+            <div class="rule"><b>单路径</b><p>标准主标不可拆分为 U 与 1，也不能为两部分分别着色。</p></div>
+            <div class="rule"><b>安全空间</b><p>独立主标四周至少保留两倍标准描边宽度。</p></div>
+            <div class="rule"><b>最小尺寸</b><p>16–24px 使用 Optical 版；32px 以上使用标准路径。</p></div>
+            <div class="rule"><b>禁止附加</b><p>不添加眼睛、轨道、圆点、盾牌、箭头或外框。</p></div>
+            <div class="rule"><b>不依赖颜色</b><p>所有正式应用必须先通过黑白与低质量打印测试。</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Lockups</div><h2>品牌名安静地跟随标志</h2></div>
+          <p>横版是默认组合，竖版只用于方形品牌场景。正式发布前会将字标完成字偶距微调并转为矢量轮廓。</p>
+        </div>
+        <div class="lockup-grid">
+          <div class="lockup-card paper"><img src="./lockups/unzoo-one-lockup-horizontal-dark.svg" alt=""></div>
+          <div class="lockup-card paper stacked"><img src="./lockups/unzoo-one-lockup-stacked-dark.svg" alt=""></div>
+          <div class="lockup-card ink"><img src="./lockups/unzoo-one-lockup-horizontal-light.svg" alt=""></div>
+          <div class="lockup-card paper"><img src="./lockups/unzoo-one-lockup-tagline-dark.svg" alt=""></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Color</div><h2>Signal 是行为，不是装饰</h2></div>
+          <p>典型页面中 Signal 的可见面积不超过 4%。成功、等待和危险保留独立语义色，不能由品牌渐变代替。</p>
+        </div>
+        <div class="palette">
+          <div class="swatch gradient"><strong>Digital Signal</strong><span>AQUA → IRIS</span></div>
+          <div class="swatch obsidian"><strong>Obsidian</strong><span>#080A0F</span></div>
+          <div class="swatch ink"><strong>Ink</strong><span>#111318</span></div>
+          <div class="swatch porcelain"><strong>Porcelain</strong><span>#F7F8FA</span></div>
+          <div class="swatch aqua"><strong>Aqua</strong><span>#5FE1FF</span></div>
+          <div class="swatch cobalt"><strong>Cobalt</strong><span>#657FF7</span></div>
+          <div class="swatch iris"><strong>Iris</strong><span>#926BFA</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Typography</div><h2>紧凑、清晰、不表演科技感</h2></div>
+          <p>Display 使用紧字距形成品牌张力；正文保持舒适阅读。中文不拉宽字距，全大写只用于极短状态标签。</p>
+        </div>
+        <div class="type-specimen">
+          <div class="type-display"><h3>One place<br>to move work<br>forward.</h3><p>从一个意图开始，调动需要的工具，并保留完整证据。品牌不靠夸张字号和荧光效果制造能力感。</p></div>
+          <div class="type-scale">
+            <div class="type-row"><small>32 / 40</small><b class="t32">Product heading</b></div>
+            <div class="type-row"><small>20 / 28</small><b class="t20">Section heading</b></div>
+            <div class="type-row"><small>14 / 21</small><b class="t14">清楚描述任务发生了什么</b></div>
+            <div class="type-row"><small>11 / 15</small><b class="t11">WAITING FOR REVIEW</b></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Platform identity</div><h2>一个标志，按场景分别校正</h2></div>
+          <p>App Icon、Favicon 和头像不是同一文件的机械缩放。小尺寸版加粗线宽并扩大斜肩开口。</p>
+        </div>
+        <div class="icon-grid">
+          <div class="icon-card"><img src="./icons/unzoo-one-app-icon.svg" alt=""><span class="caption">Application icon</span></div>
+          <div class="icon-card small"><img src="./icons/unzoo-one-avatar.svg" alt=""><span class="caption">Social avatar</span></div>
+          <div class="icon-card">
+            <div class="size-row">
+              <div class="size-item i16"><img src="./marks/unzoo-one-mark-optical-16.svg" alt=""><span>16</span></div>
+              <div class="size-item i20"><img src="./marks/unzoo-one-mark-optical-16.svg" alt=""><span>20</span></div>
+              <div class="size-item i24"><img src="./marks/unzoo-one-mark-optical-16.svg" alt=""><span>24</span></div>
+              <div class="size-item i32"><img src="./marks/unzoo-one-mark-primary.svg" alt=""><span>32</span></div>
+              <div class="size-item i48"><img src="./marks/unzoo-one-mark-primary.svg" alt=""><span>48</span></div>
+            </div>
+            <span class="caption">Optical size family</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Graphic language</div><h2>Flow Line 延伸为品牌空间</h2></div>
+          <p>辅助纹样来自主标路径的裁切和放大。它引导视线，不充当随机装饰；透明度始终保持在 8%–16%。</p>
+        </div>
+        <div class="flow-field">
+          <div class="flow-copy"><b>Many capabilities. One continuous flow.</b><p>同一条路径可以解释任务步骤、能力编排和品牌运动，但不能同时与主标争夺视觉中心。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Product expression</div><h2>品牌退后，任务与证据向前</h2></div>
+          <p>进入工作状态后，C1 只保留在产品入口。Signal 标记当前智能活动，审批仍使用 Attention 语义色。</p>
+        </div>
+        <div class="product-shell">
+          <aside class="sidebar">
+            <div class="side-brand"><img src="./marks/unzoo-one-mark-signal.svg" alt=""><span>unzoo one</span></div>
+            <div class="nav"><span>Home</span><span class="active">Tasks</span><span>Inbox</span><span>Artifacts</span><span>Automations</span><span>Integrations</span></div>
+            <div class="side-status">All systems ready</div>
+          </aside>
+          <div class="workspace">
+            <small>Good evening, Alex</small>
+            <h3>What will we accomplish?</h3>
+            <div class="composer"><p>整理本周研究并形成一份产品决策摘要</p><div class="composer-foot"><span class="mode">WORK</span><span class="send">↑</span></div></div>
+            <div class="task">
+              <div class="task-head"><b>Product decision brief</b><i>RUNNING</i></div>
+              <div class="steps">
+                <div class="step done"><span></span>理解目标与交付范围</div>
+                <div class="step done"><span></span>收集并验证 12 个来源</div>
+                <div class="step"><span></span>综合差异与风险</div>
+                <div class="step"><span></span>生成 Artifact</div>
+              </div>
+            </div>
+            <div class="approval"><b>发送前请检查</b><p>将 PDF 发送给 1 位联系人 · 尚未发生外部写操作</p></div>
+          </div>
+          <aside class="activity">
+            <div class="activity-head">Live activity</div>
+            <div class="event"><time>00:12</time><b>检索公开来源</b><p>Unzoo Browser · Research</p></div>
+            <div class="event"><time>00:48</time><b>验证关键事实</b><p>发现 2 条冲突信息</p></div>
+            <div class="event active"><time>01:16</time><b>综合产品判断</b><p>Codex · Unterm</p></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Voice</div><h2>具体、诚实、可验证</h2></div>
+          <p>Unzoo One 不假装人格，不用“魔法”和“万能”掩盖不确定性。语言必须说明动作、对象、范围和结果。</p>
+        </div>
+        <div class="voice-grid">
+          <div class="voice-card">
+            <strong>推荐表达</strong>
+            <div class="copy-row"><span>运行</span><p>正在比较 12 个来源</p></div>
+            <div class="copy-row"><span>审批</span><p>发送给 1 位联系人前需要你的确认</p></div>
+            <div class="copy-row"><span>完成</span><p>报告已生成；外部发送尚未执行</p></div>
+            <div class="copy-row"><span>故障</span><p>登录已过期，可从第 3 步继续</p></div>
+          </div>
+          <div class="voice-card">
+            <strong>避免表达</strong>
+            <div class="copy-row"><span>运行</span><p>AI 正在施展魔法</p></div>
+            <div class="copy-row"><span>审批</span><p>需要一些权限才能继续</p></div>
+            <div class="copy-row"><span>完成</span><p>全部搞定！</p></div>
+            <div class="copy-row"><span>故障</span><p>发生未知错误</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Asset manifest</div><h2>可直接进入产品的工作稿</h2></div>
+          <p>所有资产均为确定性 SVG。Lockup 中的字体仍需在品牌定稿时获得许可并转为轮廓。</p>
+        </div>
+        <div class="manifest">
+          <div class="file"><b>marks/</b><span>主标、Signal、黑白、反白、Optical</span></div>
+          <div class="file"><b>lockups/</b><span>横版、竖版、反白、Tagline</span></div>
+          <div class="file"><b>icons/</b><span>App Icon、Favicon、Avatar</span></div>
+          <div class="file"><b>motion/</b><span>一次性 Flow Draw 动效</span></div>
+          <div class="file"><b>patterns/</b><span>Flow Field 辅助图形</span></div>
+          <div class="file"><b>tokens.css</b><span>品牌色、字体、几何与动效令牌</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page"><span>Unzoo One · C1 Flow One brand system</span><span>Working draft · trademark clearance required</span></footer>
+</body>
+</html>

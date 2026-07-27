@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One Flow mark — white</title>
+  <desc id="desc">The monochrome reverse Flow mark.</desc>
+  <path d="M60 58v74c0 50 27 82 68 82s68-32 68-82V52l-38 36"
+        fill="none" stroke="#FFFFFF" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

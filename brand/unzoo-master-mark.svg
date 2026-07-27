@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo master mark</title>
+  <desc id="desc">An open U-shaped vessel protecting a perceptive core.</desc>
+  <g fill="none" stroke="#111318" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M56 52v78c0 47 30.5 78 72 78s72-31 72-78V52" stroke-width="22"/>
+    <circle cx="128" cy="130" r="24" stroke-width="10"/>
+  </g>
+  <circle cx="128" cy="130" r="7" fill="#111318"/>
+</svg>

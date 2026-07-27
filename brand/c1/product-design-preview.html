@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unzoo One — C1 Product Design System</title>
+  <link rel="stylesheet" href="./tokens.css">
+  <style>
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; background: var(--unzoo-one-obsidian); }
+    body {
+      margin: 0;
+      color: var(--unzoo-one-porcelain);
+      background:
+        radial-gradient(circle at 60% -12%, rgba(101,127,247,.10), transparent 28%),
+        var(--unzoo-one-obsidian);
+      font-family: var(--unzoo-one-font-text);
+      -webkit-font-smoothing: antialiased;
+    }
+    button { font: inherit; }
+    .page { width: min(1440px, calc(100% - 64px)); margin: 0 auto; }
+    .topbar { height: 76px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--unzoo-one-border); }
+    .lockup { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 620; letter-spacing: -.03em; }
+    .lockup img { width: 28px; height: 28px; }
+    .meta { color: var(--unzoo-one-text-tertiary); font-size: 10px; }
+    .meta span { margin-left: 9px; padding: 6px 9px; border: 1px solid var(--unzoo-one-border); border-radius: 999px; }
+    .eyebrow { color: var(--unzoo-one-text-tertiary); font-size: 10px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; }
+    .hero { min-height: 570px; display: grid; grid-template-columns: 1fr .9fr; align-items: center; gap: 80px; padding: 78px 0; }
+    h1 { margin: 18px 0 20px; font-size: clamp(58px, 7vw, 96px); line-height: .95; font-weight: 520; letter-spacing: -.07em; }
+    .signal { color: transparent; background: var(--unzoo-one-signal-gradient); background-clip: text; -webkit-background-clip: text; }
+    .lead { max-width: 670px; color: var(--unzoo-one-text-secondary); font-size: 15px; line-height: 1.75; }
+    .facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .fact { min-height: 155px; padding: 20px; display: flex; flex-direction: column; justify-content: end; border: 1px solid var(--unzoo-one-border); border-radius: 17px; background: rgba(255,255,255,.018); }
+    .fact strong { font-size: 28px; font-weight: 540; letter-spacing: -.045em; }
+    .fact span { margin-top: 7px; color: var(--unzoo-one-text-tertiary); font-size: 9px; line-height: 1.5; }
+    section { padding: 90px 0; border-top: 1px solid var(--unzoo-one-border); }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 34px; margin-bottom: 36px; }
+    .section-head h2 { margin: 10px 0 0; font-size: 34px; font-weight: 540; letter-spacing: -.045em; }
+    .section-head p { max-width: 520px; margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 11px; line-height: 1.65; }
+    .foundation { display: grid; grid-template-columns: 1.15fr repeat(3, 1fr); gap: 12px; }
+    .foundation-card { min-height: 210px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; border: 1px solid var(--unzoo-one-border); border-radius: 19px; background: rgba(255,255,255,.018); }
+    .foundation-card.signal-card { background: var(--unzoo-one-signal-gradient); border: 0; }
+    .foundation-card small { color: var(--unzoo-one-text-tertiary); font-size: 9px; letter-spacing: .08em; }
+    .signal-card small { color: rgba(255,255,255,.7); }
+    .foundation-card b { font-size: 17px; font-weight: 560; }
+    .foundation-card p { margin: 8px 0 0; color: var(--unzoo-one-text-tertiary); font-size: 10px; line-height: 1.55; }
+    .signal-card p { color: rgba(255,255,255,.72); }
+    .space-scale { display: flex; align-items: end; gap: 8px; }
+    .space-scale i { display: block; width: 10px; background: var(--unzoo-one-cobalt); border-radius: 4px 4px 0 0; }
+    .space-scale i:nth-child(1) { height: 8px; } .space-scale i:nth-child(2) { height: 16px; } .space-scale i:nth-child(3) { height: 24px; } .space-scale i:nth-child(4) { height: 32px; } .space-scale i:nth-child(5) { height: 48px; }
+    .radius-scale { display: flex; align-items: end; gap: 9px; }
+    .radius-scale i { width: 42px; height: 42px; border: 1px solid rgba(255,255,255,.22); }
+    .radius-scale i:nth-child(1) { border-radius: 10px; } .radius-scale i:nth-child(2) { border-radius: 16px; } .radius-scale i:nth-child(3) { border-radius: 22px; }
+    .type-sample { display: grid; gap: 4px; }
+    .type-sample strong { font-size: 24px; font-weight: 540; letter-spacing: -.04em; }
+    .type-sample span { color: var(--unzoo-one-text-secondary); font-size: 12px; }
+    .workbench {
+      min-height: 840px;
+      display: grid;
+      grid-template-columns: 210px minmax(680px, 1fr) 300px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.11);
+      border-radius: 26px;
+      background: #090b10;
+      box-shadow: 0 70px 180px rgba(0,0,0,.44);
+    }
+    .window-rail { grid-column: 1 / -1; height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 15px; border-bottom: 1px solid var(--unzoo-one-border); }
+    .window-dots { display: flex; gap: 6px; }
+    .window-dots i { width: 7px; height: 7px; border-radius: 50%; background: #343a47; }
+    .global-search { width: 280px; padding: 7px 12px; color: var(--unzoo-one-text-tertiary); font-size: 8px; text-align: center; border: 1px solid var(--unzoo-one-border); border-radius: 8px; background: rgba(255,255,255,.02); }
+    .stop { color: #ff858b; font-size: 8px; }
+    .sidebar { display: flex; flex-direction: column; padding: 17px 13px; border-right: 1px solid var(--unzoo-one-border); background: #0a0d13; }
+    .side-brand { display: flex; align-items: center; gap: 9px; padding: 4px 7px 22px; font-size: 13px; font-weight: 610; }
+    .side-brand img { width: 24px; height: 24px; }
+    .nav { display: grid; gap: 3px; }
+    .nav span { position: relative; padding: 10px 11px; color: var(--unzoo-one-text-tertiary); font-size: 9px; border-radius: 9px; }
+    .nav span.active { color: var(--unzoo-one-porcelain); background: rgba(255,255,255,.055); }
+    .nav span.active::before { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 2px; border-radius: 2px; background: var(--unzoo-one-signal); }
+    .nav .count { float: right; padding: 1px 5px; color: #261a05; border-radius: 999px; background: #f3b85b; font-size: 7px; }
+    .side-foot { margin-top: auto; padding: 10px 7px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .side-foot::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: #4cdaa0; }
+    .workspace { padding: 28px 32px 34px; }
+    .task-header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 23px; }
+    .task-header small { color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .task-header h3 { margin: 6px 0 0; font-size: 22px; font-weight: 550; letter-spacing: -.035em; }
+    .header-actions { display: flex; gap: 6px; }
+    .icon-btn { width: 31px; height: 31px; display: grid; place-items: center; color: var(--unzoo-one-text-secondary); border: 1px solid var(--unzoo-one-border); border-radius: 9px; background: rgba(255,255,255,.018); font-size: 9px; }
+    .progress-line { height: 3px; overflow: hidden; margin-bottom: 22px; border-radius: 2px; background: rgba(255,255,255,.06); }
+    .progress-line i { display: block; width: 62%; height: 100%; background: var(--unzoo-one-signal-gradient); }
+    .plan { padding: 19px; border: 1px solid var(--unzoo-one-border); border-radius: 18px; background: rgba(255,255,255,.016); }
+    .plan-head { display: flex; justify-content: space-between; margin-bottom: 17px; font-size: 9px; }
+    .providers { display: flex; gap: 5px; }
+    .provider { padding: 4px 6px; color: var(--unzoo-one-text-tertiary); font-size: 7px; border: 1px solid var(--unzoo-one-border); border-radius: 6px; }
+    .steps { display: grid; }
+    .step { position: relative; display: grid; grid-template-columns: 20px 1fr auto; gap: 9px; min-height: 59px; padding-top: 2px; }
+    .step:not(:last-child)::after { content: ""; position: absolute; left: 7px; top: 19px; bottom: 0; width: 1px; background: rgba(255,255,255,.10); }
+    .node { z-index: 1; width: 15px; height: 15px; border: 1px solid #4c5566; border-radius: 50%; background: #0d1017; }
+    .step.done .node { border-color: #4cdaa0; background: #4cdaa0; }
+    .step.active .node { border: 2px solid var(--unzoo-one-cobalt); box-shadow: 0 0 13px rgba(101,127,247,.32); }
+    .step.waiting .node { border-color: #f3b85b; border-radius: 4px; }
+    .step-copy b { display: block; margin-bottom: 4px; font-size: 9px; font-weight: 550; }
+    .step-copy span { color: var(--unzoo-one-text-tertiary); font-size: 8px; line-height: 1.45; }
+    .step-time { color: var(--unzoo-one-text-tertiary); font: 7px var(--unzoo-one-font-mono); }
+    .approval {
+      margin-top: 14px;
+      padding: 15px;
+      display: grid;
+      grid-template-columns: 31px 1fr auto;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid rgba(243,184,91,.3);
+      border-radius: 15px;
+      background: linear-gradient(90deg, rgba(243,184,91,.075), rgba(243,184,91,.02));
+    }
+    .risk-icon { width: 30px; height: 30px; display: grid; place-items: center; color: #f3b85b; border: 1px solid rgba(243,184,91,.3); border-radius: 9px; }
+    .approval-copy b { display: block; font-size: 9px; font-weight: 570; }
+    .approval-copy span { display: block; margin-top: 4px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .approval-actions { display: flex; gap: 5px; }
+    .btn { padding: 7px 9px; color: var(--unzoo-one-text-secondary); border: 1px solid var(--unzoo-one-border); border-radius: 7px; background: rgba(255,255,255,.02); font-size: 8px; }
+    .btn.attention { color: #261a05; border-color: #f3b85b; background: #f3b85b; }
+    .compact-composer { margin-top: 14px; padding: 12px 13px; display: flex; justify-content: space-between; align-items: center; color: var(--unzoo-one-text-tertiary); border: 1px solid rgba(107,112,246,.23); border-radius: 14px; background: rgba(255,255,255,.018); font-size: 8px; }
+    .send { width: 27px; height: 27px; display: grid; place-items: center; color: #fff; border-radius: 8px; background: var(--unzoo-one-signal); }
+    .activity { padding: 21px 16px; border-left: 1px solid var(--unzoo-one-border); background: #0a0d12; }
+    .activity-head { display: flex; justify-content: space-between; margin-bottom: 21px; font-size: 9px; }
+    .activity-head span { color: #4cdaa0; font-size: 7px; }
+    .event { position: relative; padding: 0 0 22px 17px; border-left: 1px solid rgba(255,255,255,.1); }
+    .event::before { content: ""; position: absolute; top: 1px; left: -4px; width: 7px; height: 7px; border-radius: 50%; background: #343a47; box-shadow: 0 0 0 4px #0a0d12; }
+    .event.active::before { background: var(--unzoo-one-cobalt); }
+    .event.attention::before { background: #f3b85b; }
+    .event time { color: var(--unzoo-one-text-tertiary); font: 7px var(--unzoo-one-font-mono); }
+    .event b { display: block; margin: 6px 0 4px; font-size: 8px; font-weight: 550; }
+    .event p { margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 7px; line-height: 1.45; }
+    .evidence { height: 46px; margin-top: 8px; display: flex; gap: 4px; padding: 6px; border: 1px solid var(--unzoo-one-border); border-radius: 8px; }
+    .evidence i { width: 31px; border-radius: 4px; background: linear-gradient(145deg, #dfe3ea, #727c8e); opacity: .72; }
+    .lab { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .lab-card { padding: 26px; border: 1px solid var(--unzoo-one-border); border-radius: 20px; background: rgba(255,255,255,.018); }
+    .lab-card > b { display: block; margin-bottom: 20px; font-size: 12px; font-weight: 580; }
+    .composer-lab { padding: 18px; border: 1px solid rgba(107,112,246,.32); border-radius: 18px; background: rgba(255,255,255,.025); }
+    .composer-lab p { height: 44px; margin: 0; color: var(--unzoo-one-text-secondary); font-size: 10px; }
+    .composer-lab footer { display: flex; justify-content: space-between; align-items: center; }
+    .modes { display: flex; gap: 5px; }
+    .mode { padding: 6px 8px; color: var(--unzoo-one-text-tertiary); font-size: 7px; border: 1px solid var(--unzoo-one-border); border-radius: 7px; }
+    .mode.active { color: #fff; background: rgba(255,255,255,.055); }
+    .state-list { display: grid; gap: 7px; }
+    .state-row { display: grid; grid-template-columns: 20px 100px 1fr; align-items: center; min-height: 36px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .state-node { width: 14px; height: 14px; border: 1px solid #4c5566; border-radius: 50%; }
+    .state-node.running { border: 2px solid var(--unzoo-one-cobalt); }
+    .state-node.completed { border-color: #4cdaa0; background: #4cdaa0; }
+    .state-node.waiting { border-color: #f3b85b; border-radius: 4px; }
+    .state-node.failed { border-color: #ff6b73; border-radius: 2px; transform: rotate(45deg); }
+    .state-node.review { border-color: #f3b85b; border-radius: 3px; }
+    .risk-stack { display: grid; gap: 7px; }
+    .risk { padding: 12px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--unzoo-one-border); border-radius: 12px; }
+    .risk b { font-size: 9px; font-weight: 560; }
+    .risk span { color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .risk.high { border-color: rgba(255,107,115,.28); }
+    .artifact-card { overflow: hidden; border: 1px solid var(--unzoo-one-border); border-radius: 15px; background: rgba(255,255,255,.025); }
+    .artifact-preview { position: relative; height: 170px; background: radial-gradient(circle at 76% 30%, rgba(95,225,255,.2), transparent 20%), linear-gradient(145deg, #151c31, #17152c 58%, #0b0e15); }
+    .artifact-preview::before { content: ""; position: absolute; right: -25px; bottom: -54px; width: 150px; height: 150px; border: 18px solid rgba(101,127,247,.75); border-radius: 50%; }
+    .artifact-preview::after { content: "PRODUCT DECISION BRIEF"; position: absolute; top: 18px; left: 18px; font-size: 8px; letter-spacing: .08em; }
+    .artifact-foot { display: flex; justify-content: space-between; padding: 13px; color: var(--unzoo-one-text-secondary); font-size: 8px; }
+    .screen-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    .screen { min-height: 390px; overflow: hidden; border: 1px solid var(--unzoo-one-border); border-radius: 20px; background: #0a0d13; }
+    .screen-top { height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 13px; color: var(--unzoo-one-text-tertiary); font-size: 7px; border-bottom: 1px solid var(--unzoo-one-border); }
+    .screen-body { padding: 20px; }
+    .screen-body h3 { margin: 0 0 18px; font-size: 17px; font-weight: 550; letter-spacing: -.03em; }
+    .mini-composer { min-height: 86px; padding: 14px; border: 1px solid rgba(107,112,246,.25); border-radius: 14px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .attention-strip { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; margin-top: 13px; }
+    .attention-card { min-height: 80px; padding: 11px; border: 1px solid var(--unzoo-one-border); border-radius: 11px; }
+    .attention-card b { display: block; font-size: 8px; }
+    .attention-card span { display: block; margin-top: 6px; color: var(--unzoo-one-text-tertiary); font-size: 7px; }
+    .inbox-layout { display: grid; grid-template-columns: 130px 170px 1fr; min-height: 322px; }
+    .filter-col, .list-col { padding: 13px; border-right: 1px solid var(--unzoo-one-border); }
+    .filter-col span, .list-item { display: block; padding: 8px; color: var(--unzoo-one-text-tertiary); font-size: 7px; border-radius: 7px; }
+    .filter-col span.active, .list-item.active { color: #fff; background: rgba(255,255,255,.05); }
+    .list-item { margin-bottom: 5px; border: 1px solid var(--unzoo-one-border); }
+    .detail-col { padding: 17px; }
+    .detail-col b { font-size: 10px; }
+    .detail-col p { color: var(--unzoo-one-text-tertiary); font-size: 8px; line-height: 1.55; }
+    .builder { display: grid; grid-template-columns: 150px 1fr; min-height: 322px; }
+    .builder-nav { padding: 16px; border-right: 1px solid var(--unzoo-one-border); }
+    .builder-nav span { display: block; padding: 9px; color: var(--unzoo-one-text-tertiary); font-size: 8px; }
+    .builder-nav span.active { color: #fff; }
+    .builder-main { padding: 19px; }
+    .form-block { margin-bottom: 10px; padding: 12px; border: 1px solid var(--unzoo-one-border); border-radius: 11px; }
+    .form-block b { font-size: 8px; }
+    .form-block p { margin: 5px 0 0; color: var(--unzoo-one-text-tertiary); font-size: 7px; }
+    .integration-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; }
+    .integration { padding: 12px; border: 1px solid var(--unzoo-one-border); border-radius: 11px; }
+    .integration b { font-size: 8px; }
+    .integration span { display: block; margin-top: 5px; color: var(--unzoo-one-text-tertiary); font-size: 7px; }
+    .breakpoints { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .breakpoint { padding: 22px; border: 1px solid var(--unzoo-one-border); border-radius: 18px; background: rgba(255,255,255,.018); }
+    .breakpoint b { display: block; font-size: 14px; font-weight: 560; }
+    .breakpoint code { display: block; margin: 8px 0 15px; color: var(--unzoo-one-aqua); font: 9px var(--unzoo-one-font-mono); }
+    .breakpoint p { margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 10px; line-height: 1.6; }
+    .delivery { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; }
+    .delivery-card { padding: 22px; border: 1px solid var(--unzoo-one-border); border-radius: 18px; background: rgba(255,255,255,.018); }
+    .delivery-card b { display: block; margin-bottom: 12px; font-size: 12px; font-weight: 580; }
+    .delivery-card p { margin: 0; color: var(--unzoo-one-text-tertiary); font-size: 10px; line-height: 1.65; }
+    footer.page { padding: 40px 0 66px; display: flex; justify-content: space-between; color: var(--unzoo-one-text-tertiary); font-size: 9px; border-top: 1px solid var(--unzoo-one-border); }
+    @media (max-width: 1050px) {
+      .hero, .lab { grid-template-columns: 1fr; }
+      .foundation, .breakpoints { grid-template-columns: repeat(2, 1fr); }
+      .workbench { grid-template-columns: 180px 1fr; }
+      .activity { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="page topbar">
+    <div class="lockup"><img src="./marks/unzoo-one-mark-signal.svg" alt=""><span>unzoo one</span></div>
+    <div class="meta">C1 Product UI <span>Design system v0.1</span></div>
+  </header>
+
+  <main>
+    <div class="page hero">
+      <div>
+        <div class="eyebrow">The operating surface for personal intelligence</div>
+        <h1>Calm surface.<br><span class="signal">Serious capability.</span></h1>
+        <p class="lead">C1 不只是一枚标志。它变成产品中的导航秩序、任务路径、智能状态和证据结构：一个目标、一条可追踪路径、一个清楚的控制边界。</p>
+      </div>
+      <div class="facts">
+        <div class="fact"><strong>4px</strong><span>基础空间网格</span></div>
+        <div class="fact"><strong>3</strong><span>桌面主列：导航、工作区、活动</span></div>
+        <div class="fact"><strong>4%</strong><span>Signal 建议最大可见面积</span></div>
+        <div class="fact"><strong>7</strong><span>Task Step 视觉状态</span></div>
+        <div class="fact"><strong>4</strong><span>Approval 风险级别</span></div>
+        <div class="fact"><strong>2</strong><span>Comfortable / Compact 密度</span></div>
+      </div>
+    </div>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Foundation</div><h2>品牌规则转化为产品约束</h2></div>
+          <p>高级感不来自更多视觉层，而来自空间、文字、颜色和状态都遵守同一组纪律。</p>
+        </div>
+        <div class="foundation">
+          <article class="foundation-card signal-card"><small>SIGNAL</small><div><b>Behavior, not decoration</b><p>只标记智能正在感知、协调和行动的位置。</p></div></article>
+          <article class="foundation-card"><small>SPACING</small><div class="space-scale"><i></i><i></i><i></i><i></i><i></i></div><div><b>Four-point grid</b><p>4 / 8 / 12 / 16 / 24 / 32 / 48</p></div></article>
+          <article class="foundation-card"><small>GEOMETRY</small><div class="radius-scale"><i></i><i></i><i></i></div><div><b>10 / 16 / 22</b><p>Control、Card、Panel 各自有固定圆角。</p></div></article>
+          <article class="foundation-card"><small>TYPE</small><div class="type-sample"><strong>One intent</strong><span>Every capability</span></div><div><b>Compact hierarchy</b><p>不靠夸张字号伪装产品能力。</p></div></article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Primary workbench</div><h2>任务，而不是聊天，占据产品中心</h2></div>
+          <p>标准桌面由 210px 导航、主工作区和 300px Activity Rail 组成。低于 1280px 时 Rail 进入 Drawer。</p>
+        </div>
+        <div class="workbench">
+          <div class="window-rail"><div class="window-dots"><i></i><i></i><i></i></div><div class="global-search">Search or run a command · ⌘K</div><div class="stop">Emergency stop</div></div>
+          <aside class="sidebar">
+            <div class="side-brand"><img src="./marks/unzoo-one-mark-signal.svg" alt=""><span>unzoo one</span></div>
+            <nav class="nav"><span>Home</span><span class="active">Tasks</span><span>Inbox <i class="count">3</i></span><span>Automations</span><span>Artifacts</span><span>Integrations</span><span>Memory</span><span>Settings</span></nav>
+            <div class="side-foot">All systems ready</div>
+          </aside>
+          <div class="workspace">
+            <div class="task-header">
+              <div><small>RESEARCH · RUNNING 01:42</small><h3>个人数字助理产品进入策略</h3></div>
+              <div class="header-actions"><button class="icon-btn">Ⅱ</button><button class="icon-btn">■</button><button class="icon-btn">•••</button></div>
+            </div>
+            <div class="progress-line"><i></i></div>
+            <div class="plan">
+              <div class="plan-head"><b>Plan</b><div class="providers"><span class="provider">UNZOO</span><span class="provider">UNTERM</span><span class="provider">CODEX</span></div></div>
+              <div class="steps">
+                <div class="step done"><span class="node"></span><div class="step-copy"><b>确认目标与交付范围</b><span>市场、用户、产品边界已经确认</span></div><span class="step-time">00:08</span></div>
+                <div class="step done"><span class="node"></span><div class="step-copy"><b>研究并验证来源</b><span>已比较 12 个一手来源</span></div><span class="step-time">00:54</span></div>
+                <div class="step active"><span class="node"></span><div class="step-copy"><b>综合产品差异与风险</b><span>正在验证三条核心判断</span></div><span class="step-time">00:40</span></div>
+                <div class="step waiting"><span class="node"></span><div class="step-copy"><b>发送决策摘要</b><span>等待完成报告与用户检查</span></div><span class="step-time">—</span></div>
+              </div>
+            </div>
+            <div class="approval">
+              <div class="risk-icon">◇</div>
+              <div class="approval-copy"><b>发送前请检查</b><span>将 PDF 发送给 Alex Chen · 1 位收件人 · 尚未发生外部写操作</span></div>
+              <div class="approval-actions"><button class="btn">拒绝</button><button class="btn">修改范围</button><button class="btn attention">批准本次</button></div>
+            </div>
+            <div class="compact-composer"><span>追加要求，或要求 One 改变计划…</span><span class="send">↑</span></div>
+          </div>
+          <aside class="activity">
+            <div class="activity-head"><b>Live activity</b><span>● LIVE</span></div>
+            <div class="event"><time>00:12</time><b>检索 12 个来源</b><p>Unzoo Browser · Research profile</p></div>
+            <div class="event"><time>00:47</time><b>提取并验证关键事实</b><p>发现 2 条冲突信息</p><div class="evidence"><i></i><i></i><i></i></div></div>
+            <div class="event active"><time>01:18</time><b>综合产品判断</b><p>Codex · Unterm</p></div>
+            <div class="event attention"><time>01:42</time><b>准备请求检查</b><p>外部发送尚未执行</p></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Component lab</div><h2>状态必须比装饰更清楚</h2></div>
+          <p>Composer、Step、Approval 和 Artifact 是产品可信度的四个核心组件，设计和领域状态一一对应。</p>
+        </div>
+        <div class="lab">
+          <article class="lab-card">
+            <b>Command Composer · Hero</b>
+            <div class="composer-lab"><p>研究个人数字助理市场，并形成一份产品进入策略</p><footer><div class="modes"><span class="mode active">Research</span><span class="mode">Work</span><span class="mode">Code</span><span class="mode">Automate</span></div><span class="send">↑</span></footer></div>
+          </article>
+          <article class="lab-card">
+            <b>Step states</b>
+            <div class="state-list">
+              <div class="state-row"><i class="state-node"></i><b>Pending</b><span>等待前置步骤</span></div>
+              <div class="state-row"><i class="state-node running"></i><b>Running</b><span>当前智能活动</span></div>
+              <div class="state-row"><i class="state-node waiting"></i><b>Waiting</b><span>需要用户或外部条件</span></div>
+              <div class="state-row"><i class="state-node completed"></i><b>Completed</b><span>结果已经验证</span></div>
+              <div class="state-row"><i class="state-node failed"></i><b>Failed</b><span>失败且有明确恢复路径</span></div>
+              <div class="state-row"><i class="state-node review"></i><b>Needs review</b><span>结果不应自动继续</span></div>
+            </div>
+          </article>
+          <article class="lab-card">
+            <b>Approval risk ladder</b>
+            <div class="risk-stack">
+              <div class="risk"><b>Review</b><span>本地可撤销修改</span></div>
+              <div class="risk"><b>Attention</b><span>外部发送或发布</span></div>
+              <div class="risk high"><b>High</b><span>删除、凭据、付款 · Hold</span></div>
+              <div class="risk high"><b>Critical</b><span>批量不可逆 · 确认短语</span></div>
+            </div>
+          </article>
+          <article class="lab-card">
+            <b>Artifact card</b>
+            <div class="artifact-card"><div class="artifact-preview"></div><div class="artifact-foot"><span>Market entry strategy</span><span>PDF · VERIFIED</span></div></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Screen blueprints</div><h2>关键页面围绕注意力重新排序</h2></div>
+          <p>每个页面都必须同时设计 First Use、Ready、Running、Attention 和 Degraded，而不是只提供一张理想态截图。</p>
+        </div>
+        <div class="screen-grid">
+          <article class="screen">
+            <div class="screen-top"><span>HOME · READY</span><span>⌘N New task</span></div>
+            <div class="screen-body"><h3>Good evening, Alex</h3><div class="mini-composer">What would you like to accomplish?</div><div class="attention-strip"><div class="attention-card"><b>Approval</b><span>1 external send</span></div><div class="attention-card"><b>Failed task</b><span>Can continue safely</span></div><div class="attention-card"><b>Input required</b><span>Select workspace</span></div></div></div>
+          </article>
+          <article class="screen">
+            <div class="screen-top"><span>INBOX · ATTENTION</span><span>3 items</span></div>
+            <div class="inbox-layout"><div class="filter-col"><span class="active">Needs approval</span><span>Needs input</span><span>Needs review</span><span>Failed</span></div><div class="list-col"><div class="list-item active">Send PDF<br>1 recipient</div><div class="list-item">Publish draft<br>Web account</div></div><div class="detail-col"><b>Review before sending</b><p>对象、目标、Scope、可撤销性和请求来源在这里完整展示。</p><button class="btn attention">Approve once</button></div></div>
+          </article>
+          <article class="screen">
+            <div class="screen-top"><span>AUTOMATION · BUILDER</span><span>Draft</span></div>
+            <div class="builder"><div class="builder-nav"><span>Trigger</span><span>Goal</span><span class="active">Access</span><span>Delivery</span><span>Test</span></div><div class="builder-main"><h3>Access preview</h3><div class="form-block"><b>Browser profile</b><p>Research · read-only until approval</p></div><div class="form-block"><b>Workspace</b><p>D:\Research · create files</p></div><div class="form-block"><b>Attention route</b><p>Send external actions to Inbox</p></div></div></div>
+          </article>
+          <article class="screen">
+            <div class="screen-top"><span>INTEGRATIONS · HEALTH</span><span>4 connected</span></div>
+            <div class="screen-body"><h3>Capabilities</h3><div class="integration-grid"><div class="integration"><b>Codex</b><span>Brain · Healthy</span></div><div class="integration"><b>Unterm</b><span>Execution · Healthy</span></div><div class="integration"><b>Unzoo Browser</b><span>Browser · Healthy</span></div><div class="integration"><b>Email</b><span>Connector · Reauth required</span></div></div></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">Responsive behavior</div><h2>隐藏次要列，不压缩主要任务</h2></div>
+          <p>桌面产品的响应式目标不是模仿手机，而是在窗口变窄时保持任务、审批和停止入口可用。</p>
+        </div>
+        <div class="breakpoints">
+          <article class="breakpoint"><b>Large</b><code>≥ 1440px</code><p>216px 导航、完整工作区、320px Activity Rail。适合多证据和并行查看。</p></article>
+          <article class="breakpoint"><b>Standard</b><code>1180–1439px</code><p>72px Compact Nav。Activity Rail 可以折叠为 Drawer，主工作区保持至少 720px。</p></article>
+          <article class="breakpoint"><b>Minimum</b><code>1024–1179px</code><p>单主列；详情和 Activity 使用 Overlay。Approval 与 Emergency Stop 永远可见。</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head"><div><div class="eyebrow">Delivery</div><h2>下一步从规格进入组件库</h2></div></div>
+        <div class="delivery">
+          <article class="delivery-card"><b>Design implementation</b><p>将 Token 固化为 CSS Variables；建立 Button、Composer、Step、Approval、Artifact、Provider Badge 和 Activity Event 的 Storybook 状态矩阵。</p></article>
+          <article class="delivery-card"><b>Product validation</b><p>用五个真实任务验证首次结果、跨 Provider、等待审批、用户接管和组件降级；设计验收必须覆盖键盘与 125%/150% Windows 缩放。</p></article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page"><span>Unzoo One · C1 Product Design System</span><span>Product UI v0.1 · Implementation specification</span></footer>
+</body>
+</html>

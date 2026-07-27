@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One Open Gate app icon</title>
+  <desc id="desc">The Open Gate mark on an obsidian application tile.</desc>
+  <defs>
+    <linearGradient id="tile-b" x1="30" y1="20" x2="226" y2="236" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171C28"/>
+      <stop offset="1" stop-color="#07090E"/>
+    </linearGradient>
+    <linearGradient id="signal-b" x1="58" y1="210" x2="204" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#63E6FF"/>
+      <stop offset=".5" stop-color="#6C8CFF"/>
+      <stop offset="1" stop-color="#A06CFF"/>
+    </linearGradient>
+    <radialGradient id="halo-b">
+      <stop stop-color="#6C8CFF" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#6C8CFF" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="icon-cut">
+      <rect width="256" height="256" fill="#fff"/>
+      <path d="m103 119 42-36h24v100h-33v-58l-16 14z" fill="#000"/>
+      <path d="M149 83h20l27-33h17v23l-44 39h-20z" fill="#000"/>
+    </mask>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="60" fill="url(#tile-b)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="59.5"
+        fill="none" stroke="#fff" stroke-opacity=".1"/>
+  <circle cx="128" cy="132" r="88" fill="url(#halo-b)"/>
+  <rect x="45" y="50" width="168" height="168" rx="48"
+        fill="url(#signal-b)" mask="url(#icon-cut)"/>
+</svg>

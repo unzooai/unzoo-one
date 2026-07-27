@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One Flow mark — motion specimen</title>
+  <desc id="desc">The single line draws from an open capability boundary into one intent.</desc>
+  <defs>
+    <linearGradient id="motion-signal" x1="48" y1="220" x2="208" y2="38" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5FE1FF"/>
+      <stop offset=".52" stop-color="#657FF7"/>
+      <stop offset="1" stop-color="#926BFA"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .flow {
+      stroke-dasharray: 520;
+      stroke-dashoffset: 520;
+      animation: draw 1.1s cubic-bezier(.16,1,.3,1) .15s forwards;
+    }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .flow { animation: none; stroke-dashoffset: 0; }
+    }
+  </style>
+  <path class="flow" d="M60 58v74c0 50 27 82 68 82s68-32 68-82V52l-38 36"
+        fill="none" stroke="url(#motion-signal)" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

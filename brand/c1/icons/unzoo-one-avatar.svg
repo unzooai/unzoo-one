@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One profile avatar</title>
+  <desc id="desc">The Flow mark inside a circular Obsidian field.</desc>
+  <defs>
+    <linearGradient id="avatar-signal" x1="56" y1="206" x2="200" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5FE1FF"/>
+      <stop offset=".52" stop-color="#657FF7"/>
+      <stop offset="1" stop-color="#926BFA"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="120" fill="#080A0F"/>
+  <circle cx="128" cy="128" r="119.5" fill="none" stroke="#FFFFFF" stroke-opacity=".12"/>
+  <path d="M65 62v68c0 46 25 75 63 75s63-29 63-75V57l-35 34"
+        fill="none" stroke="url(#avatar-signal)" stroke-width="24"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

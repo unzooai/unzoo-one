@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo One Open Gate mark — monochrome</title>
+  <desc id="desc">A rounded boundary opened by a number one shaped path.</desc>
+  <defs>
+    <mask id="gate-cut">
+      <rect width="256" height="256" fill="#fff"/>
+      <path d="m98 113 52-44h29v121h-41v-69l-20 17z" fill="#000"/>
+      <path d="M154 69h25l34-41h15v27l-49 50h-25z" fill="#000"/>
+    </mask>
+  </defs>
+  <rect x="28" y="28" width="200" height="200" rx="58"
+        fill="#111318" mask="url(#gate-cut)"/>
+</svg>

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Unzoo Browser mark concept</title>
+  <desc id="desc">The Unzoo open vessel surrounding a browser horizon and perceptive core.</desc>
+  <defs>
+    <linearGradient id="browser-signal" x1="48" y1="214" x2="204" y2="42" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#24D6B2"/>
+      <stop offset=".52" stop-color="#2C9CFF"/>
+      <stop offset="1" stop-color="#4967FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M56 52v78c0 47 30.5 78 72 78s72-31 72-78V52"
+        fill="none" stroke="url(#browser-signal)" stroke-width="22"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="128" cy="130" r="27" fill="none" stroke="url(#browser-signal)" stroke-width="8"/>
+  <path d="M104 132c7 8 15 12 24 12s17-4 24-12"
+        fill="none" stroke="url(#browser-signal)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="128" cy="119" r="5" fill="#2C9CFF"/>
+</svg>

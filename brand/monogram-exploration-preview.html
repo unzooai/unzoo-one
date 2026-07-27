@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unzoo One — Monogram Reset</title>
+  <link rel="stylesheet" href="./tokens.css">
+  <style>
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; background: #080a0f; }
+    body {
+      margin: 0;
+      color: #f7f8fa;
+      background: #080a0f;
+      font-family: var(--one-font-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    .page { width: min(1320px, calc(100% - 64px)); margin: 0 auto; }
+    header { height: 74px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .brand { font-size: 15px; font-weight: 620; letter-spacing: -.03em; }
+    .meta, .note { color: #8d94a4; font-size: 11px; }
+    .hero { padding: 82px 0 58px; }
+    .eyebrow { color: #8d94a4; font-size: 10px; font-weight: 700; letter-spacing: .17em; text-transform: uppercase; }
+    h1 { margin: 16px 0 18px; font-size: clamp(48px, 6vw, 78px); line-height: 1; font-weight: 520; letter-spacing: -.06em; }
+    .lead { max-width: 690px; color: #b9bfca; font-size: 15px; line-height: 1.7; }
+    .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; padding-bottom: 74px; }
+    .candidate {
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.09);
+      border-radius: 22px;
+      background: rgba(255,255,255,.018);
+    }
+    .candidate.recommended { border-color: rgba(108,140,255,.44); box-shadow: 0 0 0 1px rgba(108,140,255,.07); }
+    .visual {
+      position: relative;
+      min-height: 370px;
+      display: grid;
+      place-items: center;
+      background: #f7f8fa;
+    }
+    .visual img { width: 220px; height: 220px; }
+    .badge { position: absolute; top: 18px; left: 18px; padding: 6px 9px; color: #525867; font-size: 9px; border: 1px solid #d9dce2; border-radius: 999px; }
+    .recommended .badge { color: #4054ba; border-color: #bfc9ff; background: #eef0ff; }
+    .copy { padding: 22px; }
+    .copy h2 { margin: 0 0 8px; font-size: 16px; font-weight: 570; letter-spacing: -.025em; }
+    .copy p { min-height: 52px; margin: 0; color: #8d94a4; font-size: 11px; line-height: 1.6; }
+    .traits { display: flex; gap: 6px; margin-top: 18px; flex-wrap: wrap; }
+    .traits span { padding: 5px 7px; color: #a7adba; font-size: 9px; border: 1px solid rgba(255,255,255,.09); border-radius: 6px; }
+    section { padding: 74px 0; border-top: 1px solid rgba(255,255,255,.08); }
+    .section-head { display: flex; justify-content: space-between; align-items: end; gap: 30px; margin-bottom: 30px; }
+    .section-head h2 { margin: 10px 0 0; font-size: 30px; font-weight: 540; letter-spacing: -.04em; }
+    .section-head p { max-width: 500px; margin: 0; color: #8d94a4; font-size: 11px; line-height: 1.6; }
+    .test-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 14px; }
+    .inverse, .sizes { min-height: 300px; border-radius: 22px; }
+    .inverse { display: flex; align-items: center; justify-content: space-around; background: #f7f8fa; }
+    .inverse .dark, .inverse .light { display: grid; place-items: center; width: 210px; height: 210px; border-radius: 24px; }
+    .inverse .dark { background: #111318; }
+    .inverse img { width: 150px; height: 150px; }
+    .inverse .dark img { filter: invert(1); }
+    .sizes { display: grid; align-content: center; gap: 25px; padding: 30px; border: 1px solid rgba(255,255,255,.09); background: rgba(255,255,255,.018); }
+    .size-row { display: flex; align-items: end; gap: 23px; }
+    .size { display: grid; justify-items: center; gap: 9px; color: #8d94a4; font-size: 9px; }
+    .s16 img { width: 16px; } .s24 img { width: 24px; } .s32 img { width: 32px; } .s48 img { width: 48px; } .s72 img { width: 72px; }
+    .decision { padding: 20px; color: #b9bfca; font-size: 11px; line-height: 1.65; border-left: 2px solid #6c8cff; background: rgba(108,140,255,.055); }
+    .wordmarks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .wordmark { min-height: 160px; display: flex; align-items: center; gap: 17px; padding: 28px; border: 1px solid rgba(255,255,255,.09); border-radius: 18px; }
+    .wordmark img { width: 48px; height: 48px; filter: invert(1); }
+    .wordmark b { font-size: 20px; font-weight: 610; letter-spacing: -.045em; }
+    .wordmark small { display: block; margin-top: 5px; color: #8d94a4; font-size: 9px; letter-spacing: .03em; }
+    footer { padding: 38px 0 60px; display: flex; justify-content: space-between; color: #8d94a4; font-size: 10px; border-top: 1px solid rgba(255,255,255,.08); }
+    @media (max-width: 900px) {
+      .board, .wordmarks, .test-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="page"><div class="brand">unzoo one</div><div class="meta">Monogram reset · black & white only</div></header>
+
+  <main>
+    <div class="page hero">
+      <div class="eyebrow">Reset after Direction B</div>
+      <h1>先让符号成立，<br>再让它发光。</h1>
+      <p class="lead">放弃方块、眼睛、轨道和渐变。三枚候选都直接研究 `U → 1` 的结构关系；没有任何一枚使用颜色掩饰轮廓问题。</p>
+    </div>
+
+    <div class="page board">
+      <article class="candidate recommended">
+        <div class="visual"><span class="badge">RECOMMENDED</span><img src="./exploration-c1-flow-one.svg" alt="Flow One"></div>
+        <div class="copy">
+          <h2>C1 · Flow One</h2>
+          <p>一笔完成：左侧进入 U，右臂自然上升成为数字 1。温和但不软弱，最适合长期作为产品母标。</p>
+          <div class="traits"><span>单线</span><span>连续</span><span>人性化</span></div>
+        </div>
+      </article>
+      <article class="candidate">
+        <div class="visual"><span class="badge">PRECISION</span><img src="./exploration-c2-cut-one.svg" alt="Cut One"></div>
+        <div class="copy">
+          <h2>C2 · Cut One</h2>
+          <p>保留相同逻辑，但使用斜轴、直切端点和更紧张的比例。更像专业基础设施品牌，气质更冷。</p>
+          <div class="traits"><span>精密</span><span>克制</span><span>工程感</span></div>
+        </div>
+      </article>
+      <article class="candidate">
+        <div class="visual"><span class="badge">DUAL FORCE</span><img src="./exploration-c3-unison.svg" alt="Unison"></div>
+        <div class="copy">
+          <h2>C3 · Unison</h2>
+          <p>容器与行动柱是两个独立力量，在底部形成统一。识别最直接，但图形略重，更适合 App Icon。</p>
+          <div class="traits"><span>强力</span><span>直接</span><span>双结构</span></div>
+        </div>
+      </article>
+    </div>
+
+    <section>
+      <div class="page">
+        <div class="section-head">
+          <div><div class="eyebrow">C1 stress test</div><h2>推荐方向的小尺寸与反白</h2></div>
+          <p>C1 没有内部小孔和细碎负空间，天然适合任务栏、Favicon 和系统托盘。正式版本仍需调整 16px 的线宽与端点。</p>
+        </div>
+        <div class="test-grid">
+          <div class="inverse">
+            <div class="light"><img src="./exploration-c1-flow-one.svg" alt=""></div>
+            <div class="dark"><img src="./exploration-c1-flow-one.svg" alt=""></div>
+          </div>
+          <div class="sizes">
+            <div class="size-row">
+              <div class="size s16"><img src="./exploration-c1-flow-one.svg" alt=""><span>16</span></div>
+              <div class="size s24"><img src="./exploration-c1-flow-one.svg" alt=""><span>24</span></div>
+              <div class="size s32"><img src="./exploration-c1-flow-one.svg" alt=""><span>32</span></div>
+              <div class="size s48"><img src="./exploration-c1-flow-one.svg" alt=""><span>48</span></div>
+              <div class="size s72"><img src="./exploration-c1-flow-one.svg" alt=""><span>72</span></div>
+            </div>
+            <div class="decision">判断标准：不需要先看产品名，也能感到“开放的 U 正在变成 1”；如果只看到普通 U，则继续调整右侧斜肩。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="page">
+        <div class="section-head"><div><div class="eyebrow">Lockup study</div><h2>放进名字里再看一次</h2></div></div>
+        <div class="wordmarks">
+          <div class="wordmark"><img src="./exploration-c1-flow-one.svg" alt=""><div><b>unzoo one</b><small>FLOW ONE</small></div></div>
+          <div class="wordmark"><img src="./exploration-c2-cut-one.svg" alt=""><div><b>unzoo one</b><small>CUT ONE</small></div></div>
+          <div class="wordmark"><img src="./exploration-c3-unison.svg" alt=""><div><b>unzoo one</b><small>UNISON</small></div></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page"><span>Unzoo One · Monogram exploration</span><span>No color · No effects · No final selection</span></footer>
+</body>
+</html>
