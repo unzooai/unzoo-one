@@ -160,6 +160,21 @@
       "name": "timestamp-unknown-offset.json",
       "schema": "task/task.schema.json",
       "reason": "时间用了 -00:00。RFC 3339 里它表示「偏移未知」而不是 UTC，正是「所有时间必须是 UTC」这条规则要挡的东西——放宽到接受 +00:00 时不能把它一起放进来。"
+    },
+    {
+      "name": "brain-approval-requested-without-tool.json",
+      "schema": "brain/events.schema.json#/$defs/brain_event",
+      "reason": "approval.requested 不说要跑哪个工具、什么参数。审批人只能看到「有个东西想执行」，那不是在审批，是在盲签。"
+    },
+    {
+      "name": "brain-approval-denied-without-message.json",
+      "schema": "brain/events.schema.json#/$defs/brain_event",
+      "reason": "拒绝了却不给理由。模型只能从这条消息知道为什么停下；没有理由，它会猜，或者换个工具绕过去再试。"
+    },
+    {
+      "name": "brain-approval-policy-without-rule.json",
+      "schema": "brain/events.schema.json#/$defs/brain_event",
+      "reason": "策略自动放行，却说不出是哪条规则。自动决定没有人在场，能追溯的只有规则本身；没有 rule_id，这次放行就无从审计。"
     }
   ]
 }

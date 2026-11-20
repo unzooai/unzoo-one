@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Open in Unterm</string>
+	<key>CFBundleExecutable</key>
+	<string>UntermFinderSync</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.unzoo.unterm.finder-sync</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Unterm Finder Integration</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.12.5</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<!-- LSUIElement = true is required for Finder Sync extension hosts —
+	     without it macOS 26 (Tahoe) loads the extension process but Finder
+	     never queries it for menus. (Compared against DingTalk's working
+	     FinderSync extension, which has this key.) -->
+	<key>LSUIElement</key>
+	<true/>
+	<!-- Declare a minimum system version so Launch Services treats the
+	     bundle as a first-class macOS extension rather than legacy. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<!-- NSExtensionAttributes (even empty) is required by NSExtension on
+		     macOS 26 — without it Finder won't surface the contextual menu
+		     even though pluginkit registers + enables the extension. -->
+		<key>NSExtensionAttributes</key>
+		<dict/>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.FinderSync</string>
+		<!-- The Swift class declares `@objc(FinderSyncExtension)`, so the Obj-C
+		     runtime knows it as the bare name `FinderSyncExtension`. The earlier
+		     `UntermFinderSync.FinderSyncExtension` form silently failed to load
+		     (Obj-C runtime can't find a non-existent class name) and pluginkit
+		     never registered the extension — that's why "Open in Unterm" never
+		     appeared in Finder. -->
+		<key>NSExtensionPrincipalClass</key>
+		<string>FinderSyncExtension</string>
+	</dict>
+</dict>
+</plist>

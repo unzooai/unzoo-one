@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window may ask for its connection to the background service and open the terminal.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

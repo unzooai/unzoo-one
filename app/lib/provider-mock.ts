@@ -5,6 +5,7 @@
  * 组件表现不变，才算接对了。
  */
 
+import { t } from "../i18n";
 import {
   defaultConnectorStates,
   initialActivityItems,
@@ -25,11 +26,14 @@ import type {
 } from "../types";
 import type {
   ActivityPort,
+  AgentRule,
+  AgentRulePort,
   ApprovalDecision,
   ApprovalPort,
   ArtifactPort,
   BrainEvent,
   BrainPort,
+  BrainSession,
   CapabilityLease,
   ConnectorPort,
   PolicyPort,
@@ -41,7 +45,9 @@ import type {
 } from "./provider";
 
 /** 高风险动作的关键词。policy.check 的 mock 判据，真实实现走 unterm 的策略引擎。 */
-const externalSendKeywords = ["发送", "上传", "分享", "提交", "发布"];
+// Matched against the action text, which can be in either language: these
+// are data, not interface text, so they are not translated.
+const externalSendKeywords = ["发送", "上传", "分享", "提交", "发布", "send", "upload", "share", "submit", "publish"];
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -52,7 +58,7 @@ function nextId(prefix: string): string {
 }
 
 function nowLabel(): string {
-  return "刚刚更新";
+  return t("刚刚更新");
 }
 
 export function createMockProvider(): WorkspaceProvider {
@@ -74,14 +80,14 @@ export function createMockProvider(): WorkspaceProvider {
       return found ? clone(found) : null;
     },
     async create(draft) {
-      if (tasks.some((t) => t.id === draft.id)) throw new Error(`任务 id 已存在: ${draft.id}`);
+      if (tasks.some((t) => t.id === draft.id)) throw new Error(t("任务 id 已存在: {id}", { id: draft.id }));
       const task: TaskItem = { progress: 0, ...clone(draft), updated: nowLabel() };
       tasks = [task, ...tasks];
       return clone(task);
     },
     async update(id, patch) {
       const index = tasks.findIndex((t) => t.id === id);
-      if (index === -1) throw new Error(`任务不存在: ${id}`);
+      if (index === -1) throw new Error(t("任务不存在: {id}", { id }));
       tasks[index] = { ...tasks[index], ...clone(patch), updated: nowLabel() };
       return clone(tasks[index]);
     },
@@ -98,7 +104,7 @@ export function createMockProvider(): WorkspaceProvider {
     },
     async exportEvidence(id) {
       const task = tasks.find((t) => t.id === id);
-      if (!task) throw new Error(`任务不存在: ${id}`);
+      if (!task) throw new Error(t("任务不存在: {id}", { id }));
       const related = artifacts.filter((a) => a.taskId === id);
       return JSON.stringify({ task, artifacts: related, exportedAt: new Date().toISOString() }, null, 2);
     },
@@ -110,6 +116,10 @@ export function createMockProvider(): WorkspaceProvider {
   const approvalPort: ApprovalPort = {
     async list() {
       return approvals.slice();
+    },
+    // 内存实现没有托管会话。
+    async live() {
+      return [];
     },
     async decide(id, decision) {
       return approvalPort.decideMany([id], decision);
@@ -123,7 +133,7 @@ export function createMockProvider(): WorkspaceProvider {
             id: nextId("activity"),
             time: nowLabel(),
             createdAt: new Date().toISOString(),
-            title: decision.kind === "approve" ? `已批准：${item.title}` : `已拒绝：${item.title}`,
+            title: decision.kind === "approve" ? t("已批准：{title}", { title: item.title }) : t("已拒绝：{title}", { title: item.title }),
             detail: decision.kind === "approve" ? item.impact : decision.reason,
             icon: "shield",
             tone: decision.kind === "approve" ? "green" : "red",
@@ -149,7 +159,7 @@ export function createMockProvider(): WorkspaceProvider {
     },
     async update(id, patch) {
       const index = artifacts.findIndex((a) => a.id === id);
-      if (index === -1) throw new Error(`成果不存在: ${id}`);
+      if (index === -1) throw new Error(t("成果不存在: {id}", { id }));
       artifacts[index] = { ...artifacts[index], ...clone(patch), updated: nowLabel() };
       return clone(artifacts[index]);
     },
@@ -215,12 +225,12 @@ export function createMockProvider(): WorkspaceProvider {
 
   const policyPort: PolicyPort = {
     async check(action, target): Promise<PolicyVerdict> {
-      const external = externalSendKeywords.some((k) => action.includes(k));
+      const external = externalSendKeywords.some((k) => action.toLowerCase().includes(k));
       if (!external) return { allowed: true, requiresApproval: false };
       return {
         allowed: true,
         requiresApproval: true,
-        reason: `${action} 会把内容送到 ${target}，属于外部发送，需要先确认。`,
+        reason: t("{action} 会把内容送到 {target}，属于外部发送，需要先确认。", { action, target }),
       };
     },
     async set() {
@@ -233,13 +243,13 @@ export function createMockProvider(): WorkspaceProvider {
       return clone(members);
     },
     async invite(member) {
-      if (members.some((m) => m.id === member.id)) throw new Error(`成员 id 已存在: ${member.id}`);
+      if (members.some((m) => m.id === member.id)) throw new Error(t("成员 id 已存在: {id}", { id: member.id }));
       members = [...members, clone(member)];
       return clone(member);
     },
     async updateRole(id, role) {
       const index = members.findIndex((m) => m.id === id);
-      if (index === -1) throw new Error(`成员不存在: ${id}`);
+      if (index === -1) throw new Error(t("成员不存在: {id}", { id }));
       members[index] = { ...members[index], role };
       return clone(members[index]);
     },
@@ -254,26 +264,61 @@ export function createMockProvider(): WorkspaceProvider {
    */
   const brainSessions = new Map<string, { events: BrainEvent[]; startedAt: number }>();
 
+  /** 演示会话说过的话，续接时用来证明"接上了"。 */
+  const brainTranscripts = new Map<string, { agent: BrainSession["agent"]; prompts: string[] }>();
+
+  function playTurn(
+    agent: BrainSession["agent"],
+    prompt: string,
+    ids: { taskId: string; runId: string; stepId: string },
+    reply: string,
+  ): BrainSession {
+    const sessionId = nextId("ags");
+    const at = new Date().toISOString();
+    brainSessions.set(sessionId, {
+      startedAt: Date.now(),
+      events: [
+        { event: "session.started", at, ...ids },
+        { event: "turn.started", at, model: agent === "claude-code" ? "claude-opus-5" : "gpt-5-codex", ...ids },
+        { event: "output.delta", at, stream: "assistant", message: reply, ...ids },
+        { event: "usage.updated", at, ...ids },
+        { event: "turn.completed", at, state: "finished", ...ids },
+      ],
+    });
+    return { sessionId, agent, adapter: agent === "claude-code" ? "claude" : "codex" };
+  }
+
   const brainPort: BrainPort = {
+    async agents() {
+      return [
+        { id: "claude-code", name: "Claude Code", installed: true, hosted: true, governed: true, signedIn: true, signInCommand: "claude" },
+        { id: "codex-cli", name: "Codex CLI", installed: true, hosted: true, governed: false, signedIn: true, signInCommand: "codex login" },
+        { id: "opencode", name: "OpenCode", installed: false, hosted: true, governed: false, signedIn: false, signInCommand: "opencode auth login" },
+      ];
+    },
     async start({ agent, prompt, taskId, runId, stepId }) {
-      const sessionId = nextId("ags");
-      const at = new Date().toISOString();
-      const ids = { taskId, runId, stepId };
-      brainSessions.set(sessionId, {
-        startedAt: Date.now(),
-        events: [
-          { event: "session.started", at, ...ids },
-          { event: "turn.started", at, model: agent === "claude-code" ? "claude-opus-5" : "gpt-5-codex", ...ids },
-          { event: "output.delta", at, message: `收到：${prompt.slice(0, 40)}`, ...ids },
-          { event: "usage", at, ...ids },
-          { event: "turn.ended", at, ...ids },
-        ],
+      const session = playTurn(agent, prompt, { taskId, runId, stepId }, t("收到：{slice}", { slice: prompt.slice(0, 40) }));
+      brainTranscripts.set(session.sessionId, { agent, prompts: [prompt] });
+      return session;
+    },
+    async resume({ sessionId, prompt, taskId, runId, stepId }) {
+      const earlier = brainTranscripts.get(sessionId);
+      if (!earlier) throw new Error(t("会话 {sessionId} 没有可以接着的对话", { sessionId }));
+      const session = playTurn(
+        earlier.agent,
+        prompt,
+        { taskId, runId, stepId },
+        t("接着上次（{slice}）：{slice2}", { slice: earlier.prompts[0].slice(0, 20), slice2: prompt.slice(0, 40) }),
+      );
+      brainTranscripts.set(session.sessionId, {
+        agent: earlier.agent,
+        prompts: [...earlier.prompts, prompt],
       });
-      return { sessionId, agent, adapter: agent === "claude-code" ? "claude" : "codex" };
+      return session;
     },
     async events(sessionId, cursor) {
       const session = brainSessions.get(sessionId);
-      if (!session) throw new Error(`会话不存在: ${sessionId}`);
+      if (!session) throw new Error(t("会话不存在: {sessionId}", { sessionId }));
       // 按经过的时间逐条放出来，让界面看到的是流式而不是一次到齐。
       const available = Math.min(
         session.events.length,
@@ -283,7 +328,7 @@ export function createMockProvider(): WorkspaceProvider {
     },
     async status(sessionId) {
       const session = brainSessions.get(sessionId);
-      if (!session) throw new Error(`会话不存在: ${sessionId}`);
+      if (!session) throw new Error(t("会话不存在: {sessionId}", { sessionId }));
       const done = Date.now() - session.startedAt > session.events.length * 400;
       return {
         state: done ? "finished" : "running",
@@ -296,7 +341,36 @@ export function createMockProvider(): WorkspaceProvider {
     },
     async close(sessionId) {
       const existed = brainSessions.delete(sessionId);
-      return existed ? { exitCode: 0 } : { exitCode: 1, reason: "会话已经结束" };
+      return existed ? { exitCode: 0 } : { exitCode: 1, reason: t("会话已经结束") };
+    },
+  };
+
+  /** 演示版的常设规则：只活在这一页里，真规则在 unterm 的状态目录。 */
+  let agentRules: AgentRule[] = [];
+  const agentRulePort: AgentRulePort = {
+    async list() {
+      return { rules: clone(agentRules) };
+    },
+    async add(draft) {
+      const tool = draft.tool.trim();
+      if (!tool) throw new Error(t("规则要写明是哪个工具"));
+      const rule: AgentRule = {
+        id: nextId("rule"),
+        tool,
+        decision: draft.decision,
+        workspace: draft.workspace?.trim() || undefined,
+        commandPrefix: draft.commandPrefix?.trim() || undefined,
+        note: draft.note?.trim() || undefined,
+        createdAt: new Date().toISOString(),
+        createdBy: "console",
+      };
+      agentRules = [...agentRules, rule];
+      return clone(rule);
+    },
+    async remove(id) {
+      const before = agentRules.length;
+      agentRules = agentRules.filter((rule) => rule.id !== id);
+      if (agentRules.length === before) throw new Error(t("没有这条规则：{id}", { id }));
     },
   };
 
@@ -343,6 +417,137 @@ export function createMockProvider(): WorkspaceProvider {
     policy: policyPort,
     team: teamPort,
     brain: brainPort,
+    runtime: {
+      // 演示版没有本机运行时：任务留在页面里，由页面自己演示运行。
+      async available() {
+        return false;
+      },
+      async list() {
+        return [];
+      },
+      async put() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async remove() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async run() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async thread() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async stop() {
+        return false;
+      },
+      async setWatchSecret() {},
+      async output() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async capabilities() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async browser() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async terminalScreen() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async terminalInput() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async answerHandover() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async focusTerminal() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async tabView() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async activateTab() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async skills() {
+        return [];
+      },
+      async clients() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async connectClient() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async shells() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async setDefaultShell() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async installShell() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async setTermProgram() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async tellRules() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async forgetTellRule() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async plugins() {
+        return { plugins: [], browserProfiles: [] };
+      },
+      async addPlugin(): Promise<string> {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async enablePlugin() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async restartPlugin() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async removePlugin() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async bindPluginRole() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async pluginLog() {
+        return "";
+      },
+      async phone() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async pairPhone() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async unpairPhone() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async setPhoneEnabled() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async setupBrowserForClients() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async setSkillEnabled() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async deleteSkill() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async importSkill() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async settings() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+      async saveSettings() {
+        throw new Error(t("演示版没有本机运行时"));
+      },
+    },
+    agentRules: agentRulePort,
     snapshot,
     defaults,
     reset,

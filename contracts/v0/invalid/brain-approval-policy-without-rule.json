@@ -1,0 +1,16 @@
+{
+  "schema": "brain/events.schema.json#/$defs/brain_event",
+  "reason": "策略自动放行，却说不出是哪条规则。自动决定没有人在场，能追溯的只有规则本身；没有 rule_id，这次放行就无从审计。",
+  "instance": {
+    "schema_version": "brain_event.v0",
+    "event": "approval.resolved",
+    "at": "2026-11-10T05:00:00+00:00",
+    "session_id": "ags_7f31c0",
+    "cursor": 5,
+    "approval": {
+      "request_id": "r1",
+      "decision": "allow_once",
+      "decided_by": "policy"
+    }
+  }
+}

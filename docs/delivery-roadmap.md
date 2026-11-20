@@ -8,6 +8,11 @@
 > 「Unzoo One 是唯一控制平面，Unterm 与 Unzoo 是同级 Provider」。
 > 见 `unzoo-one#2`、`unterm#20`、`unzoo#73`。
 
+> **归属修订 2026-11-09（取代上一条的实现部分）**：Unterm 源码已并入本仓库 `unterm/`，
+> 采用 `unterm#30` 的**路线 A**——运行时以 unterm 的 Rust 实现为准，`contracts/v0`
+> 是它的对外接口，`one-core`（TypeScript）冻结并逐步迁移，Unterm 不再是可选组件。
+> 详见 [ADR 0002](adr/0002-absorb-unterm-route-a.md)。下面 §1 尚未按此重写，冲突处以 ADR 为准。
+
 ## 1. 仓库职责
 
 ### `unzooai/unzoo-one`

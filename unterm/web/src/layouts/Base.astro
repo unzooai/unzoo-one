@@ -1,0 +1,362 @@
+---
+// Base layout: <html>, <head>, sticky nav, footer, slot for the page body.
+//
+// Each translated page passes:
+//   - lang        the BCP-47 locale code, e.g. "zh-CN"
+//   - dict        the loaded translation object (already filtered to that lang)
+//   - alternates  array of {code, href} for hreflang link tags
+//
+// The nav language picker is server-rendered as a real <form> + <select>: a
+// change submits to the corresponding /<code>/ URL via <option data-href>,
+// no JS framework needed. (Tiny inline script handles the select->navigate.)
+
+interface Locale {
+  code: string;
+  name: string;
+  href: string;
+}
+
+interface Props {
+  lang: string;
+  dict: Record<string, string>;
+  alternates: { code: string; href: string }[];
+  locales: Locale[];
+  pathPrefix: string; // "" for en, "/zh-CN" for others
+  // Optional per-page SEO overrides. When omitted, the layout renders the
+  // home page's title / description / canonical / structured data exactly as
+  // before (zero regression). Sub-pages such as /compare/<slug> pass their
+  // own so each ranks for its own query.
+  seo?: {
+    title?: string;
+    description?: string;
+    /** Full site-absolute path of THIS page, e.g. "/compare/warp" or
+     *  "/zh-CN/compare/warp". Drives <link rel=canonical> + og:url. */
+    canonicalPath?: string;
+    /** Replaces the default home JSON-LD graph when provided. */
+    jsonLd?: unknown[];
+    /** x-default hreflang target (defaults to the site root). */
+    xDefault?: string;
+  };
+}
+
+const { lang, dict, alternates, locales, pathPrefix, seo } = Astro.props as Props;
+import enUS from "../i18n/en-US.json";
+
+const t = (k: string) => dict[k] ?? enUS[k] ?? k;
+const metaTitle = seo?.title ?? t("meta.title");
+const metaDesc = seo?.description ?? t("meta.desc");
+const canonical = seo?.canonicalPath
+  ? `https://unterm.app${seo.canonicalPath}`
+  : `https://unterm.app${pathPrefix || "/"}`;
+const xDefaultHref = seo?.xDefault ?? "https://unterm.app/";
+
+// og:locale wants underscore form (en_US, zh_CN). Build the active locale +
+// every other locale as og:locale:alternate so each translated page declares
+// its siblings to social / answer-engine crawlers.
+const ogLocale = lang.replace("-", "_");
+const ogAltLocales = alternates
+  .map((a) => a.code.replace("-", "_"))
+  .filter((c) => c !== ogLocale);
+
+// ?v= busts the Cloudflare edge cache (assets/* carries max-age=86400,
+// so the bare URL can keep serving the previous card for up to a day
+// after a deploy). Bump it whenever og.png is regenerated.
+const ogImage = "https://unterm.app/assets/og.png?v=0.71.28-craft";
+
+// Structured data (SEO rich results + GEO / answer-engine extraction).
+// SoftwareApplication is the primary entity; WebSite + Organization give
+// crawlers the publisher graph. Rendered once per page in <head>.
+const defaultJsonLd: unknown[] = [
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "Unterm",
+    alternateName: "Unterm — the terminal AI agents can drive",
+    applicationCategory: "DeveloperApplication",
+    operatingSystem: "macOS, Linux, Windows",
+    softwareVersion: "0.71.28",
+    url: "https://unterm.app/",
+    downloadUrl: "https://github.com/zhitongblog/unterm/releases/latest",
+    description: t("meta.desc"),
+    license: "https://opensource.org/licenses/MIT",
+    image: ogImage,
+    offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+    author: { "@type": "Person", name: "Alex Lee" },
+    publisher: { "@type": "Organization", name: "Unzoo", url: "https://unterm.app/" },
+    sameAs: [
+      "https://github.com/zhitongblog/unterm",
+      "https://atomgit.com/zhitongblog/unterm",
+    ],
+    featureList: [
+      "Local Model Context Protocol (MCP) server with 155 methods and mcp-trim token optimization",
+      "9 signed first-party AI agent manifests including Claude Code, Codex, Gemini CLI, Antigravity (agy), OpenCode, and Qwen Code",
+      "Agent Cockpit & Inspection (Ctrl+Shift+I): real-time per-pane state tracking, 1-key Y/N approval, and live terminal takeover (handover)",
+      "Central Multi-Agent Delegation (agent_session.delegate) & isolated Git worktree fleets",
+      "7 native themes (Obsidian, Carbon, Solarized Dark, Dracula, Nord, Daylight, Paper Light) with high-contrast split-pane focus rings",
+      "Zero-stall input pipeline with concurrent session activity snapshots and sub-millisecond echo wakeup",
+      "Review: dangling-commit checkpoints, diffs, test runs, merge as staged changes, rollback",
+      "GPU rendering via wgpu: Metal, Direct3D 12 and Vulkan, with OpenGL and software fallbacks",
+      "No telemetry, no account; all servers bind to 127.0.0.1",
+      "Cross-platform support for macOS, Linux, and Windows",
+    ],
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    name: "Unterm",
+    url: "https://unterm.app/",
+    description: t("meta.desc"),
+    inLanguage: lang,
+  },
+];
+
+const jsonLd = seo?.jsonLd ?? defaultJsonLd;
+---
+
+<!doctype html>
+<html lang={lang} class="bg-notion-bg scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{metaTitle}</title>
+    <meta name="description" content={metaDesc} />
+    <link rel="canonical" href={canonical} />
+    {alternates.map((a) => (
+      <link rel="alternate" hreflang={a.code} href={a.href} />
+    ))}
+    <link rel="alternate" hreflang="x-default" href={xDefaultHref} />
+
+    <meta name="theme-color" content="#10b981" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Unterm" />
+    <meta property="og:title" content={metaTitle} />
+    <meta property="og:description" content={metaDesc} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={metaTitle} />
+    <meta property="og:locale" content={ogLocale} />
+    {ogAltLocales.map((c) => (
+      <meta property="og:locale:alternate" content={c} />
+    ))}
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={metaTitle} />
+    <meta name="twitter:description" content={metaDesc} />
+    <meta name="twitter:image" content={ogImage} />
+    <meta name="twitter:image:alt" content={metaTitle} />
+
+    {jsonLd.map((schema) => (
+      <script type="application/ld+json" set:html={JSON.stringify(schema)} />
+    ))}
+
+    <link rel="sitemap" type="application/xml" href="/sitemap.xml" />
+    <style is:global>
+      kbd {
+        display: inline-block;
+        min-width: 1.6em;
+        margin: 0 0.12em;
+        padding: 0.05em 0.45em;
+        border: 1px solid rgb(255 255 255 / 0.14);
+        border-bottom-width: 2px;
+        border-radius: 5px;
+        background: rgb(255 255 255 / 0.05);
+        font: 500 0.82em/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-align: center;
+        color: rgb(228 228 222);
+      }
+      .guide-prose code {
+        font: 0.9em ui-monospace, SFMono-Regular, Menlo, monospace;
+        padding: 0.1em 0.35em;
+        border-radius: 4px;
+        background: rgb(255 255 255 / 0.06);
+        color: rgb(236 236 230);
+      }
+    </style>
+
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/icon-32.png?v=0.71.28" />
+    <link rel="icon" type="image/png" sizes="256x256" href="/assets/icon-256.png?v=0.71.28" />
+    <link rel="icon" type="image/svg+xml" href="/assets/icon.svg?v=0.71.28" />
+
+    <!-- Cloudflare Web Analytics (privacy-first, no cookies) -->
+    <script
+      is:inline
+      type="module"
+      src="https://static.cloudflareinsights.com/beacon.min.js"
+      data-cf-beacon='{"token": "6daea7bd6ed24e82a9f3b5463dbcc3f0"}'
+    ></script>
+  </head>
+  <body class="bg-notion-bg text-notion-ink antialiased font-sans">
+
+    <!-- ============== NAV ============== -->
+    <header class="sticky top-0 z-30 backdrop-blur bg-notion-bg/80 border-b border-notion-border">
+      <div class="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
+        <a href={pathPrefix + "/"} class="flex items-center gap-2 group">
+          <img src="/assets/icon.svg?v=0.71.28" alt="" width="28" height="28" />
+          <span class="font-semibold tracking-tight text-notion-ink group-hover:text-white">Unterm</span>
+          <span class="text-xs font-mono text-notion-faint hidden sm:inline">v0.71.28</span>
+        </a>
+        <nav class="hidden md:flex items-center gap-6 text-sm text-notion-muted">
+          <a href={pathPrefix + "/#themes"} class="hover:text-notion-ink">{lang.startsWith("zh") ? "7 套主题" : "Themes"}</a>
+          <a href={pathPrefix + "/features"} class="hover:text-notion-ink">{t("nav.features")}</a>
+          <a href={pathPrefix + "/guide"} class="hover:text-notion-ink">{t("nav.guide")}</a>
+          <a href={pathPrefix + "/#compare"} class="hover:text-notion-ink">{t("nav.compare")}</a>
+          <a href="/docs/agent-integration" class="hover:text-notion-ink">{t("nav.docs")}</a>
+          <a href={pathPrefix + "/#install"} class="px-3 py-1.5 rounded-md bg-notion-green/15 text-notion-teal hover:bg-notion-green/25 font-medium">{t("nav.download")}</a>
+        </nav>
+        <div class="flex items-center gap-3">
+          <select id="lang-picker"
+                  class="text-xs bg-notion-surface border border-notion-border rounded px-2 py-1 text-notion-ink focus:outline-none focus:border-notion-borderStrong">
+            {locales.map((l) => (
+              <option value={l.href} selected={l.code === lang}>{l.name}</option>
+            ))}
+          </select>
+          <a href="https://github.com/zhitongblog/unterm" target="_blank" rel="noopener"
+             class="inline-flex items-center gap-1.5 rounded-md border border-notion-border hover:border-notion-borderStrong px-2.5 py-1 text-xs text-notion-muted hover:text-notion-ink transition"
+             aria-label={t("nav.star")} title={t("nav.star")}>
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.6V20c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.4-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 2-.4 3-.4s2.1.1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.7.8 1.2 1.9 1.2 3.2 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.5-1.5 7.8-5.8 7.8-10.9C23.5 5.7 18.3.5 12 .5z"/>
+            </svg>
+            <span class="hidden sm:inline">Star</span>
+            <span data-stat-chip hidden class="inline-flex items-center gap-1 pl-1.5 border-l border-notion-border font-mono">
+              <svg class="w-3 h-3 text-amber-400" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3 6.1 20.6l1.3-6.6L2.5 9.4l6.6-.8z"/></svg>
+              <span data-stat="stars"></span>
+            </span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <slot />
+    </main>
+
+    <!-- ============== FOOTER ============== -->
+    <footer class="border-t border-notion-border py-12 mt-10">
+      <div class="max-w-6xl mx-auto px-6 space-y-6">
+        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
+          <div class="flex items-center gap-2 text-notion-faint text-sm">
+            <img src="/assets/icon.svg?v=0.71.28" alt="" width="20" height="20" />
+            <span class="font-semibold text-notion-ink">Unterm</span>
+            <span>{t("footer.tag")}</span>
+          </div>
+          <div class="flex flex-wrap items-center gap-5 text-sm text-notion-faint">
+            <a href="https://github.com/zhitongblog/unterm" target="_blank" rel="noopener" class="hover:text-notion-ink">GitHub</a>
+            <a href="https://atomgit.com/zhitongblog/unterm" target="_blank" rel="noopener" class="hover:text-notion-ink">AtomGit</a>
+            <a href="https://github.com/zhitongblog/unterm/releases" target="_blank" rel="noopener" class="hover:text-notion-ink">{t("footer.releases")}</a>
+            <a href="/changelog" class="hover:text-notion-ink">{t("footer.changelog")}</a>
+            <a href="/docs/agent-integration" class="hover:text-notion-ink">{t("footer.docs")}</a>
+            <a href="https://github.com/zhitongblog/unterm/blob/master/LICENSE.md" target="_blank" rel="noopener" class="hover:text-notion-ink">{t("footer.license")}</a>
+            <a href={pathPrefix + "/features"} class="hover:text-notion-ink">{t("footer.features")}</a>
+            <a href={pathPrefix + "/guide"} class="hover:text-notion-ink">{t("footer.guide")}</a>
+            <a href={pathPrefix + "/features#sponsor"} class="hover:text-rose-300"><span class="text-rose-400">♥</span> {t("footer.sponsor")}</a>
+            <a href={pathPrefix + "/ambassador"} class="hover:text-notion-ink">{t("footer.ambassador")}</a>
+            <span>{t("footer.copy")}</span>
+          </div>
+        </div>
+        <!-- SoloMD-style tech-stack callout: a single line at the very bottom
+             that signals "this is what's actually under the hood." Helps
+             ship engineers get a quick read on whether to read the source. -->
+        <div class="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-xs text-notion-faint">
+          <span class="uppercase tracking-widest font-mono text-[10px]">{t("footer.also")}</span>
+          <a href="https://doaipm.com" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 hover:text-notion-ink">
+            <img src="/assets/ads/doaipm.svg" width="16" height="16" alt="" class="rounded" />DO AI PM <span class="text-notion-faint">· {t("ads.doaipm")}</span>
+          </a>
+          <a href="https://unflick.app" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 hover:text-notion-ink">
+            <img src="/assets/ads/unflick.svg" width="16" height="16" alt="" class="rounded" />Unflick <span class="text-notion-faint">· {t("ads.unflick")}</span>
+          </a>
+        </div>
+        <div class="text-center text-xs text-notion-faint font-mono pt-4 border-t border-notion-border/60">
+          {t("footer.stack")}
+        </div>
+      </div>
+    </footer>
+
+    <!-- Shown once per browser, after a download link is clicked. -->
+    <div id="dl-thanks" hidden
+         class="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 w-[calc(100%-2rem)] max-w-xl rounded-xl border border-notion-border bg-notion-surface/95 backdrop-blur shadow-lg px-4 py-3 text-sm text-notion-ink">
+      <div class="flex items-center gap-3">
+        <span class="flex-1">{t("dl.thanks")}</span>
+        <a href="https://github.com/zhitongblog/unterm" target="_blank" rel="noopener"
+           class="shrink-0 inline-flex items-center gap-1 rounded-md bg-notion-green/15 hover:bg-notion-green/25 text-notion-teal px-2.5 py-1 font-medium">
+          <svg class="w-3.5 h-3.5 text-amber-400" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3 6.1 20.6l1.3-6.6L2.5 9.4l6.6-.8z"/></svg>
+          {t("dl.star")}
+        </a>
+        <button type="button" id="dl-thanks-close" class="shrink-0 text-notion-faint hover:text-notion-ink px-1" aria-label={t("dl.close")}>×</button>
+      </div>
+    </div>
+    <script is:inline>
+      (() => {
+        const bar = document.getElementById("dl-thanks");
+        if (!bar) return;
+        const KEY = "unterm.dl-thanks.shown";
+        const seen = () => { try { return localStorage.getItem(KEY) === "1"; } catch (_) { return false; } };
+        const remember = () => { try { localStorage.setItem(KEY, "1"); } catch (_) {} };
+        document.getElementById("dl-thanks-close")?.addEventListener("click", () => { bar.hidden = true; });
+        document.addEventListener("click", (event) => {
+          const link = event.target.closest && event.target.closest("a[href]");
+          if (!link || seen()) return;
+          const href = link.getAttribute("href") || "";
+          if (!/\/api\/download|\/releases\/(latest\/)?download\/|atomgit\.com\/[^/]+\/unterm\/releases/.test(href)) return;
+          remember();
+          setTimeout(() => { bar.hidden = false; }, 600);
+        });
+      })();
+    </script>
+
+    <script is:inline>
+      // Tiny non-framework lang picker — no Alpine needed.
+      const sel = document.getElementById("lang-picker");
+      if (sel) {
+        sel.addEventListener("change", (e) => {
+          const href = e.target.value;
+          if (href) window.location.assign(href);
+        });
+      }
+
+      // Layer 3 of the stats stack: live-refresh the star/download chips.
+      //
+      // Why this exists, even though Astro already SSR'd numbers into the
+      // HTML: the build only runs on push to master, which can be days or
+      // weeks ago. /api/stats is a Pages Function that proxies GitHub on
+      // a 5-minute edge cache, so a regular visitor still sees today's
+      // count without us redeploying.
+      //
+      // Two footguns guarded against:
+      //   1. We update only when the answer is > 0. A null response
+      //      (proxy failure) leaves the SSR text alone — never overwrite
+      //      a real number with "—" or 0.
+      //   2. We swallow all errors silently. If /api/stats is down, the
+      //      page just keeps showing the build-time numbers; users never
+      //      see "loading..." flicker or a thrown promise.
+      (function () {
+        function fmt(n) {
+          if (n === null || !Number.isFinite(n)) return "—";
+          if (n < 1000) return String(n);
+          if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+          if (n < 1000000) return Math.round(n / 1000) + "k";
+          return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+        }
+        function paint(key, value) {
+          if (typeof value !== "number" || value <= 0) return;
+          document
+            .querySelectorAll('[data-stat="' + key + '"]')
+            .forEach((el) => {
+              el.textContent = fmt(value);
+              const chip = el.closest("[data-stat-chip]");
+              if (chip) chip.hidden = false;
+            });
+        }
+        fetch("/api/stats", { headers: { accept: "application/json" } })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (!d) return;
+            paint("stars", d.stars);
+            paint("downloads", d.downloads);
+          })
+          .catch(() => {});
+      })();
+    </script>
+  </body>
+</html>

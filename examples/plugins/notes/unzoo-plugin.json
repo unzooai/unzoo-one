@@ -1,0 +1,17 @@
+{
+  "id": "notes",
+  "name": "Notes",
+  "version": "0.1.0",
+  "description": "A tiny example plugin: a page and two tools around a list of notes",
+  "run": { "command": ["python", "{dir}/server.py"], "health": "/api/ping" },
+  "page": "/",
+  "mcp": {
+    "command": ["python", "{dir}/mcp_server.py"],
+    "tools": { "list_notes": "read", "add_note": "change" }
+  },
+  "roles": {
+    "browser": { "kind": "browser", "label": "Browser identity it would use" },
+    "writer": { "kind": "agent", "label": "Agent that writes", "default": { "agent": "claude-code", "model": "sonnet" } }
+  },
+  "permissions": { "domains": [] }
+}

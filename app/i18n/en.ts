@@ -1,0 +1,208 @@
+import { enPage1 } from "./en-page-1";
+import { enPage2 } from "./en-page-2";
+import { enPage3 } from "./en-page-3";
+import { enPage4 } from "./en-page-4";
+import { enPage5 } from "./en-page-5";
+import { enPage6 } from "./en-page-6";
+import { enPage7 } from "./en-page-7";
+import { enPage8 } from "./en-page-8";
+import { enDemo } from "./en-demo";
+import { enPage9 } from "./en-page-9";
+import { enPage10 } from "./en-page-10";
+import { enPage11 } from "./en-page-11";
+
+/**
+ * English, keyed by the Chinese source text (see ./index.ts).
+ *
+ * Every `t("…")` in the console needs an entry here; `tests/i18n.test.mjs`
+ * fails on one that is missing. Keep `{placeholders}` identical.
+ */
+export const en: Record<string, string> = {
+  // First, so a key an older catalog already translates keeps that wording.
+  ...enPage10,
+  ...enPage11,
+  ...enPage9,
+  ...enPage1,
+  ...enPage2,
+  ...enPage3,
+  ...enPage4,
+  ...enPage5,
+  ...enPage6,
+  ...enPage7,
+  ...enPage8,
+  ...enDemo,
+  // Settings › Agents
+  "读不到运行设置：{error}": "Couldn't read the run settings: {error}",
+  "没有保存：{error}": "Not saved: {error}",
+  "{message}（这个浏览器不能保存设置，刷新后会恢复默认）":
+    "{message} (this browser can't store settings; they'll reset when you reload)",
+  "智能体的工作目录已设为 {cwd}": "Agent working directory set to {cwd}",
+  "已清除智能体的工作目录": "Agent working directory cleared",
+  "先设好工作目录，或者取消“只在工作目录里生效”":
+    "Set a working directory first, or uncheck “Only in the working directory”",
+  "已添加规则：{rule}": "Rule added: {rule}",
+  "没能添加规则：{error}": "Couldn't add the rule: {error}",
+  "已删除规则：{rule}": "Rule removed: {rule}",
+  "没能删除规则：{error}": "Couldn't remove the rule: {error}",
+  "智能体执行": "Agent runs",
+  "工作目录、受管模式与常设规则": "Working directory, governed mode and standing rules",
+  "交给哪个智能体": "Agent for tasks",
+  "读不到智能体清单：{error}": "Couldn't read the list of agents: {error}",
+  "{name} 没装在这台机器上，任务会启动失败。": "{name} isn't installed on this computer, so tasks will fail to start.",
+  "{name} 不支持受管，会以托管模式运行：每次工具调用照样先进收件箱。":
+    "{name} doesn't support governed mode, so it runs hosted: every tool call still comes to your inbox first.",
+  "新建、继续和重试的任务都交给它。继续对话沿用那次运行原来的智能体。":
+    "New, resumed and retried tasks go to this agent. Continuing a conversation keeps the agent that run used.",
+  "任务改为交给 {name}": "Tasks now go to {name}",
+  "正在读取…": "Loading…",
+  "{agent}（清单里没有）": "{agent} (not in the list)",
+  "（未安装）": " (not installed)",
+  "工作目录": "Working directory",
+  "任务交给智能体后，它在这个目录里读写文件、执行命令。留空则每个任务用自己的文件夹：文档 › Unzoo One › 任务名。":
+    "The agent reads and writes files and runs commands in this folder. Leave it empty and each task gets its own folder: Documents › Unzoo One › task name.",
+  "例如 C:\\code\\my-project": "e.g. C:\\code\\my-project",
+  "智能体的工作目录": "Agent working directory",
+  "保存": "Save",
+  "受管模式": "Governed mode",
+  "关掉 Claude Code 自带的 Bash、PowerShell 和联网工具，命令只能经 Unzoo One 执行，每一步都先进收件箱。目前只有 Claude Code 支持；其它智能体以托管模式运行：用自己的工具，但同样逐条等你批准。":
+    "Turns off Claude Code's own Bash, PowerShell and web tools so commands can only run through Unzoo One, and every step comes to your inbox first. Only Claude Code supports this today; other agents run hosted: they use their own tools, but still wait for your approval on each call.",
+  "已改为托管模式": "Switched to hosted mode",
+  "已改为受管模式": "Switched to governed mode",
+  "常设规则": "Standing rules",
+  "命中的工具调用不再进收件箱，直接放行或拒绝。只有人能定规则；放行规则不会匹配拼接命令（&、|、;、重定向）。各家的命令行工具（Bash、PowerShell、shell、run_command）算同一个，写哪个都对它们全部生效。":
+    "Tool calls that match a rule are allowed or denied without coming to your inbox. Only people can make rules, and an allow rule never matches a chained command (&, |, ;, redirection). Every agent's command-line tool (Bash, PowerShell, shell, run_command) counts as one tool, so a rule for any of them applies to all.",
+  "刷新规则": "Refresh rules",
+  "读取规则失败：{error}": "Couldn't load the rules: {error}",
+  "还没有规则。每次工具调用都会进收件箱。": "No rules yet. Every tool call comes to your inbox.",
+  "放行": "Allow",
+  "拒绝": "Deny",
+  "只在 {workspace}": "Only in {workspace}",
+  "所有工作区": "All workspaces",
+  "审批时记住": "Remembered from an approval",
+  "在设置里添加": "Added in Settings",
+  "删除规则 {rule}": "Remove rule {rule}",
+  "删除规则": "Remove rule",
+  "规则的决定": "Rule decision",
+  "工具名": "Tool name",
+  "工具，如 Bash": "Tool, e.g. Bash",
+  "命令前缀": "Command prefix",
+  "命令前缀（可选），如 git push": "Command prefix (optional), e.g. git push",
+  "只在工作目录里生效": "Only in the working directory",
+  "添加": "Add",
+  "规则保存在 {store}": "Rules are stored in {store}",
+
+  // Task and run states. These are data values compared in code, so they are
+  // translated where shown (`t(task.status)`), not where set.
+  "运行中": "Running",
+  "待确认": "Needs review",
+  "失败": "Failed",
+  "已完成": "Done",
+  "已暂停": "Paused",
+  "成功": "Succeeded",
+  "已取消": "Cancelled",
+
+  // Home focus card and run records
+  "正在运行的任务": "Current task",
+  "还没有任务": "No tasks yet",
+  "说清楚要做什么，交给智能体去做。它每一次用工具前都会先来这里问你。":
+    "Describe what needs doing and hand it to an agent. It asks you here before every tool it uses.",
+  "新建第一个任务": "Create your first task",
+  "等你确认": "Waiting for you",
+  "正在运行": "Running",
+  "最近一次": "Last run",
+  "{seconds} 秒": "{seconds}s",
+  "智能体正在处理": "The agent is working",
+  "停下": "Stop",
+  "再运行一次": "Run again",
+  "查看任务": "Open task",
+  "按计划运行": "Scheduled run",
+  "等你在收件箱确认一次工具调用": "Waiting for you to approve a tool call in your inbox",
+  "运行完成": "Run finished",
+  "已停止": "Stopped",
+  "运行失败": "Run failed",
+  "完成": "Finished",
+  "停止": "Stopped",
+  "{when} {verb}": "{verb} {when}",
+  "刚刚": "Just now",
+  "目标：{target}": "Target: {target}",
+
+  // Remaining data values (enum members in app/types.ts)
+  "全部": "All",
+  "仅运行一次": "Once",
+  "每天": "Daily",
+  "每周": "Weekly",
+  "周一": "Monday",
+  "周二": "Tuesday",
+  "周三": "Wednesday",
+  "周四": "Thursday",
+  "周五": "Friday",
+  "周六": "Saturday",
+  "周日": "Sunday",
+  "报告": "Reports",
+  "证据": "Evidence",
+  "草稿": "Draft",
+  "重点": "Key",
+  "已修订": "Revised",
+  "管理员": "Admin",
+  "审批者": "Approver",
+  "在线": "Online",
+  "已邀请": "Invited",
+  "待接受": "Pending",
+  "审批": "Approval",
+  "系统": "System",
+  "未读": "Unread",
+  "已跳过": "Skipped",
+
+  // Approvals from hosted agents, service errors, the offline demo engine
+  "（未提供参数）": "(no arguments)",
+  "{minutes} 分钟前": "{minutes} min ago",
+  "执行命令": "run a command",
+  "修改文件": "change a file",
+  "授予权限": "grant a permission",
+  "调用 {tool}": "use {tool}",
+  "{agent} 请求{action}": "{agent} wants to {action}",
+  "{agent} 在托管会话中要使用 {tool}，执行前需要你确认。": "{agent} wants to use {tool} in a hosted session and needs your approval first.",
+  "批准后会在本机执行：{target}": "If approved, this runs on this computer: {target}",
+  "批准后 {agent} 会使用 {tool}：{target}": "If approved, {agent} uses {tool}: {target}",
+  "仅本次调用": "This call only",
+  "会话关闭时自动拒绝": "Denied automatically when the session closes",
+  "托管会话：执行前询问": "Hosted session: asks before running",
+  "Unzoo One 的后台服务还没有就绪": "The Unzoo One background service isn't ready yet",
+  "bootstrap.json 返回 {status}": "bootstrap.json returned {status}",
+  "bootstrap.json 里没有 auth_token": "bootstrap.json has no auth_token",
+  "{error}（{detail}）": "{error} ({detail})",
+  "后台服务返回 {status}": "The background service returned {status}",
+  "不是托管会话的审批：{id}": "Not a hosted-session approval: {id}",
+  "后台服务返回的规则不完整": "The background service returned an incomplete rule",
+  "刚刚更新": "Just updated",
+  "任务 id 已存在: {id}": "A task with id {id} already exists",
+  "任务不存在: {id}": "No such task: {id}",
+  "成果不存在: {id}": "No such deliverable: {id}",
+  "{action} 会把内容送到 {target}，属于外部发送，需要先确认。": "{action} sends content to {target}, which counts as sending out and needs approval first.",
+  "成员 id 已存在: {id}": "A member with id {id} already exists",
+  "成员不存在: {id}": "No such member: {id}",
+  "收到：{slice}": "Got it: {slice}",
+  "会话 {sessionId} 没有可以接着的对话": "Session {sessionId} has no conversation to continue",
+  "接着上次（{slice}）：{slice2}": "Continuing from before ({slice}): {slice2}",
+  "会话不存在: {sessionId}": "No such session: {sessionId}",
+  "会话已经结束": "The session has ended",
+  "规则要写明是哪个工具": "A rule needs to name a tool",
+  "没有这条规则：{id}": "No such rule: {id}",
+  "演示版没有本机运行时": "The demo has no local service",
+  "界面语言": "Language",
+  "切换后页面会重新载入。": "The page reloads when you change it.",
+  "待确认的操作": "Approvals",
+  "终端只能在 Unzoo One 桌面版里打开": "The terminal can only be opened in the Unzoo One desktop app",
+  "没能打开终端：{error}": "Couldn't open the terminal: {error}",
+  "打开终端": "Open terminal",
+  "我的工作区": "My workspace",
+  "交给 AI 的任务、审批与成果": "Tasks, approvals and deliverables you hand to AI",
+  "个人版": "Personal",
+  "完成下面几步，就可以把真实的工作交给智能体。": "Finish these steps and you're ready to hand real work to an agent.",
+  "交给智能体的第一项工作": "The first piece of work for an agent",
+  "智能体没能启动：{error}": "The agent couldn't start: {error}",
+  "十分钟没有任何进展，已停止": "Stopped after ten minutes without any progress",
+  "智能体的会话意外中断了": "The agent's session ended unexpectedly",
+  "这次运行还没结束，后台服务就停止了": "The background service stopped before this run finished",
+  "Unzoo One | AI 任务工作台": "Unzoo One | The AI task workspace",
+};

@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main, "agent/**"]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings -A unexpected-cfgs -A dead-code -A unused-imports -A unused-mut -A unused-unsafe -A unused-assignments -A mismatched-lifetime-syntaxes"
+
+jobs:
+  check-macos:
+    name: cargo check (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p unterm-app -p unterm-cli
+      - name: Run product tests
+        # Serial on every platform, not only Windows: several suites
+        # share process-global state -- unterm-core's engine, and the
+        # single front end a Core may have attached -- so parallel test
+        # threads see each other's sessions. Windows had this flag and
+        # the others did not, which made the same defect a Windows-only
+        # rule instead of the workspace-wide one it is.
+        run: cargo test --release --workspace -- --test-threads=1
+
+  check-linux:
+    name: cargo check (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libssl-dev \
+            libgtk-3-dev \
+            libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-util-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+      - run: cargo check -p unterm-app -p unterm-cli
+      - name: Run product tests
+        # Serial on every platform, not only Windows: several suites
+        # share process-global state -- unterm-core's engine, and the
+        # single front end a Core may have attached -- so parallel test
+        # threads see each other's sessions. Windows had this flag and
+        # the others did not, which made the same defect a Windows-only
+        # rule instead of the workspace-wide one it is.
+        run: cargo test --release --workspace -- --test-threads=1
+
+  check-windows:
+    name: cargo check (Windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Full history: the benchmark gate checks that the recorded summary
+          # commit is an ancestor of HEAD. A shallow checkout makes it skip that
+          # check entirely -- it had been silently not running.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p unterm-app -p unterm-cli
+      - name: Run product tests
+        run: cargo test --release --workspace -- --test-threads=1
+      - name: Verify next-core gates
+        shell: pwsh
+        run: .\ci\next-core-benchmark.ps1

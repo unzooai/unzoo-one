@@ -31,12 +31,14 @@ test("server-renders the Unzoo One task console", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<html lang="zh-CN">/);
-  assert.match(html, /<title>Unzoo One \| AI 任务操作系统<\/title>/);
-  assert.match(html, /(夜深了|早上好|下午好|晚上好)，今天有 4 件事需要你处理/);
-  assert.match(html, /跟踪竞品发布动态/);
-  assert.match(html, /需要你处理/);
-  assert.match(html, /你交给 Unzoo One 的工作/);
+  // Server rendering has no system language: it is English, the default
+  // for the European and US market. Chinese is chosen in the browser.
+  assert.match(html, /<html lang="en">/);
+  assert.match(html, /<title>Unzoo One \| The AI task workspace<\/title>/);
+  assert.match(html, /(Working late|Good morning|Good afternoon|Good evening) — 4 thing\(s\) need you today/);
+  assert.match(html, /Track competitor releases/);
+  assert.match(html, /Needs you/);
+  assert.match(html, /Work you(&#x27;|')ve handed to Unzoo One/);
   assert.match(html, /ai-core-premium\.webp/);
   assert.match(html, /unzoo-one-mark-v6\.png/);
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/);
@@ -62,16 +64,16 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /clarity-wordmark-name/);
   assert.match(page, /clarity-wordmark-one/);
   assert.match(page, /clarity-mobile-brand-mark/);
-  assert.match(page, /className="clarity-brand"[\s\S]*aria-label="返回首页"/);
+  assert.match(page, /className="clarity-brand"[\s\S]*aria-label=\{t\("返回首页"\)\}/);
   assert.match(page, /const onboardingPreferenceKey =/);
   assert.match(page, /type OnboardingStepId =/);
-  assert.match(page, /const onboardingSteps:/);
+  assert.match(page, /const onboardingSteps\s*[:=]/);
   assert.match(page, /function openOnboarding\(\)/);
   assert.match(page, /function continueOnboarding\(\)/);
   assert.match(page, /id="workspace-onboarding"/);
   assert.match(page, /className="workspace-onboarding-steps"/);
   assert.match(page, /name: "",[\s\S]*target: "",[\s\S]*description: ""/);
-  assert.match(page, /targetHint: "粘贴要监控的网页地址"/);
+  assert.match(page, /targetHint: t\("粘贴要监控的网页地址"\)/);
   assert.match(page, /activeTaskTemplate\?\.targetHint/);
   assert.match(brandSvg, /viewBox="12 12 104 104"/);
   assert.match(brandSvg, /#356dff/);
@@ -190,7 +192,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /window\.Notification\.requestPermission/);
   assert.match(page, /new window\.Notification/);
   assert.match(page, /desktopNotificationTrackingReadyRef/);
-  assert.match(page, /aria-label="需要确认时发送桌面通知"/);
+  assert.match(page, /aria-label=\{t\("需要确认时发送桌面通知"\)\}/);
   assert.match(page, /页面内通知仍会保留/);
   assert.match(page, /className="notification-backdrop"/);
   assert.match(page, /function closeNotifications/);
@@ -226,12 +228,12 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function confirmHighRiskApproval/);
   assert.match(page, /approvalConfirmAcknowledged/);
   assert.match(page, /className="approval-confirm-dialog"/);
-  assert.match(page, /aria-label="我已核对执行对象和授权范围"/);
+  assert.match(page, /aria-label=\{t\("我已核对执行对象和授权范围"\)\}/);
   assert.match(page, /disabled=\{!approvalConfirmAcknowledged\}/);
   assert.match(page, /function confirmApprovalSnooze/);
   assert.match(page, /function restoreDeferredApproval/);
   assert.match(page, /className="approval-snooze-dialog"/);
-  assert.match(page, /aria-label="重新提醒时间"/);
+  assert.match(page, /aria-label=\{t\("重新提醒时间"\)\}/);
   assert.match(page, /type ArtifactItem =/);
   assert.match(page, /const initialArtifacts: ArtifactItem\[\]/);
   assert.match(page, /function isArtifactItem/);
@@ -310,7 +312,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function openPlanBudget\(\)/);
   assert.match(page, /function openPlanMembers\(\)/);
   assert.match(page, /className="plan-center-dialog"/);
-  assert.match(page, /aria-label="关闭方案中心"/);
+  assert.match(page, /aria-label=\{t\("关闭方案中心"\)\}/);
   assert.match(page, /onClick=\{openPlanBudget\}/);
   assert.match(page, /onClick=\{openPlanMembers\}/);
   assert.match(page, /type SettingsDraftTarget =/);
@@ -333,7 +335,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /保存为已暂停/);
   assert.match(page, /任务会先保存，不会运行/);
   assert.match(page, /usage: usageSettings/);
-  assert.match(page, /aria-label="本月 AI 额度使用"/);
+  assert.match(page, /aria-label=\{t\("本月 AI 额度使用"\)\}/);
   assert.match(page, /function scrollWorkspaceTop/);
   assert.match(page, /temporaryModeOpen/);
   assert.match(page, /关闭页面后保留工作区/);
@@ -350,7 +352,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /完成后 10 秒内可以撤销/);
   assert.match(
     page,
-    /notice\.startsWith\("已删除"\) \|\| notice\.startsWith\("已拒绝"\)/,
+    /notice\.startsWith\(t\("已删除"\)\) \|\| notice\.startsWith\(t\("已拒绝"\)\)/,
   );
   assert.match(page, /function chooseApproval/);
   assert.match(page, /function scrollApprovalIntoView/);
@@ -359,9 +361,9 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /拒绝后自动暂停任务/);
   assert.match(page, /function exportActivity/);
   assert.match(page, /function exportActivityItem/);
-  assert.match(page, /aria-label="搜索运行记录"/);
-  assert.match(page, /aria-label="运行记录排序"/);
-  assert.match(page, /aria-label="复制事件 ID"/);
+  assert.match(page, /aria-label=\{t\("搜索运行记录"\)\}/);
+  assert.match(page, /aria-label=\{t\("运行记录排序"\)\}/);
+  assert.match(page, /aria-label=\{t\("复制事件 ID"\)\}/);
   assert.match(page, /function exportWorkspace/);
   assert.match(page, /async function importWorkspace/);
   assert.match(page, /type PendingWorkspaceImport =/);
@@ -407,7 +409,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /taskScheduleTime/);
   assert.match(page, /taskScheduleDay/);
   assert.match(page, /role="radiogroup"/);
-  assert.match(page, /aria-label="运行记录筛选"/);
+  assert.match(page, /aria-label=\{t\("运行记录筛选"\)\}/);
   assert.match(page, /role="switch"/);
   assert.match(page, /<textarea/);
   assert.match(page, /<select/);
@@ -439,11 +441,11 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function openTaskRun/);
   assert.match(page, /async function copyTaskRunId/);
   assert.match(page, /function downloadTaskRun/);
-  assert.match(page, /aria-label="运行阶段"/);
+  assert.match(page, /aria-label=\{t\("运行阶段"\)\}/);
   assert.match(page, /id="run-detail-title"/);
   assert.match(page, /MAIL_AUTH_EXPIRED/);
   assert.match(page, /任务未完成，但没有执行外部发送/);
-  assert.match(page, /aria-label="运行健康"/);
+  assert.match(page, /aria-label=\{t\("运行健康"\)\}/);
   assert.match(page, /selectedTaskIds/);
   assert.match(page, /function toggleAllVisibleTasks/);
   assert.match(page, /function bulkPauseTasks/);
@@ -460,8 +462,8 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function confirmBulkReject/);
   assert.match(page, /approval\.risk !== "高风险"/);
   assert.match(page, /approvalRejectReason\.trim\(\)\.length < 4/);
-  assert.match(page, /aria-label="批量审批操作"/);
-  assert.match(page, /aria-label="审批风险筛选"/);
+  assert.match(page, /aria-label=\{t\("批量审批操作"\)\}/);
+  assert.match(page, /aria-label=\{t\("审批风险筛选"\)\}/);
   assert.match(page, /useRef<HTMLInputElement>/);
   assert.match(page, /function chooseSearchResult/);
   assert.match(page, /function handleSearchKeyDown/);
@@ -570,8 +572,8 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function openWorkspaceSection/);
   assert.match(page, /function openWorkspaceBudget/);
   assert.match(page, /function openWorkspaceInvite/);
-  assert.match(page, /aria-label="打开工作区控制中心"/);
-  assert.match(page, /aria-modal="true"\s+aria-label="工作区控制中心"/);
+  assert.match(page, /aria-label=\{t\("打开工作区控制中心"\)\}/);
+  assert.match(page, /aria-modal="true"\s+aria-label=\{t\("工作区控制中心"\)\}/);
   assert.match(page, /id="settings-usage"/);
   assert.match(page, /id="settings-team"/);
   assert.match(page, /id="settings-connectors"/);
@@ -597,7 +599,8 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /function discardRecoveredArtifactDraft/);
   assert.match(page, /function DraftRecoveryNotice/);
   assert.match(page, /function getWorkspaceToday/);
-  assert.match(page, /timeZone: "Asia\/Shanghai"/);
+  // Times are shown in the viewer's own time zone, not a fixed one.
+  assert.doesNotMatch(page, /Asia\/Shanghai/);
   assert.doesNotMatch(page, /今天 · 7 月 29 日/);
   assert.match(page, /发现未完成的任务草稿/);
   assert.match(page, /发现未完成的成果修订/);
@@ -615,12 +618,12 @@ test("keeps commercial task interactions and accessibility in source", async () 
   assert.match(page, /composer-error-summary/);
   assert.match(page, /role="alert"/);
   assert.match(page, /isSavingTask/);
-  assert.match(page, /aria-label="通知筛选"/);
+  assert.match(page, /aria-label=\{t\("通知筛选"\)\}/);
   assert.match(page, /全部已读/);
-  assert.match(page, /aria-label="搜索任务列表"/);
-  assert.match(page, /aria-label="任务排序"/);
-  assert.match(page, /aria-label="搜索成果列表"/);
-  assert.match(page, /aria-label="成果排序"/);
+  assert.match(page, /aria-label=\{t\("搜索任务列表"\)\}/);
+  assert.match(page, /aria-label=\{t\("任务排序"\)\}/);
+  assert.match(page, /aria-label=\{t\("搜索成果列表"\)\}/);
+  assert.match(page, /aria-label=\{t\("成果排序"\)\}/);
   assert.match(css, /\.task-list-controls/);
   assert.match(css, /\.task-bulk-bar/);
   assert.match(css, /\.task-selection-control/);
@@ -730,7 +733,7 @@ test("keeps commercial task interactions and accessibility in source", async () 
     (match) => Number(match[1]),
   );
   assert.ok(Math.min(...pixelFontSizes) >= 11);
-  assert.match(layout, /AI 任务操作系统/);
+  assert.match(layout, /The AI task workspace/);
   assert.match(packageJson, /"test": "npm run test:contracts && npm run build && node --test/);
 
   await assert.rejects(access(new URL("app/_sites-preview", templateRoot)));

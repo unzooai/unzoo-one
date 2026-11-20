@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="12 12 104 104" role="img" aria-labelledby="title">
+  <title id="title">Unzoo One</title>
+  <g fill="none" stroke-linecap="round" stroke-width="16">
+    <circle cx="64" cy="64" r="34" stroke="#356dff" stroke-dasharray="58 155.63" transform="rotate(-90 64 64)"/>
+    <circle cx="64" cy="64" r="34" stroke="#102a31" stroke-dasharray="58 155.63" transform="rotate(30 64 64)"/>
+    <circle cx="64" cy="64" r="34" stroke="#16b889" stroke-dasharray="58 155.63" transform="rotate(150 64 64)"/>
+  </g>
+  <rect width="16" height="16" x="56" y="56" rx="3" fill="#102a31" transform="rotate(45 64 64)"/>
+</svg>

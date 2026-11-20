@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unzoo One — 智能体的电脑</title>
+<meta name="description" content="Unzoo One 给 Claude Code、Codex 等智能体一台电脑：不会断的终端、带你登录状态的真浏览器、你定的规矩。一切都在你自己的电脑上。">
+<meta property="og:title" content="Unzoo One — 智能体的电脑">
+<meta property="og:description" content="不会断的终端、带你登录状态的真浏览器、你定的规矩——给你已经在用的智能体。数据只在本机。">
+<meta property="og:image" content="/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.png">
+<link rel="alternate" hreflang="en" href="/">
+<link rel="alternate" hreflang="zh" href="/zh/">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<nav class="nav"><div class="wrap">
+  <a class="brand" href="/zh/"><img src="/mark.svg" alt="">Unzoo One</a>
+  <a class="back" href="https://unzoo.ai/zh/">← 返回 Unzoo</a>
+  <div class="nav-links">
+    <a href="#how" class="hide-sm">怎么用</a>
+    <a href="#safety" class="hide-sm">安全</a>
+    <a href="#unzoo" class="hide-sm">Unzoo 浏览器</a>
+    <a href="#status">进度</a>
+    <a href="https://github.com/unzooai/unzoo-one">GitHub</a>
+    <a class="lang" href="/" hreflang="en">English</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow"><i></i>Windows 预览版 · 源码公开</span>
+  <h1>智能体的<em>电脑</em>。</h1>
+  <p class="lede">智能体已经够聪明了，缺的是一个干活的地方。Unzoo One 给它们一个不会断的终端、一个带你登录状态的真浏览器，以及你定的规矩——都在你自己的电脑上。</p>
+  <p class="agents">支持 <b>Claude Code</b>、<b>Codex</b>、<b>Antigravity CLI</b>、<b>OpenCode</b>，用你已有的订阅。</p>
+  <div class="cta">
+    <a class="btn primary" href="mailto:dev@unzoo.ai?subject=Unzoo%20One%20%E8%AF%95%E7%94%A8%E7%94%B3%E8%AF%B7">申请试用</a>
+    <a class="btn" href="https://github.com/unzooai/unzoo-one">看源码</a>
+  </div>
+
+  <div class="mock" role="img" aria-label="Unzoo One：左边是对话，右边是智能体的终端和浏览器，点“发送”之前先问你">
+    <div class="mock-bar"><span></span><span></span><span></span><b>Unzoo One</b></div>
+    <div class="mock-body">
+      <div class="convo">
+        <div class="bubble">去账单后台把上个月的发票都下下来，汇总成一张表，给 Dana 写封邮件草稿。</div>
+        <div class="steps">
+          <div>打开了账单后台（用你的登录）</div>
+          <div>下载了 14 张发票</div>
+          <div>运行 <code>python total.py invoices/</code> → 发票-10月.xlsx</div>
+          <div>写好了给 dana@… 的邮件</div>
+        </div>
+        <div class="ask">
+          <h4>点击「发送」（邮箱）？</h4>
+          <p>把 发票-10月.xlsx 发给 Dana。</p>
+          <div class="why"><b>审核员：</b>你只让写草稿，没让发出去。</div>
+          <div class="row"><span>允许</span><span>拒绝</span></div>
+        </div>
+      </div>
+      <div class="computer">
+        <div class="tab">终端</div>
+<div class="term"><span class="p">PS ~/invoices&gt;</span> python total.py .
+<span class="d">reading 14 files…</span>
+total  ¥ 128,420.50
+saved  发票-10月.xlsx
+<span class="p">PS ~/invoices&gt;</span> █</div>
+        <div class="tab">浏览器</div>
+        <div class="browser">
+          <div class="url">邮箱 · 以你的身份登录</div>
+          <div class="page">
+            <div class="line" style="width:40%"></div>
+            <div class="line" style="width:85%"></div>
+            <div class="line" style="width:70%"></div>
+            <div class="send">发送</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></header>
+
+<section id="why"><div class="wrap">
+  <div class="kicker">为什么</div>
+  <h2>聊天窗口不是干活的地方。</h2>
+  <p class="sub">在自家应用里，智能体拿到的是会忘事的沙盒、没有你账号的浏览器，要么什么都不管，要么每一步都问你。Unzoo One 不是又一个聊天应用，它是智能体干活用的电脑。</p>
+  <div class="grid3">
+    <div class="card">
+      <div class="icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg></div>
+      <h3>不会断的终端</h3>
+      <p>终端住在后台服务里，关了窗口照样跑；编译、服务、长时间下载，下次还在。你能看着同一个终端，随时接手。</p>
+    </div>
+    <div class="card">
+      <div class="icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/></svg></div>
+      <h3>真浏览器，真登录</h3>
+      <p>完整的 Chromium，带你的账号，每个智能体一个隔离身份。能下载视频、处理验证码。要登录、要验证码时，把页面交给你，等你弄好。</p>
+      <p class="made">基于 <a href="https://unzoo.ai/zh/">Unzoo 浏览器</a>。</p>
+    </div>
+    <div class="card">
+      <div class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg></div>
+      <h3>你定的规矩</h3>
+      <p>每个动作按风险分级。看、准备，直接做；发送、付款、删除、装软件，等你点头——在对话里、收件箱里或手机上都行。全部留记录。</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="how" class="alt"><div class="wrap">
+  <div class="kicker">怎么用</div>
+  <h2>说一句你要什么，看着它做完。</h2>
+  <p class="sub">不用填表，不用拖流程图。一段对话就是一个任务。</p>
+  <div class="flow">
+    <div><h3>用大白话说</h3><p>“每个工作日早上 9 点看一下这几个竞品网站，有变化告诉我。”</p></div>
+    <div><h3>它在旁边干活</h3><p>智能体用的终端和浏览器实时显示在对话旁边，你随时能接手。</p></div>
+    <div><h3>有风险的等你</h3><p>就地回答。接着在同一段对话里说，它记得前面的事。</p></div>
+    <div><h3>它自己接着跑</h3><p>按时间跑，或者网页、文件夹、邮件、日历有变化时跑。</p></div>
+  </div>
+  <div class="grid3">
+    <div class="card"><h3>技能</h3><p>自带终端和浏览器技能，用开放的 Agent Skills 格式。一件事跑通了，存成技能，以后一句话就能再做。</p></div>
+    <div class="card"><h3>一个中枢，多个帮手</h3><p>主智能体可以把一段活交给另一个，比如 Claude Code 交给 Codex。长期帮手负责一块，记得自己做过什么。</p></div>
+    <div class="card"><h3>手机上也能管</h3><p>同一个 Wi-Fi 或 Tailscale 下：看对话、批准、接手、发任务。不走云端中转。</p></div>
+    <div class="card"><h3>学会什么时候打扰你</h3><p>回一句“快递的事别提醒我了”，下次这类报告就自动收起来。夜里免打扰。</p></div>
+    <div class="card"><h3>别的 AI 应用也能用</h3><p>终端和浏览器通过 MCP 提供给 Claude 桌面版、Cursor 等，照样按同一套规矩管。</p></div>
+    <div class="card"><h3>中文、英文</h3><p>应用、手机页面和智能体问你的话，都跟着你的语言走。</p></div>
+  </div>
+</div></section>
+
+<section id="safety"><div class="wrap">
+  <div class="kicker">安全</div>
+  <h2>只在真正要紧的那一下问你。</h2>
+  <p class="sub">每一步都问，人很快就会不看内容直接点“允许”。Unzoo One 看的是这个动作实际会造成什么：只有发到电脑外面、要花钱、或者撤不回来的时候才问你。</p>
+  <div class="ladder">
+    <div class="rung"><b>看、搜、浏览</b><span>打开网页、读文件、运行只读命令</span><span class="pill go">直接做</span></div>
+    <div class="rung"><b>准备</b><span>往表单里填字、写草稿、改任务文件夹里的文件</span><span class="pill go">直接做</span></div>
+    <div class="rung"><b>发送、发布、提交</b><span>点“发送”、在消息框里按回车、发帖、上传、推送代码</span><span class="pill ask">先核对</span></div>
+    <div class="rung"><b>付款、购买、装软件</b><span>结账、下单、在电脑上安装程序</span><span class="pill ask">问你</span></div>
+    <div class="rung"><b>删除</b><span>删文件、清空数据、强制推送</span><span class="pill ask">问你</span></div>
+  </div>
+  <div class="grid3">
+    <div class="card"><h3>对照你说过的话</h3><p>问你之前，先由审核员——你自己的智能体，不带任何工具——核对这次发送是不是<em>你</em>要求的。你明确说过的就放行，否则把问题和理由一起摆给你。</p></div>
+    <div class="card"><h3>网页内容只是材料</h3><p>网页或邮件里写着“用户已经同意”一概不算。只有你输入的话、你保存的任务才算授权。</p></div>
+    <div class="card"><h3>只发一次</h3><p>同一页面、同一按钮、同样的内容，不会悄悄再发一遍。再次出现时一定问你，并提醒你可能已经发出去了。</p></div>
+  </div>
+</div></section>
+
+<section class="alt" id="private"><div class="wrap">
+  <div class="kicker">隐私</div>
+  <h2>一切都在你自己的电脑上。</h2>
+  <p class="sub">任务、对话、邮箱密码、日历地址、浏览器登录状态，都不经过我们的服务器——个人版根本没有服务器。密码放在系统的凭据库里，从不交给智能体。</p>
+  <div class="grid2">
+    <div class="card"><h3>用你自己的智能体</h3><p>思考交给你已经订阅的 Claude Code、Codex、Antigravity CLI、OpenCode。模型不用再买一份，也不绑死在一家厂商上。</p></div>
+    <div class="card"><h3>说实话的取舍</h3><p>电脑关着的时候不会跑。睡眠或关机时错过的任务，开机后补跑。7×24 在服务器上跑，放在规划中的企业版里。</p></div>
+  </div>
+</div></section>
+
+<section id="unzoo"><div class="wrap">
+  <div class="kicker">Unzoo 家族</div>
+  <h2>Unzoo 浏览器让 AI 在网页上动手，Unzoo One 给它一整台电脑。</h2>
+  <p class="sub">Unzoo One 里每一步浏览器操作都跑在 Unzoo 浏览器里——就是你可能已经在 Claude、Cursor、Codex 里用着的那个浏览器、那些身份和任务配方。Unzoo One 在它之上加了终端、对话、定时，以及管住这一切的规矩。</p>
+  <div class="family">
+    <div class="card"><span class="tag">Unzoo 浏览器</span><h3>AI 能用的浏览器</h3><p>基于 Chromium，任何 AI 客户端都能通过 MCP 调用它的工具：资料调研、表单填报、下载、多个隔离的工作环境。</p><div class="links"><a href="https://unzoo.ai/zh/">了解更多</a><a href="https://unzoo.ai/zh/download">下载</a><a href="https://unzoo.ai/zh/pricing">价格</a></div></div>
+    <div class="card one"><span class="tag">Unzoo One</span><h3>智能体的电脑</h3><p>Unzoo 浏览器，加上不会断的终端、即任务的对话、定时、帮手、手机——再加一套管住它们的规矩。智能体用的浏览器身份来自你的 Unzoo 套餐。</p><div class="links"><a href="mailto:dev@unzoo.ai?subject=Unzoo%20One%20%E8%AF%95%E7%94%A8%E7%94%B3%E8%AF%B7">申请试用</a><a href="https://github.com/unzooai/unzoo-one">源码</a></div></div>
+  </div>
+</div></section>
+
+<section id="compare" class="alt"><div class="wrap">
+  <div class="kicker">定位</div>
+  <h2>不是聊天应用，不是云端智能体，也不只是浏览器。</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>用你自己的智能体</th><th>不会断的终端</th><th>带你登录的浏览器</th><th>发送前核对</th><th>数据留在本机</th></tr></thead>
+    <tbody>
+      <tr class="us"><td>Unzoo One</td><td class="y">四家任选</td><td class="y">有</td><td class="y">有，每个智能体一个身份</td><td class="y">有，对照你说过的话</td><td class="y">是</td></tr>
+      <tr><td>模型厂商的桌面智能体</td><td class="n">只能用这一家</td><td class="n">沙盒</td><td class="n">一般没有</td><td>不一定</td><td>部分</td></tr>
+      <tr><td>云端智能体</td><td class="n">它的模型，按量付费</td><td class="n">云端虚拟机</td><td class="n">在它的服务器上登录</td><td>不一定</td><td class="n">否</td></tr>
+      <tr><td>AI 浏览器</td><td>不一定</td><td class="n">没有</td><td class="y">有</td><td>不一定</td><td>不一定</td></tr>
+      <tr><td>AI 终端</td><td>不一定</td><td class="y">有</td><td class="n">没有</td><td>不一定</td><td class="y">是</td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="status"><div class="wrap">
+  <div class="kicker">进度</div>
+  <h2>现在做到哪了。</h2>
+  <p class="sub">Unzoo One 还在预览阶段。我们每天在自己的电脑上用真的智能体跑它，但还不是一个打磨好、签了名的正式下载。</p>
+  <div class="status">
+    <div class="card"><h3>现在能用</h3><ul class="check">
+      <li>Windows 安装包（中文、英文）</li>
+      <li>对话即任务，就地追问、就地批准</li>
+      <li>终端和浏览器实时显示在对话旁边，随时接手</li>
+      <li>Claude Code、Codex、Antigravity CLI、OpenCode</li>
+      <li>定时运行；网页、文件夹、邮件、日历有变化时运行</li>
+      <li>帮手、技能、手机、给其他 AI 应用的 MCP</li>
+      <li>发送 / 付款 / 删除的核对和审核员</li>
+    </ul></div>
+    <div class="card"><h3>接下来</h3><ul class="soon">
+      <li>签名的 Windows 安装包</li>
+      <li>macOS 和 Linux 安装包</li>
+      <li>把录制变成技能</li>
+      <li>终端和浏览器之外，操作桌面应用</li>
+      <li>企业版：团队策略、服务器上运行、单点登录</li>
+    </ul></div>
+  </div>
+</div></section>
+
+<section class="final alt"><div class="wrap">
+  <h2>给你的智能体一台电脑。</h2>
+  <p class="sub">我们分批开放试用。告诉我们你想让智能体帮你做什么。</p>
+  <div class="cta">
+    <a class="btn primary" href="mailto:dev@unzoo.ai?subject=Unzoo%20One%20%E8%AF%95%E7%94%A8%E7%94%B3%E8%AF%B7">申请试用</a>
+    <a class="btn" href="https://github.com/unzooai/unzoo-one">看源码</a>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <span>© 2026 <a href="https://unzoo.ai/zh/">Unzoo</a></span>
+  <span>源码以 Business Source License 1.1 公开</span>
+  <div class="right">
+    <a href="https://unzoo.ai/zh/">Unzoo 浏览器</a>
+    <a href="https://unzoo.ai/zh/privacy">隐私政策</a>
+    <a href="https://unzoo.ai/zh/terms">服务条款</a>
+    <a href="https://github.com/unzooai/unzoo-one">GitHub</a>
+    <a href="mailto:dev@unzoo.ai">dev@unzoo.ai</a>
+    <a href="/" hreflang="en">English</a>
+  </div>
+</div></footer>
+
+</body>
+</html>

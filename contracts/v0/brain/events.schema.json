@@ -16,6 +16,8 @@
         "tool_call.result",
         "usage.updated",
         "turn.completed",
+        "approval.requested",
+        "approval.resolved",
         "session.closed",
         "error"
       ]
@@ -86,6 +88,49 @@
           "$ref": "https://contracts.unzoo.ai/v0/common/primitives.schema.json#/$defs/usage"
         },
 
+        "approval": {
+          "description": "approval.requested / approval.resolved 携带。Brain 在执行某个工具前停下来问宿主，等待一个答复。答复只针对这一次工具调用，不授予任何更大的范围——更大范围的授权走 security/capability-grant。",
+          "type": "object",
+          "required": ["request_id"],
+          "properties": {
+            "request_id": {
+              "description": "CLI 自己给这次询问的 id，答复必须原样带回。",
+              "type": "string",
+              "minLength": 1
+            },
+            "tool_call": {
+              "type": "object",
+              "required": ["tool", "arguments"],
+              "properties": {
+                "tool": { "type": "string", "minLength": 1 },
+                "arguments": { "type": "object" }
+              }
+            },
+            "description": { "type": "string" },
+            "decision": {
+              "description": "取值沿用 task/approval 的词：这里只会是单次放行或拒绝。",
+              "enum": ["allow_once", "deny"]
+            },
+            "message": {
+              "description": "拒绝时交给模型的理由，作为该工具调用的错误返回。",
+              "type": "string"
+            },
+            "interrupt": {
+              "description": "拒绝时一并结束本轮：被拒的模型往往会换个办法再问，这让一次拒绝就够。",
+              "type": "boolean"
+            },
+            "decided_by": {
+              "description": "caller：调用方答复；unterm：会话关闭时仍未答复，由宿主代为拒绝；policy：命中工作区里一条预先定下的规则，没有打扰任何人。",
+              "enum": ["caller", "unterm", "policy"]
+            },
+            "rule_id": {
+              "description": "decided_by 为 policy 时必填：命中的是哪条规则。自动决定必须能追溯到某个人定下的某条规则。",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+
         "state": {
           "description": "session.closed 和 turn.completed 的收敛状态。",
           "enum": ["running", "finished", "interrupted", "failed"]
@@ -104,7 +149,8 @@
         },
         {
           "if": { "properties": { "event": { "const": "turn.started" } }, "required": ["event"] },
-          "then": { "required": ["model", "turn_id"] }
+          "$comment": "model 不强制：codex exec --json 的 turn.started 不带模型，有的 CLI 要到后面才报。宁可缺省，也不让实现填一个假值。",
+          "then": { "required": ["turn_id"] }
         },
         {
           "if": {
@@ -121,6 +167,31 @@
           "$comment": "错了必须给结构化 error。只发一句自由文本，上层没法分支也没法归因。",
           "if": { "properties": { "event": { "const": "error" } }, "required": ["event"] },
           "then": { "required": ["error"] }
+        },
+        {
+          "if": { "properties": { "event": { "const": "approval.requested" } }, "required": ["event"] },
+          "then": {
+            "required": ["approval"],
+            "properties": { "approval": { "required": ["request_id", "tool_call"] } }
+          }
+        },
+        {
+          "$comment": "拒绝必须给理由：模型只能从这条消息知道为什么停下，没有理由它只能猜，或者换个工具再试。",
+          "if": { "properties": { "event": { "const": "approval.resolved" } }, "required": ["event"] },
+          "then": {
+            "required": ["approval"],
+            "properties": { "approval": { "required": ["request_id", "decision"] } },
+            "allOf": [
+              {
+                "if": { "properties": { "approval": { "properties": { "decision": { "const": "deny" } } } } },
+                "then": { "properties": { "approval": { "required": ["message"] } } }
+              },
+              {
+                "if": { "properties": { "approval": { "properties": { "decided_by": { "const": "policy" } }, "required": ["decided_by"] } } },
+                "then": { "properties": { "approval": { "required": ["rule_id"] } } }
+              }
+            ]
+          }
         },
         {
           "if": { "properties": { "event": { "const": "session.closed" } }, "required": ["event"] },

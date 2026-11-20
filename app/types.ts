@@ -6,6 +6,7 @@ export type ViewId =
   | "approvals"
   | "artifacts"
   | "activity"
+  | "plugins"
   | "settings";
 
 export type SettingsSectionId =
@@ -13,11 +14,12 @@ export type SettingsSectionId =
   | "usage"
   | "team"
   | "preferences"
+  | "agents"
   | "data"
   | "connectors"
   | "security";
 
-export type OnboardingStepId = "profile" | "connectors" | "security" | "task";
+export type OnboardingStepId = "agent" | "profile" | "connectors" | "security" | "task";
 
 export type WorkspaceRoute = {
   view: ViewId;
@@ -45,7 +47,16 @@ export type TaskFilter = "全部" | TaskStatus;
 
 export type TaskSort = "状态优先" | "进度最高" | "名称";
 
-export type TaskSchedule = "仅运行一次" | "每天" | "每周";
+export type TaskSchedule = "仅运行一次" | "每天" | "工作日" | "每周" | "每隔" | "定时一次";
+
+/** 有变化就运行：一个网页（隔几分钟看一次），或一个文件夹（有新文件）。 */
+export type TaskWatch =
+  | { kind: "web"; url: string; everyMinutes: number }
+  | { kind: "folder"; path: string }
+  /** 新邮件。密码（应用专用密码/授权码）只进系统凭据库，不在这里。 */
+  | { kind: "mail"; address: string; host: string; filter: string }
+  /** 日历里的日程快开始了。日历的 iCal 地址只进系统凭据库。 */
+  | { kind: "calendar"; minutesBefore: number };
 
 export type Weekday = "周一" | "周二" | "周三" | "周四" | "周五" | "周六" | "周日";
 
@@ -351,6 +362,13 @@ export type TaskRun = {
   summary: string;
   errorCode?: string;
   errorMessage?: string;
+  /**
+   * 这次运行交给的 unterm 托管会话。有它才能"继续对话"：会话关了、甚至
+   * unterm 重启过，也能接着它原来的对话说下一句。
+   */
+  sessionId?: string;
+  /** 正等人在收件箱批准一次工具调用。 */
+  waiting?: boolean;
 };
 
 export type TaskRunStageStatus = "成功" | "失败" | "运行中" | "已取消" | "已跳过";
@@ -373,6 +391,20 @@ export type TaskItem = {
   schedule?: TaskSchedule;
   scheduleTime?: string;
   scheduleDay?: Weekday;
+  /** schedule 为“每隔”时，隔多少分钟。 */
+  scheduleEvery?: number;
+  /** schedule 为“定时一次”时，本地时间 YYYY-MM-DDTHH:MM。 */
+  scheduleAt?: string;
+  /** 有变化就运行。 */
+  watch?: TaskWatch;
+  /** 交给哪个智能体长期负责；不填用运行设置里的。 */
+  helperAgent?: string;
+  /** 定时和有变化时的运行接着上一次的对话，智能体记得做过什么。 */
+  keepConversation?: boolean;
+  /** 运行时最近一次查看监视对象时出的错（运行时写，不推回去）。 */
+  watchError?: string;
+  /** 邮件、日历的密码或地址是否已存进系统凭据库（运行时写，不推回去）。 */
+  watchHasSecret?: boolean;
   requiresApproval?: boolean;
   pinned?: boolean;
   runs?: TaskRun[];
@@ -416,6 +448,21 @@ export type ArtifactItem = {
   editedAt?: string;
   editedBy?: string;
   revisions?: ArtifactRevision[];
+  /** 智能体运行时写在本机的文件：内容在磁盘上，页面只读。 */
+  file?: ArtifactFile;
+};
+
+export type ArtifactFile = {
+  runId: string;
+  /** 相对运行目录。 */
+  path: string;
+  modified: string;
+  absolutePath?: string;
+  /** 内容读回来了没有；读不了时是原因。 */
+  loaded: boolean;
+  binary?: boolean;
+  truncated?: boolean;
+  error?: string;
 };
 
 export type ApprovalItem = {

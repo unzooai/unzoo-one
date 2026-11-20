@@ -1,0 +1,70 @@
+# Unterm
+
+> Unterm is "the terminal AI agents can drive." It is a free, open-source (MIT), cross-platform terminal emulator (macOS, Linux, Windows) built on Unterm's own `next-core` engine. Instead of embedding an AI chatbox inside the terminal, Unterm exposes the terminal itself as a controllable surface that any external AI agent (Claude Code, Codex CLI, Gemini CLI, Cursor, or a custom script) can drive from the outside. It is also an Agent Cockpit: the terminal sees, aggregates, and orchestrates the AI agents running inside its panes.
+
+Expanded single-file reference: https://unterm.app/llms-full.txt
+
+## What it does
+
+- **Four control surfaces, one engine.** A local MCP server (line-delimited JSON-RPC 2.0 over TCP, bound to 127.0.0.1, token-gated; `unterm-cli mcp-stdio` bridges it to stdio), an HTTP Web Settings server, a CLI (`unterm-cli`), and the GUI. They share the same state but do not all expose everything: theme, language and the `unterm.conf` config file are deliberately not on MCP.
+- **152 MCP methods plus `auth.login`.** An agent calls `meta.surface` (or runs `unterm-cli reference`) once to receive the entire API live: every method with param schemas, every CLI subcommand, and every currently-bound keybinding.
+- **Agent Cockpit.** Live per-pane agent state (`working` / `waiting` / `done` / `idle`) for Claude Code, Codex CLI, Gemini CLI, Aider and others — zero-config via terminal titles, OSC 9 / 9;4 / 777 sequences and screen heuristics, exact via the agents' own lifecycle hooks, which `unterm-cli agent enable-hooks` wires up. Tab dots, a cross-window tally chip, and an Agent Inbox (`Ctrl+Shift+A`) sorted waiting-first with jump-to-pane.
+- **Fleet.** One task × N agents × N isolated git worktrees (`unterm-cli fleet launch --agents claude,claude,codex -- <task>`): each member gets its own worktree, branch, tab, and state badge.
+- **Review.** When an agent starts working in a repo, Unterm takes a non-invasive checkpoint (a dangling commit; HEAD, index and files untouched). The Review page shows diffs including agent-created untracked files, runs the project's tests in a member's worktree, merges a chosen result into the repo as staged changes (the commit stays with the user), discards rejects, and rolls back to any checkpoint.
+- **Pane control without keystroke simulation.** `session.create` / `session.split` / `session.focus` / `session.input` let an external agent carve panes, hand focus, and type; `exec.run_wait` runs a command and returns its result; `screen.text` / `screen.scrollback_text` read pane output back.
+- **Built-in AI coding-agent launcher.** Install, authenticate, configure, and launch Claude Code, Codex CLI, Gemini CLI, OpenCode, and Aider. Launched agents are wired back to the terminal's MCP server through `unterm-cli mcp-stdio`, with each agent's native config written in its own format.
+- **Auditable and revocable.** Requests fall into seven risk bands; the first write from a new agent triggers an Allow / Block / Always-allow prompt; agent actions are kept in a redacted audit log; trust is revocable from Web Settings.
+
+## Recent releases
+
+- **v0.71.28 (2026-11-17):** fixes cross-process Appearance theme switching between Web Settings (`unterm-core`) and native GUI windows (`unterm-app`) via 180ms `theme.json` mtime polling, prevents the default `unterm.conf` `#111315` background from overriding persisted light/custom themes (`Daylight`, `Notion Light`, `Midnight`, `Classic`, `Agent Inbox`), and live-syncs Web Settings CSS theme variables (`syncDocumentTheme`).
+- **v0.71.27 (2026-11-16):** adds central multi-agent delegation (`agent_session.delegate`), human terminal takeover (`agent_session.handover`), live colorized ANSI terminal streaming & keyboard input in the Console, and `--mcp-trim` token optimization (~30k tokens saved per request, #73); refines the 7 native themes (Obsidian, Carbon, Solarized Dark, Dracula, Nord, Daylight, Paper Light), high-contrast split-pane focus rings (`✦ ACTIVE`), and one-screen Quick Start; and eliminates typing stutter under multi-session load via concurrent `SessionActivity` snapshots, a 500ms process-tree cache, and typing-window background housekeeping backoff.
+- **v0.71.26 (2026-11-12):** adds a zero-stall input pipeline (`ui_client` dedicated IPC channel, condvar-backed `EventHub` wakeup, 6ms active cadence, and memory-cached `pane_modes`/`mcp_state`), a native in-window Settings Center (`⚙` / `Cmd+,`), Active Agent Inspection (`Ctrl+Shift+I`) with live 2-line terminal tail previews, cross-pane `Y/N` Quick Approve, and Sidebar Hover Peek; adds risk-graded autonomy (`Autonomy`, `tool_risk`, `command_risk`), multi-turn Console task threads and structured outputs, a dedicated managed browser profile (`~/.unterm/browser-profile`), local agent sign-in and curated skill plugins, and `unterm-core` keepalive on active background work (#68–#72).
+- **v0.71.25 (2026-11-11):** adds hosted and governed agent sessions (`agent_session.start` with `hosted`/`governed`, `agent_session.decide`, `agent_session.approvals`, `agent_session.resume`), `contracts/v0` (`brain_event.v0`) adapters for Gemini CLI, OpenCode (`opencode acp`), Codex (`codex app-server`), and Antigravity (`agy acp`), standing approval policies (`agent_policy`), runtime-managed Console tasks and scheduling (`/api/console/tasks/*`), Core-hosted Settings/Console HTTP server, and custom product branding (`UNTERM_PRODUCT_NAME`).
+- **v0.71.24 (2026-11-10):** adds first-party `agy` (Google Antigravity CLI) and `qwen-code` (Alibaba Qwen Code CLI) manifests plus China Coding Plan (`cn_coding_plan`) authentication modes for `claude-code`, `kimi-code`, `opencode`, and `trae-agent`; adds guided auto-install and one-click `PATH` repair (`unterm-cli agent repair-path` / `fix-path` and Web Settings); preloads shell command history for ghost completions on macOS/Linux/Windows; and adds AtomGit mirror downloads for mainland China.
+- **v0.71.23 (2026-11-09):** fixes Windows borderless window maximize (`WM_GETMINMAXINFO`) so the OS taskbar and auto-hide taskbar remain accessible; dispatches MCP `HostCall` requests on per-call worker threads to eliminate `ask_confirmation` head-of-line blocking, auto-wakes and focuses the target window/tab on confirmation, supports mouse-clicking confirmation buttons (`Allow` / `Always allow` / `Block`), and syncs `AlwaysAllow` trust back to `unterm-core` and `approval.list` (#45); aligns `contracts/v0` provider manifest risk fields and `output.delta` stream payloads (#30); and hardens multi-window DWM cloaking and clipboard retries for screenshots.
+- **v0.71.22 (2026-11-05):** adds Unterm Pocket mobile remote gateway (`unterm-cli remote`) over LAN / Tailscale with QR pairing and scoped permissions (`full`, `approve`, `readonly`), localhost dev-server discovery and `/preview/<port>/` proxy, zero-pollution hidden Git checkpoints (`refs/unterm/checkpoints/<id>`), cross-agent portable handoffs, and window + A11y snapshots; adds main-screen soft-wrap reflow on width resize, aligns `DECLRMM`, `DECFRA`/`DECERA`/`DECSERA`, `LNM`, `XTSAVE`/`XTRESTORE`, and global `?2026` synchronized output with xterm, clips glyphs strictly by cell, and eliminates Windows startup frame flash.
+- **v0.71.21 (2026-10-20):** recovers orphaned `WM_CHAR` messages on Windows so fast typing and IME commits no longer drop characters; keeps the cursor column unchanged on Insert Line / Delete Line (ECMA-48), clamps DSR cursor reports to the screen, and fixes backspace at the pending-wrap boundary, which removes tearing in TUIs such as Claude Code; the GUI reads screens from an event-driven local frame cache instead of making synchronous calls to the Core, removing UI stalls under heavy output.
+- **v0.61 (2026-08-02):** replaced the WezTerm fork with `next-core`, an in-house kernel of about 12,000 lines and 10 direct dependencies. Launch to a live MCP surface went from 7.1 s to 22 ms; idle CPU at a prompt from 80% of a core to 6.6%.
+- **v0.55 (2026-07-11):** Agent Cockpit — live agent state, Inbox, fleets, checkpoints and review.
+
+## Key facts
+
+- License: MIT. Price: $0 — no paid tier, no subscription, no in-app purchase.
+- Privacy: no telemetry, no account, no analytics; every server bound to 127.0.0.1. Two outbound requests of its own: a plain GET to the GitHub releases API every 6 hours (update check, no identifiers) and a GET of the signed agent catalog from unterm.app when the AI Agents page or `unterm-cli agent` is used. Neither can be switched off in settings yet. The Agent Cockpit is fully local.
+- Platforms: macOS (universal, signed and Apple-notarized DMG), Linux x86_64/arm64 (.deb and AppImage), Windows 10/11 x64/arm64 (.msi and portable .zip).
+- Rendering: wgpu — Metal on macOS, Direct3D 12 on Windows, Vulkan on Linux, with OpenGL and software fallbacks.
+- UI languages: 9 (English, 简体中文, 繁體中文, 日本語, 한국어, Deutsch, Français, Italiano, हिन्दी) with system-locale auto-detect.
+- How it differs from Warp: Warp embeds AI inside a closed, login-based product that external tools cannot drive; Unterm keeps AI outside and exposes the terminal as an MCP-controllable surface, and its agent orchestration (fleets, review) is local and open.
+- Common questions it answers: "how do I see when Claude Code needs my approval" (Inbox + amber chip), "how do I run multiple Claude Code instances in parallel without conflicts" (Fleet: isolated git worktrees), "how do I review or undo what an AI agent changed" (Review: checkpoints, diffs, rollback, merge as staged).
+
+## Docs
+
+- [Advanced guide](https://unterm.app/guide): tested recipes — the agent inbox from scripts, fleets across git worktrees, scripting panes, recordings, workspaces, per-project identities, raw MCP over TCP, the Windows administrator window.
+- [All features](https://unterm.app/features): every surface and capability.
+- [Agent Cockpit](https://unterm.app/docs/agent-cockpit): live agent state, the Inbox, fleets, checkpoints and review.
+- [MCP reference](https://unterm.app/docs/mcp-reference): every MCP method, namespace, and param schema.
+- [CLI reference](https://unterm.app/docs/cli-reference): the `unterm-cli` command surface.
+- [Agent integration](https://unterm.app/docs/agent-integration): connecting Claude Code / Cursor / custom agents.
+- [Agent recipes](https://unterm.app/docs/agent-recipes): copy-pastable Python snippets for driving panes.
+- [Multi-instance](https://unterm.app/docs/multi-instance): NATO-named instances and cross-window routing.
+- [Identity profiles](https://unterm.app/docs/profiles): binding credentials to a window.
+- [Configuration](https://unterm.app/docs/configuration): every file under `~/.unterm/`.
+- [Config file reference](https://unterm.app/docs/config-reference): every key in `unterm.conf`, including `[env]` and `[keys]`.
+- [Inline images](https://unterm.app/docs/inline-images): kitty graphics, iTerm2 inline images and sixel.
+- [Shell integration](https://unterm.app/docs/shell-integration): prompt and command marks for zsh, bash, fish and PowerShell.
+- [Architecture](https://unterm.app/docs/architecture): how the control surfaces fit together.
+- [Roadmap](https://unterm.app/docs/product-roadmap): shipped and planned work.
+
+## Blog
+
+- [v0.71.22: Unterm Pocket, Agent Harness, main-screen reflow & xterm grid alignment](https://unterm.app/blog/mobile-harness-reflow-v07122) ([中文](https://unterm.app/blog/mobile-harness-reflow-v07122-zh))
+- [v0.71.21: zero dropped keystrokes, clean TUI rendering](https://unterm.app/blog/smooth-typing-ecma48-v071) ([中文](https://unterm.app/blog/smooth-typing-ecma48-v071-zh))
+- [v0.61: our own kernel](https://unterm.app/blog/next-core-v061) ([中文](https://unterm.app/blog/next-core-v061-zh))
+- [v0.55: Agent Cockpit](https://unterm.app/blog/agent-cockpit-v055)
+
+## Links
+
+- Homepage: https://unterm.app/
+- Source and releases: https://github.com/zhitongblog/unterm
+- Download (latest): https://github.com/zhitongblog/unterm/releases/latest

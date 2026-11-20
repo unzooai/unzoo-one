@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!--
+    og-card.svg — the single source for web/public/assets/og.png and
+    assets/social-preview.png (GitHub repo social preview).
+
+    Regenerate after a logo or version change:
+      1. Edit the version chip text + copy below.
+      2. Serve web/ locally, open any page, then rasterize in-browser:
+         load this SVG into an <img>, draw to a 1200x630 canvas,
+         toDataURL, save. (foreignObject SVGs taint the canvas in
+         Unzoo's Chromium — this file must stay plain SVG, no HTML.)
+      3. Overwrite web/public/assets/og.png and assets/social-preview.png;
+         re-upload the GitHub social preview by hand in repo Settings.
+
+    The logo group below is inlined from web/public/assets/icon.svg
+    (command-loop mark) — keep in sync when the mark changes.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101413"/>
+      <stop offset="0.55" stop-color="#0b0e0d"/>
+      <stop offset="1" stop-color="#090c0b"/>
+    </linearGradient>
+    <radialGradient id="glowBR" cx="0.88" cy="1.08" r="0.75">
+      <stop offset="0" stop-color="#26a68d" stop-opacity="0.16"/>
+      <stop offset="0.6" stop-color="#26a68d" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowTL" cx="-0.05" cy="-0.10" r="0.58">
+      <stop offset="0" stop-color="#26a68d" stop-opacity="0.10"/>
+      <stop offset="0.55" stop-color="#26a68d" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="head" x1="0" y1="0" x2="1" y2="0.25">
+      <stop offset="0" stop-color="#7dd8f0"/>
+      <stop offset="0.7" stop-color="#4fd0ae"/>
+    </linearGradient>
+    <!-- logo (icon.svg command-loop mark) -->
+    <linearGradient id="tile" x1="7" y1="5" x2="58" y2="61" gradientUnits="userSpaceOnUse"><stop stop-color="#20282B"/><stop offset=".48" stop-color="#111719"/><stop offset="1" stop-color="#080B0C"/></linearGradient>
+    <radialGradient id="ambient" cx="0" cy="0" r="1" gradientTransform="translate(17 8) rotate(48) scale(57)"><stop stop-color="#FFFFFF" stop-opacity=".09"/><stop offset=".52" stop-color="#FFFFFF" stop-opacity=".015"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></radialGradient>
+    <linearGradient id="metal" x1="20" y1="14" x2="39" y2="51" gradientUnits="userSpaceOnUse"><stop stop-color="#FAFCFA"/><stop offset=".55" stop-color="#E2E8E4"/><stop offset="1" stop-color="#AEB9B2"/></linearGradient>
+    <linearGradient id="jade" x1="43" y1="31" x2="46" y2="45" gradientUnits="userSpaceOnUse"><stop stop-color="#94E7D3"/><stop offset="1" stop-color="#42B49A"/></linearGradient>
+    <filter id="termShadow" x="-20%" y="-15%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="24" stdDeviation="30" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+    <clipPath id="termClip"><rect width="480" height="294" rx="12"/></clipPath>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#glowBR)"/>
+  <rect width="1200" height="630" fill="url(#glowTL)"/>
+
+  <!-- brand -->
+  <g transform="translate(56,44) scale(1.125)">
+    <rect width="64" height="64" rx="14" fill="url(#tile)"/><rect width="64" height="64" rx="14" fill="url(#ambient)"/><rect x=".5" y=".5" width="63" height="63" rx="13.5" fill="none" stroke="#FFFFFF" stroke-opacity=".06"/>
+    <path d="M20.5 15.5V35c0 9.7 4.8 14.5 13.5 14.5 7.6 0 11.5-4.5 11.5-11.5" fill="none" stroke="#020505" stroke-opacity=".30" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" transform="translate(0 .75)"/><path d="M20.5 15.5V35c0 9.7 4.8 14.5 13.5 14.5 7.6 0 11.5-4.5 11.5-11.5" fill="none" stroke="url(#metal)" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.5" cy="15.5" r="3.25" fill="#8FE3CE"/><path d="m41.5 33 5.8 5-5.8 5" fill="none" stroke="#06110E" stroke-opacity=".28" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" transform="translate(0 .75)"/><path d="m41.5 33 5.8 5-5.8 5" fill="none" stroke="url(#jade)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="148" y="94" font-family="Helvetica Neue, Arial, sans-serif" font-size="40" font-weight="700" fill="#e8e6e3" letter-spacing="-0.5">Unterm</text>
+  <rect x="312" y="62" width="104" height="34" rx="17" fill="none" stroke="#6fccb8" stroke-opacity="0.35"/>
+  <text x="364" y="86" text-anchor="middle" font-family="Menlo, monospace" font-size="18" font-weight="600" fill="#6fccb8">v0.57.0</text>
+
+  <!-- headline -->
+  <text x="53" y="230" font-family="Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="-2" fill="url(#head)">AI coding agents.</text>
+  <text x="53" y="309" font-family="Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="-2" fill="url(#head)">One terminal.</text>
+
+  <!-- sub -->
+  <text x="56" y="370" font-family="Helvetica Neue, Arial, sans-serif" font-size="25" fill="#b9b6b1">Claude Code, Codex, Gemini, OpenCode, Aider.</text>
+  <text x="56" y="407" font-family="Helvetica Neue, Arial, sans-serif" font-size="25" fill="#b9b6b1"><tspan font-weight="600" fill="#dedbd6">Agent Cockpit</tspan>: Inbox · fleets · review. Local, no cloud.</text>
+
+  <!-- chips -->
+  <g font-family="Menlo, monospace" font-size="18" fill="#cfccc7">
+    <rect x="56" y="500" width="196" height="38" rx="19" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.14"/>
+    <text x="154" y="525" text-anchor="middle">99 MCP methods</text>
+    <rect x="266" y="500" width="163" height="38" rx="19" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.14"/>
+    <text x="347" y="525" text-anchor="middle">Agent Inbox</text>
+    <rect x="443" y="500" width="207" height="38" rx="19" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.14"/>
+    <text x="546" y="525" text-anchor="middle">Worktree fleets</text>
+    <rect x="664" y="500" width="185" height="38" rx="19" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.14"/>
+    <text x="756" y="525" text-anchor="middle">Notarized DMG</text>
+  </g>
+
+  <!-- footer -->
+  <text x="56" y="592" font-family="Menlo, monospace" font-size="21" font-weight="700" fill="#4fd0ae">unterm.app</text>
+  <text x="1144" y="592" text-anchor="end" font-family="Menlo, monospace" font-size="21" fill="#8b8884">MIT · $0</text>
+
+  <!-- terminal mockup -->
+  <g transform="translate(672,110)" filter="url(#termShadow)">
+    <rect width="480" height="294" rx="12" fill="#161a19"/>
+    <g clip-path="url(#termClip)">
+      <rect width="480" height="40" fill="#1f2423"/>
+      <circle cx="22" cy="20" r="6" fill="#ff5f57"/>
+      <circle cx="42" cy="20" r="6" fill="#febc2e"/>
+      <circle cx="62" cy="20" r="6" fill="#28c840"/>
+      <text x="270" y="25" text-anchor="middle" font-family="Menlo, monospace" font-size="14" fill="#a5a29d">auth-service — Unterm</text>
+      <rect y="40" width="116" height="220" fill="#131716"/>
+      <rect y="52" width="116" height="30" fill="#26312e"/>
+      <rect y="52" width="2.5" height="30" fill="#4fd0ae"/>
+      <g font-family="Menlo, monospace" font-size="13.5">
+        <text x="12" y="72" fill="#e8e6e3">⚡ claude</text>
+        <text x="12" y="106" fill="#8b8884">✋ codex</text>
+        <text x="12" y="140" fill="#8b8884">zsh</text>
+        <text x="132" y="76" fill="#6fccb8">unterm <tspan fill="#dedbd6">fleet launch claude,codex,gemini</tspan></text>
+        <text x="132" y="106" fill="#6fccb8">unterm <tspan fill="#dedbd6">agent inbox</tspan></text>
+        <text x="132" y="136" fill="#e8b04b">✋ codex — waiting for approval · 2m</text>
+        <text x="132" y="166" fill="#6fccb8">unterm <tspan fill="#dedbd6">review verify</tspan></text>
+        <text x="132" y="196" fill="#58c98f">✓ passed · rank #1 — merged as staged</text>
+      </g>
+      <rect y="260" width="480" height="34" fill="#131716"/>
+      <rect y="260" width="480" height="1" fill="#ffffff" fill-opacity="0.07"/>
+      <text x="16" y="282" font-family="Menlo, monospace" font-size="13" fill="#8b8884">zsh — ~/work/auth-service — mcp:4</text>
+      <text x="464" y="282" text-anchor="end" font-family="Menlo, monospace" font-size="13" fill="#e8b04b">⚡2 ✋1</text>
+    </g>
+  </g>
+</svg>

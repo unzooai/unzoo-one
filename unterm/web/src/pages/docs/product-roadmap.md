@@ -1,0 +1,69 @@
+---
+layout: ../../layouts/Doc.astro
+title: Product roadmap
+subtitle: "What is being built now, what comes after it, and what Unterm will not become. Current release: v0.71.28."
+kicker: Docs / Product roadmap
+date: 2026-10-01
+---
+
+## Strategy in one sentence
+
+Unterm is a terminal that agents can drive and that shows you what the agents inside it are doing — local-first, MCP-driven, and vendor-neutral.
+
+Most of what follows is terminal groundwork: the protocols modern command-line tools expect, and the install and update paths people expect from a daily driver. The agent surface (MCP, CLI, Agent Cockpit) already ships; see the [MCP reference](/docs/mcp-reference) and [Agent Cockpit](/docs/agent-cockpit).
+
+## Shipped in v0.71.22
+
+### Mobile & Agent Harness
+
+- **Unterm Pocket & Mobile Remote Gateway (`unterm-cli remote`)** — pair phones or tablets over LAN / Tailscale with a 6-digit single-use code or QR code in Web Settings, backed by scoped permissions (`full`, `approve`, `readonly`), live terminal streaming, and remote approval decisions.
+- **Localhost Dev-Server Preview Proxy** — automatically discovers active local web servers and proxies them at `/preview/<port>/` for paired devices.
+- **Hidden Git Checkpoints & Portable Handoffs** — zero-pollution Git checkpoints under `refs/unterm/checkpoints/<id>` (with diff and auto-backed-up restore), budgeted cross-agent Markdown handoffs, and foreground window + Accessibility (A11y) snapshots.
+
+### Terminal grid & rendering
+
+- **Main-screen reflow on resize** — re-wraps soft-wrapped lines when pane width changes and keeps the cursor line visible when shrinking height.
+- **xterm grid & ECMA-48 alignment** — `DECLRMM` left/right margins, rectangular area operations (`DECFRA`, `DECERA`, `DECSERA`) with clean wide-character splitting, global `?2026` synchronized output across screen switches, `LNM`, `DECST8C`, `XTSAVE` / `XTRESTORE`, and strict per-cell glyph placement and clipping.
+
+## Shipped in v0.71.18
+
+### Pictures
+
+- **Inline images** — the kitty graphics protocol, iTerm2's inline images (`OSC 1337 File=`, and its multipart form) and sixel. Pictures scroll with their text, stay in the scrollback, are clipped at pane edges and keep to the screen they were drawn on. Programs that ask for the cell size in pixels get the real one. Agents list them with `screen.images`. See [Inline images](/docs/inline-images).
+
+### Configuration
+
+- `[platform.*]` sections apply; `[window] close_confirmation` works; `path_append` and `[env]` reach shells a Core starts on its own; settings that do nothing are reported with the reason.
+
+## Shipped in v0.71.17
+
+### Terminal protocols
+
+- **Kitty keyboard protocol** (the "disambiguate" level, which is what agents and modern TUIs ask for) and xterm's **modifyOtherKeys**: Shift+Enter, Esc and Ctrl/Alt chords reach the program as themselves. Unterm answers the protocol's query with exactly the levels it implements.
+- **Synchronized output (mode 2026)**: an update is shown whole or not at all, for at most 150 ms, so full-screen redraws stop tearing.
+- **Colour queries** (OSC 4, 10, 11, 12) answered from the theme the window is drawing, and **XTVERSION**.
+- **OSC 9;4 progress**, drawn as a bar under the tab in the sidebar.
+- **Shell integration, injected automatically** into zsh, bash, fish and PowerShell: prompt and command marks with exit codes, so a failed command marks its tab. See [Shell integration](/docs/shell-integration).
+
+### Windows
+
+- **Git Bash** found wherever Git is installed, and **each WSL distribution** listed by name in the shell menu.
+
+### Install and update
+
+- **In-app updates**: `unterm-cli update`, the command palette's **Install update**, and Web Settings download, verify and install the new release, then restart Unterm. See [`update`](/docs/cli-reference#update).
+- **Homebrew and Scoop**: `brew install --cask zhitongblog/tap/unterm`, `scoop bucket add zhitongblog https://github.com/zhitongblog/scoop-bucket` then `scoop install unterm`. winget (`zhitongblog.Unterm`) is submitted and listed once Microsoft accepts it.
+- **Crash reports via a pre-filled GitHub issue**: nothing is sent unless you submit it yourself.
+
+## Later
+
+- **SSH sessions** — remote panes that Unterm knows are remote, rather than a local `ssh` process.
+- **Screen-reader accessibility.**
+
+## What we are not doing
+
+- No cloud AI subscription, account, or login.
+- No chat panel inside the terminal. The agents you already use stay outside and drive it.
+- No telemetry.
+
+Progress is tracked in the [changelog](/changelog) and on [GitHub](https://github.com/zhitongblog/unterm/issues).

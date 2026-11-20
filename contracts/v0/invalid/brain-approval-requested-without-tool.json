@@ -1,0 +1,14 @@
+{
+  "schema": "brain/events.schema.json#/$defs/brain_event",
+  "reason": "approval.requested 不说要跑哪个工具、什么参数。审批人只能看到「有个东西想执行」，那不是在审批，是在盲签。",
+  "instance": {
+    "schema_version": "brain_event.v0",
+    "event": "approval.requested",
+    "at": "2026-11-09T02:10:02+00:00",
+    "session_id": "ags_7f31c0",
+    "cursor": 4,
+    "approval": {
+      "request_id": "r1"
+    }
+  }
+}

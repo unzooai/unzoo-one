@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import "./light-theme.css";
+import "@xterm/xterm/css/xterm.css";
 import "./clarity.css";
 
 const geistSans = Geist({
@@ -15,25 +16,25 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Unzoo One | AI 任务操作系统",
+  title: "Unzoo One | The AI task workspace",
   description:
-    "运行、审批并追踪长期 AI 任务，让每一步执行都有证据、边界和清晰结果。",
+    "Run, approve and track long-running AI tasks, with evidence, limits and a clear result for every step.",
   openGraph: {
-    title: "Unzoo One | AI 任务控制台",
-    description: "让长期 AI 任务的执行、审批和证据都清晰可见。",
+    title: "Unzoo One | The AI task workspace",
+    description: "See every step, approval and piece of evidence of your long-running AI tasks.",
     images: [
       {
         url: "https://unzoo-one-console.matiancheng528.chatgpt.site/og.png",
         width: 1740,
         height: 909,
-        alt: "Unzoo One AI 任务控制台",
+        alt: "Unzoo One, the AI task workspace",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Unzoo One | AI 任务控制台",
-    description: "让长期 AI 任务的执行、审批和证据都清晰可见。",
+    title: "Unzoo One | The AI task workspace",
+    description: "See every step, approval and piece of evidence of your long-running AI tasks.",
     images: ["https://unzoo-one-console.matiancheng528.chatgpt.site/og.png"],
   },
   icons: {
@@ -48,7 +49,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN">
+    <html lang="en">
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >

@@ -3,6 +3,62 @@
 版本策略：新增可选字段、新增事件类型、放宽约束 —— 向后兼容，记在这里即可。
 删字段、改语义、收窄枚举、改必填 —— 破坏兼容，必须升 major 并开新目录。
 
+## 2026-11-10 — `approval.decided_by` 新增 `policy`，并带 `rule_id`（向后兼容：新增）
+
+托管会话的审批可以由工作区里一条预先定下的规则直接答复，不打扰任何人：允许
+`cargo test`、永远拒绝 `git push --force` 之类。每次都问会把人训练成不看就点
+「允许」，规则把注意力留给真正需要判断的那几次。
+
+- `decided_by` 增加 `policy`
+- 新增 `rule_id`；`decided_by` 为 `policy` 时必填——自动决定没有人在场，能追溯的
+  只有规则本身（反例 `invalid/brain-approval-policy-without-rule.json`）
+- `examples/brain-events.json` 增加一条由规则放行的问答
+
+实现（unterm `agent_policy`）：规则只能由人定——控制台 REST，或答复时带
+`remember`；没有任何 MCP 方法能加规则，否则 agent 就能自己批准自己。带命令前缀
+的放行规则绝不匹配拼接命令（`&&`、`;`、`|`、重定向、命令替换），拒绝规则则连
+拼接命令的各段一起看。真实 Claude Code 实测：控制台勾「记住」批准一次，同一工作区
+再跑同一条命令时以 `decided_by: policy` 自动放行、不进收件箱；拒绝规则命中则拒绝
+并结束本轮。导出事件按本目录 schema 校验全部通过。
+
+## 2026-11-09 — Brain 事件新增 `approval.requested` / `approval.resolved`（向后兼容：新增）
+
+无头运行的 agent 不再只能「预先放行或跳过权限」：Brain 在执行某个工具前停下来问宿主，
+宿主答复后才继续。这两个事件把这次问答放进同一条事件流。
+
+- `approval.requested`：必须带 `approval.request_id` 和 `approval.tool_call{tool, arguments}`。
+  只说「有东西想执行」而不说是什么，就不是审批，是盲签（反例
+  `invalid/brain-approval-requested-without-tool.json`）
+- `approval.resolved`：必须带 `request_id` 和 `decision`（`allow_once` / `deny`，沿用
+  task/approval 的词——这里只答复这一次调用，不授予更大范围）。`deny` 必须带 `message`，
+  它会作为工具错误交给模型（反例 `invalid/brain-approval-denied-without-message.json`）
+- `interrupt`：拒绝时一并结束本轮。实测 Claude 被拒后会立刻换一个命令再问，一次拒绝
+  不够；带上它，本轮以 `interrupted` 结束
+- `decided_by`：`caller` 或 `unterm`（会话关闭时仍未答复，由宿主代为拒绝）
+- `examples/brain-events.json` 增加一问一答
+
+实现：unterm 的托管会话（`agent_session.start` 带 `hosted: true`，答复用
+`agent_session.decide`）。真实 Claude Code 2.1.319 端到端：放行写文件 → 文件写出；
+同一进程追问一轮；拒绝并中断 → 文件未写、本轮 100ms 内以 interrupted 结束。
+两段会话共 23 条事件用本目录的 schema 校验全部通过。
+
+OpenCode 走 ACP（`opencode acp`，unterm 把 bash/edit/webfetch 设为询问——OpenCode 默认全放行，
+不改就永远不会来问）。经无头 Core + MCP 桥接实测：放行写文件、追问一轮、拒绝并中断
+（0.31s 以 interrupted 结束）、未答复即关闭（代拒并中断），55 条事件校验全部通过。
+ACP 的答复只是选项、不带文字，所以对 OpenCode 来说 `deny` 的 `message` 只记录在案、到不了模型。
+
+## 2026-11-09 — `turn.started` 的 `model` 改为可选（向后兼容：放宽）
+
+`codex exec --json` 的 `turn.started` 不带模型名，有的 CLI 要到这一轮后面才报。
+原来要求 `model` 必填，实现只能填 `"unknown"` 之类的假值，比缺省更糟——它看起来像
+真的。现在 `turn.started` 只要求 `turn_id`；`model` 出现时仍须是字符串。
+
+unterm 的会话层（`unterm/unterm-services/src/agent_session.rs`）已按 v0 输出：
+`schema_version: "brain_event.v0"`、生成 `turn_…` id 并贯穿整轮、
+`tool_call.requested` 用嵌套的 `tool_call`、`turn.completed` / `session.closed`
+用契约的 `state`、`error` 带结构化 `error`。一次真实会话的 10 条事件已用本目录
+的 schema 逐条校验通过。
+
 ## 2026-11-09 — Brain 事件 `output.delta` 改用 `stream` + `text`（**破坏兼容，冻结前**）
 
 对应 `unzoo-one#15`，来自 `zhitongblog/unterm#30` 第 3 项。unterm 源码已并入本仓库

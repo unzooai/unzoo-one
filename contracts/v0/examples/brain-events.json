@@ -1,5 +1,5 @@
 {
-  "cursor": 6,
+  "cursor": 10,
   "events": [
     {
       "schema_version": "brain_event.v0",
@@ -80,6 +80,78 @@
       "run_id": "run_01JBQ8XG5V8P3N0W1MSTE4XA2B",
       "turn_id": "turn_01JBQ8XGH70C5B2J3AFGT6KP4Q",
       "state": "finished"
+    },
+    {
+      "schema_version": "brain_event.v0",
+      "event": "approval.requested",
+      "at": "2026-09-03T02:11:31+00:00",
+      "session_id": "ags_7f31c0",
+      "task_id": "task_01JBQ8XG4T7N2M9V0KRSD3WZ1A",
+      "run_id": "run_01JBQ8XG5V8P3N0W1MSTE4XA2B",
+      "step_id": "step_01JBQ8XG7X0R5Q2Y3PVWG6ZC4D",
+      "cursor": 7,
+      "approval": {
+        "request_id": "a331",
+        "tool_call": {
+          "tool": "Bash",
+          "arguments": {
+            "command": "echo hi > out.txt"
+          }
+        },
+        "description": "Write hi into out.txt"
+      }
+    },
+    {
+      "schema_version": "brain_event.v0",
+      "event": "approval.resolved",
+      "at": "2026-09-03T02:11:40+00:00",
+      "session_id": "ags_7f31c0",
+      "task_id": "task_01JBQ8XG4T7N2M9V0KRSD3WZ1A",
+      "run_id": "run_01JBQ8XG5V8P3N0W1MSTE4XA2B",
+      "step_id": "step_01JBQ8XG7X0R5Q2Y3PVWG6ZC4D",
+      "cursor": 8,
+      "approval": {
+        "request_id": "a331",
+        "decision": "deny",
+        "message": "not on this machine",
+        "decided_by": "caller"
+      }
+    },
+    {
+      "schema_version": "brain_event.v0",
+      "session_id": "ags_7f31c0",
+      "task_id": "task_01JBQ8XG4T7N2M9V0KRSD3WZ1A",
+      "run_id": "run_01JBQ8XG5V8P3N0W1MSTE4XA2B",
+      "step_id": "step_01JBQ8XG7X0R5Q2Y3PVWG6ZC4D",
+      "event": "approval.requested",
+      "at": "2026-09-03T02:12:02+00:00",
+      "cursor": 9,
+      "approval": {
+        "request_id": "a332",
+        "tool_call": {
+          "tool": "Bash",
+          "arguments": {
+            "command": "cargo test --workspace"
+          }
+        },
+        "description": "Run the test suite"
+      }
+    },
+    {
+      "schema_version": "brain_event.v0",
+      "session_id": "ags_7f31c0",
+      "task_id": "task_01JBQ8XG4T7N2M9V0KRSD3WZ1A",
+      "run_id": "run_01JBQ8XG5V8P3N0W1MSTE4XA2B",
+      "step_id": "step_01JBQ8XG7X0R5Q2Y3PVWG6ZC4D",
+      "event": "approval.resolved",
+      "at": "2026-09-03T02:12:02+00:00",
+      "cursor": 10,
+      "approval": {
+        "request_id": "a332",
+        "decision": "allow_once",
+        "decided_by": "policy",
+        "rule_id": "rule_01JBQ9A2C4E6G8J0K2M4P6R8T0"
+      }
     }
   ]
 }

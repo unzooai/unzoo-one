@@ -3,6 +3,15 @@
 > 状态：Accepted
 > 日期：2026-07-27
 
+> **修订 2026-11-10**：Tauri 2 外壳已接入，位置改为 `apps/unzoo-one`。界面不再是
+> `apps/desktop-ui` 的原型（已删除），而是 `app/` 的控制台——真实功能（运行时任务、
+> 收件箱、常设规则、智能体设置、多语言）都做在那里，用 `npm run build:static` 的
+> 静态构建打包进客户端。`OneClient` 的位置由 `app/lib/core-connection.ts` 承担：
+> 客户端外壳确保 Unzoo One 的后台服务（headless Core）在跑，把地址和令牌交给页面；
+> 页面调 Core 的本机 REST。Core 只对客户端自己的页面来源放开跨源。安装包由
+> `apps/unzoo-one/build-installer.ps1` 生成，一并装入后台服务、终端和 CLI。
+> 下文"代码位于 `apps/desktop-ui`""当前使用 `mockOneClient`"已不再成立。
+
 ## 决策
 
 Unzoo One 桌面界面采用：

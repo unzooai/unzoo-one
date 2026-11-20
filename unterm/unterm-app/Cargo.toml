@@ -1,0 +1,81 @@
+[package]
+name = "unterm-app"
+version.workspace = true
+edition = "2021"
+publish = false
+
+# The terminal without WezTerm: next-core for the engine, unterm-render for
+# the pixels, winit for the window. No wezterm-gui, no mux, no window crate.
+
+# The terminal lives in the library; the bin is a four-line shell around it.
+# Not taste -- see the module comment in src/lib.rs. A bin target's unit
+# tests and the bin share cargo's `target/debug/unterm.exe` uplift path, and
+# the loser of that race is what `CARGO_BIN_EXE_unterm` points integration
+# tests at.
+[lib]
+name = "unterm_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unterm"
+path = "src/main.rs"
+# No harness for the shell. Four lines with nothing to test, and building one
+# recreates the very collision the split above removes: a `kind=bin,
+# name=unterm` harness uplifts to `target/debug/unterm.exe` too.
+test = false
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+dirs-next.workspace = true
+emojis.workspace = true
+frecency.workspace = true
+nucleo-matcher.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+parking_lot.workspace = true
+log.workspace = true
+env_logger = "0.10"
+termwiz.workspace = true
+portable-pty.workspace = true
+image.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+unterm-engine = { path = "../unterm-engine" }
+unterm-core = { path = "../unterm-core" }
+unterm-agents.workspace = true
+unterm-mcp = { path = "../unterm-mcp" }
+unterm-services.workspace = true
+unterm-profile.workspace = true
+unterm-settings.workspace = true
+unterm-render = { path = "../unterm-render" }
+unterm-protocol.workspace = true
+wgpu.workspace = true
+winit = "0.30"
+arboard = "3"
+pollster = "0.4"
+tray-icon.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# tray-icon's Linux backend is libappindicator, which needs a gtk main loop
+# on the thread that owns the icon. winit runs X11/Wayland, not gtk, so the
+# indicator gets a thread of its own and this is what starts it.
+gtk = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+# Asking DWM to round the window's corners: a frameless window is not
+# rounded by default, and square corners next to every other Windows 11
+# window read as a window that did not finish loading.
+winapi = { workspace = true, features = ["dwmapi", "windef", "minwindef", "winerror", "consoleapi", "wincon", "processenv", "winbase", "commctrl", "winuser", "uxtheme", "dcomp", "shellapi", "processthreadsapi", "securitybaseapi", "handleapi", "winnt", "unknwnbase", "dxgi", "combaseapi", "winreg", "tlhelp32"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

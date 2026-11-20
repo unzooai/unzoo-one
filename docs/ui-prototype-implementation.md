@@ -5,7 +5,9 @@
 
 ## 已实现
 
-`apps/desktop-ui` 已把 C1 产品设计系统落为可运行界面：
+> **已被取代（2026-11-10）**：`apps/desktop-ui` 原型已删除。桌面客户端是 `apps/unzoo-one`（Tauri 2），界面是 `app/` 的控制台，见 [ADR 0001 的修订](adr/0001-desktop-ui-stack.md)。下文为历史记录。
+
+`apps/desktop-ui` 曾把 C1 产品设计系统落为可运行界面：
 
 - 窗口顶栏、主导航、工作区与可收起 Activity Rail；
 - Home、Task Detail、Inbox、Automations、Artifacts、Integrations 入口；

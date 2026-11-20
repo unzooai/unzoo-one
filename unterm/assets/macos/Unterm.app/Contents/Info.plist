@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Unterm</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>command</string>
+				<string>sh</string>
+				<string>zsh</string>
+				<string>bash</string>
+				<string>fish</string>
+				<string>tool</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>terminal.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>Terminal shell script</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folders</string>
+			<key>CFBundleTypeOSTypes</key>
+			<array>
+				<string>fold</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Shell</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.unix-executable</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>unterm</string>
+	<key>CFBundleIconFile</key>
+	<string>terminal.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.unzoo.unterm</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Unterm</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>ai.unzoo.unterm.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>unterm</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>An application launched via Unterm would like to access AppleScript.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>An application launched via Unterm would like to access calendar data.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>An application launched via Unterm would like to access the camera.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>An application launched via Unterm wants to access your contacts.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>An application launched via Unterm would like to access your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>An application launched via Unterm would like to access your Downloads folder.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>An application launched via Unterm would like to access the local network.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>An application launched via Unterm would like to access your location information, even in the background.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>An application launched via Unterm would like to access your location information.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>An application launched via Unterm would like to access your location information while active.</string>
+	<key>NSMainNibFile</key>
+	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>An application launched via Unterm would like to access your microphone.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>An application launched via Unterm would like to access your reminders.</string>
+	<key>NSRequiresAquaSystemAppearance</key>
+	<string>NO</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>New Unterm Tab Here</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>openUntermTabHere</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSTextContent</key>
+				<string>FilePath</string>
+			</dict>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSFilenamesPboardType</string>
+				<string>public.plain-text</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>New Unterm Window Here</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>openInUnterm</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSTextContent</key>
+				<string>FilePath</string>
+			</dict>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSFilenamesPboardType</string>
+				<string>public.plain-text</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>An application launched via Unterm requires elevated permission.</string>
+</dict>
+</plist>

@@ -1,0 +1,15 @@
+{
+  "schema": "brain/events.schema.json#/$defs/brain_event",
+  "reason": "拒绝了却不给理由。模型只能从这条消息知道为什么停下；没有理由，它会猜，或者换个工具绕过去再试。",
+  "instance": {
+    "schema_version": "brain_event.v0",
+    "event": "approval.resolved",
+    "at": "2026-11-09T02:10:05+00:00",
+    "session_id": "ags_7f31c0",
+    "cursor": 5,
+    "approval": {
+      "request_id": "r1",
+      "decision": "deny"
+    }
+  }
+}

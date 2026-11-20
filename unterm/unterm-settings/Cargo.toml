@@ -1,0 +1,45 @@
+[package]
+name = "unterm-settings"
+version = "0.71.28"
+edition = "2021"
+publish = false
+
+# The settings UI Unterm serves over HTTP, which `unterm-cli settings` opens.
+# Deliberately window-free: it reads and writes the same files and the same
+# engine every other surface does, so it works whether or not anything is on
+# screen.
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+dirs-next.workspace = true
+encoding_rs.workspace = true
+ed25519-dalek.workspace = true
+fastrand.workspace = true
+hex.workspace = true
+hmac.workspace = true
+hostname.workspace = true
+http_req.workspace = true
+log.workspace = true
+native-tls = "0.2"
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+unterm-agents.workspace = true
+unterm-engine = { path = "../unterm-engine" }
+unterm-mcp = { path = "../unterm-mcp" }
+unterm-profile.workspace = true
+unterm-protocol.workspace = true
+unterm-services.workspace = true
+unterm-tasks.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+unterm-brain.workspace = true
+tempfile.workspace = true
+unterm-services = { workspace = true, features = ["test-support"] }

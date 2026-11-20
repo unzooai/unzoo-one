@@ -1,105 +1,116 @@
 # Unzoo One
 
-**Your Personal AI Operating System.**
+**The agent's computer.**
 
-Unzoo One 是一个本地优先、可更换大脑、可持续运行、可审计，并能安全操作终端、浏览器和桌面应用的 AI 超级工作台。
+[中文](README.zh-CN.md)
 
-核心组合：
+Unzoo One is not another chat app. It is the computer your AI agents work on.
+The thinking comes from the agents you already pay for: Claude Code, Codex,
+Antigravity CLI (agy) and OpenCode, on your own subscriptions. Unzoo One gives
+them what they can't get inside their own apps:
 
-- **Unterm**：任务、会话、大脑路由、权限、审批、记忆、调度、审计与产物。
-- **Unzoo**：浏览器与桌面操作执行器，负责观察、行动、验证与证据。
-- **Codex / Claude / Gemini / OpenCode**：可插拔 AI Brain。
-- **MCP / SDK / ACP**：能力和大脑接入协议。
+- **A terminal that stays.** Sessions live in a background service, so they
+  keep going when the window closes. Long-running programs are still there next
+  time, and you can watch the same terminal and take over at any point.
+- **A real browser with real sign-ins.** A full Chromium with your accounts,
+  and a separate identity for each agent. It can download media and deal with
+  captchas. When a login is needed, it hands the page to you and waits.
+- **Governance.** Every action is rated for risk. Low-risk steps just run;
+  risky ones (deleting, pushing, paying) wait in your inbox for approval.
+  Everything is recorded.
 
-## 产品设计
+You are not tied to any model vendor. The terminal and browser are also offered
+over MCP, so Claude Desktop, Cursor and other clients can use them too.
 
-- [完整产品文档索引](docs/README.md)
-- [整体产品架构与能力审计](docs/product-architecture.md)
-- [MVP 产品规格](docs/mvp-product-spec.md)
-- [产品体验、页面与异常状态规格](docs/product-experience-spec.md)
-- [核心领域模型与协议契约](docs/domain-model-and-contracts.md)
-- [`contracts/v0` 跨仓库 JSON Schema](contracts/v0/README.md)（三仓库唯一事实来源）
-- [`one-core` 常驻运行时](one-core/README.md)（骨架：认证 IPC、单实例、SQLite、事件 cursor）
-- [安全与信任模型](docs/security-and-trust-model.md)
-- [Connector、Skill 与生态规范](docs/connectors-skills-and-ecosystem.md)
-- [分发、数据与运行保障](docs/distribution-data-and-operations.md)
-- [产品指标与验证计划](docs/product-metrics-and-validation.md)
-- [交付路线图与开发 Backlog](docs/delivery-roadmap.md)
-- [OpenWorker 参考分析与能力覆盖策略](docs/openworker-reference-analysis.md)
-- [Unzoo 品牌家族与 Unzoo One UI 系统](docs/brand-and-ui-system.md)
-- [C1 / Flow One 完整品牌识别系统](docs/c1-brand-identity-system.md)
-- [打开 C1 完整品牌系统预览](brand/c1/brand-system-preview.html)
-- [C1 产品设计系统](docs/c1-product-design-system.md)
-- [关键页面与状态蓝图](docs/key-screen-blueprints.md)
-- [打开 C1 产品设计预览](brand/c1/product-design-preview.html)
-- [运行 C1 桌面 UI 原型](apps/desktop-ui/README.md)
-- [桌面 UI 实现状态与接入 Backlog](docs/ui-prototype-implementation.md)
-- [超级工作台 Context、角色与执行治理](docs/super-workbench-context-and-governance.md)
-- [打开品牌与 UI 预览](brand/preview.html)
+## What you can do today (personal edition)
 
-## 当前阶段
+- **Talk, don't fill in forms.** Type what you want done. A conversation is a
+  task: follow up in the same thread, and approve right where you are.
+- **Watch the agent work.** Its terminal and browser appear beside the
+  conversation, and you can take over at any time.
+- **Skills.** Built-in terminal and browser skills, managed in one place. Save
+  something an agent did as a new skill.
+- **A hub with helpers.** Your main agent can hand part of the work to another
+  agent, for example Claude Code passing a chunk to Codex. Standing helpers own
+  an area and remember what they did before.
+- **Runs on its own.** Run tasks daily, on weekdays, weekly, every N minutes or
+  once at a set time. Tasks can also run when something changes: a web page, a
+  folder, new mail, or an upcoming calendar event.
+- **Phone.** On the same Wi-Fi or over Tailscale, read conversations, approve
+  actions, take over and start tasks from your phone.
+- **Languages.** English first, with Chinese as well.
 
-项目已进入产品架构、跨仓库契约、核心运行时与桌面 UI 原型并行验证阶段。首个目标是完成：
+### Private by design
 
-1. Unterm 真正无头运行。
-2. Codex 与 Claude Brain Adapter。
-3. 持久化 Task Engine。
-4. Unzoo Browser Provider 原生绑定。
-5. 统一 Policy、Approval、Audit 与 Artifact。
-6. Ask / Work / Code / Automate 四种任务入口。
-7. 统一 Approval Inbox、MCP Connector 导入和首批邮件/日历/消息连接。
+In the personal edition, everything stays on your computer: tasks,
+conversations, mail passwords, calendar addresses and browser sign-ins. Nothing
+goes through our servers. Secrets live in the system credential store
+(Windows Credential Manager) and are never handed to the agents. Page and mail
+content reaches the agent as data, never as instructions.
 
-## Web 控制台（`app/`）
+The trade-off is that nothing runs while your computer is off. Runs missed
+while it was asleep or off catch up once it is back on.
 
-仓库内置 Unzoo One 的 Web 控制台原型（来自 codex 前端线），技术栈为
-Next.js 16 + React 19 + [vinext](https://github.com/cloudflare/vinext)，运行在
-Cloudflare Worker 上，可选 D1 / R2 绑定。
+## Where we are going
+
+| | Personal | Enterprise (planned) |
+|---|---|---|
+| Where it runs | Your computer only | Your computer plus your organization's own server |
+| When the computer is off | Waits, then catches up | Tasks keep running on the server |
+| Data | Never leaves your computer | Stays inside your organization |
+| People | One | Teams with shared agents, skills and policies |
+| Governance | Your own approvals | Central policy, approval routing, audit export, SSO |
+
+Next for the personal edition:
+
+- macOS and Linux packages.
+- Signed Windows installers.
+- Turning a recording into a skill.
+- Letting agents use desktop apps as well as the terminal and browser.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `unterm/` | The runtime: background service, terminal, agent sessions, scheduling, gateway (Rust). Third-party, MIT; see [NOTICE.md](NOTICE.md). |
+| `app/` | The interface (Next.js 16 + React 19 on [vinext](https://github.com/cloudflare/vinext)), built as static files and bundled into the desktop client. |
+| `apps/unzoo-one/` | The desktop client (Tauri 2) and installer. See [its README](apps/unzoo-one/README.md). |
+| `contracts/` | Cross-repository JSON Schemas. |
+| `docs/` | Product and design documents. The current plan is [docs/plans/2026-11-12-agent-computer.md](docs/plans/2026-11-12-agent-computer.md). |
+| `one-core/` | Earlier runtime prototype, now frozen. |
+
+## Building
 
 ```bash
-npm install     # 依赖锁定在 package-lock.json
-npm run dev     # 本地开发
-npm run build   # 验证 vinext 构建产物
-npm test        # 构建 + 渲染骨架测试
-npm run lint
+npm install
+npm run build:static          # interface -> dist/client
+npm test                      # interface tests
+cd unterm && cargo build -p unterm-core -p unterm-app    # runtime and terminal
 ```
 
-### 两个构建目标
+Windows installer: `powershell -File apps\unzoo-one\build-installer.ps1`.
+Details, signing and autostart are covered in
+[apps/unzoo-one/README.md](apps/unzoo-one/README.md). The interface's
+development setup is in [docs/web-console-setup.md](docs/web-console-setup.md).
 
-| 命令 | 产物 | 用途 |
-| --- | --- | --- |
-| `npm run build` | `dist/server`（Worker） | 云端演示版，SSR + API routes，数据走内存 mock |
-| `npm run build:static` | `dist/client`（静态文件） | 本地版，交给 unterm 托管 |
+Agents working in this repository must follow [AGENTS.md](AGENTS.md). In
+particular, all browser automation goes through Unzoo Browser; Playwright,
+Puppeteer and similar tools are not allowed.
 
-静态版是预渲染的完整首屏，不是白屏 SPA。
+## License
 
-### 交给 unterm 托管
+Unzoo One is **source-available** under the
+[Business Source License 1.1](LICENSE). It is free software with controls:
 
-unterm 0.71 起，`unterm-settings` 的 HTTP 服务（固定端口 19877）可以直接托管
-这套静态产物：
+- **Allowed:** reading, changing and building the code; using it yourself; and
+  using it inside your company, including in production.
+- **Not allowed** without a commercial license: offering it to others as a
+  hosted or managed service, or shipping it inside a product that competes
+  with Unzoo One.
+- **After four years:** each version becomes
+  [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) four years
+  after it is first released.
 
-```bash
-npm run build:static
-# 开发时把 unterm 指向产物目录，改完前端刷新浏览器即可
-UNTERM_CONSOLE_DIR=D:/code/unzoo-one/dist/client unterm
-# 然后访问 http://127.0.0.1:19877/console/
-```
-
-安装版会把产物放在 `<unterm 安装目录>/console`，不需要设环境变量。
-
-同源之后控制台直接调 unterm 的 `/api/*`：页面加载时先取一次
-`/bootstrap.json` 拿 auth token，后续请求带 Bearer，和 unterm 自己的设置页
-是同一套机制。这条路下本仓库的 `app/api/*` 代理不参与，也不用配置令牌。
-
-### 数据从哪来
-
-组件只依赖 `app/lib/provider.ts` 的契约，实现在 `app/lib/workspace-provider.ts`
-里选：
-
-- `provider-mock.ts` — 内存数据，云端演示和离线兜底都用它
-- `provider-live.ts` — 真实后端，能接的走本机 unzoo / unterm，接不上自动
-  落回 mock
-
-所以云端和本地跑的是同一份代码，区别只在于有多少数据是真的。
-
-脚手架细节、ChatGPT 登录（SIWC）与 D1 迁移说明见
-[Web 控制台脚手架说明](docs/web-console-setup.md)。
+The runtime in `unterm/` and other third-party code keep their own licenses
+(MIT and others); see [NOTICE.md](NOTICE.md). For a commercial or enterprise
+license, email [dev@unzoo.ai](mailto:dev@unzoo.ai).

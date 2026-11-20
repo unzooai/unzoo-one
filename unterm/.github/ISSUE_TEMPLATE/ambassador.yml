@@ -1,0 +1,39 @@
+name: Share a post about Unterm / 提交推广文章
+description: Wrote, recorded or posted something about Unterm? Drop the link and it shows up on unterm.app/ambassador. 写了、录了或发了关于 Unterm 的内容？贴上链接，就会出现在官网推广大使页。
+title: "[Post] "
+labels: ["ambassador-post"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you! Paste the link below. Open submissions are listed on [unterm.app/ambassador](https://unterm.app/ambassador) within a few minutes; closing the issue takes it off the page.
+
+        谢谢你！把链接贴在下面即可。提交后几分钟内会出现在 [unterm.app/zh-CN/ambassador](https://unterm.app/zh-CN/ambassador)；关闭 issue 即从页面移除。
+  - type: input
+    id: link
+    attributes:
+      label: Link / 链接
+      description: The post, video, thread or talk. 文章、视频、帖子或分享的地址。
+      placeholder: https://
+    validations:
+      required: true
+  - type: input
+    id: title
+    attributes:
+      label: Title / 标题
+      description: Optional — shown on the page instead of the link. 可选，会代替链接显示在页面上。
+  - type: textarea
+    id: note
+    attributes:
+      label: Anything you'd like us to know? / 想对我们说的话
+      description: Optional. Questions, bugs or requests your readers raised are very welcome here. 可选。读者提的问题、bug 或需求都欢迎写在这里。
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Ground rules / 基本规则
+      description: Details on unterm.app/ambassador. 详见官网推广大使页。
+      options:
+        - label: I wrote it myself, in my own words, and the post says I'm an Unterm ambassador or user. / 内容是我自己写的，并在文中说明了我是 Unterm 推广大使或用户。
+          required: true
+        - label: I posted it where self-promotion is allowed — no spam, fake accounts or bought votes. / 我发在允许自我推广的地方——没有刷屏、小号或刷票。
+          required: true

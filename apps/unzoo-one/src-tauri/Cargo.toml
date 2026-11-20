@@ -1,0 +1,29 @@
+[package]
+name = "unzoo-one"
+version = "0.1.0"
+description = "Unzoo One — the desktop client"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+# Its own workspace: the client is not part of the runtime's (unterm/) build.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Where the background service records itself: the one answer every process
+# has to agree on.
+unterm-protocol = { path = "../../../unterm/unterm-protocol" }
+
+[profile.release]
+strip = true
+lto = true
+
+[target."cfg(windows)".dependencies]
+# The Run key for start-at-sign-in, through the registry API.
+winreg = "0.10"

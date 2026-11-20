@@ -21,7 +21,7 @@ test("任务：列出、创建、改状态、删除", async () => {
 
   await assert.rejects(
     () => p.tasks.create({ id: "task-contract-1", title: "重复", description: "", target: "", status: "运行中" }),
-    /已存在/,
+    /already exists/,
     "同一个 id 不能建两次",
   );
 
@@ -231,8 +231,8 @@ test("brain：跑一轮，事件按游标推进，状态收敛到 finished", asy
 
 test("brain：会话不存在时明确报错，不是静默返回空", async () => {
   const p = createMockProvider();
-  await assert.rejects(() => p.brain.events("ags-nope", 0), /会话不存在/);
-  await assert.rejects(() => p.brain.status("ags-nope"), /会话不存在/);
+  await assert.rejects(() => p.brain.events("ags-nope", 0), /No such session/);
+  await assert.rejects(() => p.brain.status("ags-nope"), /No such session/);
   const closed = await p.brain.close("ags-nope");
   assert.equal(closed.exitCode, 1, "关一个不存在的会话是失败，不是成功");
 });
@@ -244,5 +244,40 @@ test("brain：中断后会话就没了", async () => {
   });
   assert.equal(s.adapter, "codex");
   await p.brain.interrupt(s.sessionId);
-  await assert.rejects(() => p.brain.status(s.sessionId), /会话不存在/);
+  await assert.rejects(() => p.brain.status(s.sessionId), /No such session/);
+});
+
+test("brain：续接沿用原来的对话，没有可接的对话就报错", async () => {
+  const p = createMockProvider();
+  const first = await p.brain.start({
+    agent: "claude-code", prompt: "记住 banana", taskId: "t", runId: "r1", stepId: "s1", mode: "governed",
+  });
+  const next = await p.brain.resume({
+    sessionId: first.sessionId, prompt: "刚才让你记住什么", taskId: "t", runId: "r2", stepId: "s2",
+  });
+  assert.notEqual(next.sessionId, first.sessionId, "续接是一个新会话");
+  await new Promise((r) => setTimeout(r, 2200));
+  const { events } = await p.brain.events(next.sessionId, 0);
+  const said = events.filter((e) => e.event === "output.delta").map((e) => e.message).join("");
+  assert.match(said, /记住 banana/, "接上了原来的对话");
+  assert.ok(events.every((e) => e.runId === "r2"), "事件挂在新的运行上");
+  assert.equal(events.at(-1).event, "turn.completed");
+  await assert.rejects(
+    () => p.brain.resume({ sessionId: "ags-nope", prompt: "x", taskId: "t", runId: "r", stepId: "s" }),
+    /no conversation to continue/,
+  );
+});
+
+test("常设规则：加、列、删；删不存在的报错", async () => {
+  const p = createMockProvider();
+  assert.deepEqual((await p.agentRules.list()).rules, []);
+  const rule = await p.agentRules.add({ tool: " Bash ", decision: "deny", commandPrefix: "git push", workspace: "" });
+  assert.equal(rule.tool, "Bash");
+  assert.equal(rule.workspace, undefined, "空工作区当作所有工作区");
+  assert.equal(rule.createdBy, "console");
+  assert.equal((await p.agentRules.list()).rules.length, 1);
+  await p.agentRules.remove(rule.id);
+  assert.equal((await p.agentRules.list()).rules.length, 0);
+  await assert.rejects(() => p.agentRules.remove(rule.id), /No such rule/);
+  await assert.rejects(() => p.agentRules.add({ tool: "  ", decision: "allow" }), /name a tool/);
 });

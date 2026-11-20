@@ -1,0 +1,18655 @@
+//! The window, the surface, and the shell behind them.
+//!
+//! Everything here needs a display to exercise, which is why the frame-building
+//! half lives in `terminal.rs` and is tested on its own. What is left is
+//! plumbing: winit gives events, next-core gives a screen, unterm-render turns
+//! one into the other.
+
+use crate::terminal::{colors_from, TerminalFont};
+
+/// How many matches a search collects.
+///
+/// Enough that the count means something, bounded so a pattern matching every
+/// line of a long scrollback does not stall the keystroke that typed it.
+const MAX_SEARCH_MATCHES: usize = 500;
+
+/// How many rows the palette shows at once.
+///
+/// Enough to choose from, few enough that it does not become the window. A
+/// query that narrows the list is the way to reach the rest.
+
+/// How many inbox rows fit before the list becomes the window.
+/// How many changed paths the git panel shows before it stops.
+///
+/// A repository mid-rebase can have hundreds; a panel that covers the
+/// terminal is a panel nobody opens twice.
+const MAX_GIT_ROWS: usize = 20;
+
+/// How many queued prompts the composer shows.
+const MAX_COMPOSER_ROWS: usize = 12;
+
+const MAX_INBOX_ROWS: usize = 12;
+
+/// How often the cockpit tracker is shown the panes.
+///
+/// Not every frame: it scans each pane's last rows for the shapes an agent
+/// makes when it is waiting, and doing that sixty times a second would spend
+/// more on watching the agents than on drawing them.
+const COCKPIT_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How often the window does its housekeeping.
+///
+/// Twice a second. Everything on that path -- reconciling the tab list,
+/// feeding the cockpit, re-deriving the title -- answers a question whose
+/// answer changes when a person or an agent does something, not between two
+/// frames. Doing it per frame was most of what an idle window cost.
+const HOUSEKEEPING: std::time::Duration = std::time::Duration::from_millis(500);
+/// The renderer has two sampled textures and no bindless resource table.
+///
+/// WGPU's WebGPU-compatible default is one million non-sampler bindings. On
+/// D3D12 that number is not merely validation metadata: wgpu-hal immediately
+/// allocates a shader-visible descriptor heap with that capacity. A terminal
+/// then carries roughly 32 MiB of unused dedicated GPU memory (and the driver's
+/// mirrored bookkeeping) before its first frame. Four thousand bindings leave
+/// orders of magnitude more headroom than this renderer can consume without
+/// making every idle window pay for a game-engine-sized heap.
+const MAX_GPU_VIEW_DESCRIPTORS: u32 = 4_096;
+
+/// Do not initialise every graphics API installed on the machine.
+///
+/// `Instance::default()` enables DX12, Vulkan and OpenGL together on Windows.
+/// Even though adapter selection ultimately uses DX12, loading and probing the
+/// other driver stacks leaves their DLLs and runtime allocations resident for
+/// the lifetime of every terminal window. Use the native primary backend here;
+/// startup tries the portable backend separately if the primary has no adapter.
+#[cfg(target_os = "windows")]
+const PRIMARY_GPU_BACKEND: wgpu::Backends = wgpu::Backends::DX12;
+#[cfg(target_os = "macos")]
+const PRIMARY_GPU_BACKEND: wgpu::Backends = wgpu::Backends::METAL;
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+const PRIMARY_GPU_BACKEND: wgpu::Backends = wgpu::Backends::VULKAN;
+
+#[cfg(target_os = "windows")]
+const FALLBACK_GPU_BACKEND: Option<wgpu::Backends> = Some(wgpu::Backends::GL);
+#[cfg(target_os = "macos")]
+const FALLBACK_GPU_BACKEND: Option<wgpu::Backends> = None;
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+const FALLBACK_GPU_BACKEND: Option<wgpu::Backends> = Some(wgpu::Backends::GL);
+
+/// A graphics stack that has already produced one frame.
+struct Graphics {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    format: wgpu::TextureFormat,
+    /// Kept so a second window does not have to find a GPU again.
+    shared: SharedGpu,
+}
+
+/// The parts of the graphics stack that belong to the process, not a window.
+///
+/// Choosing an adapter costs about 200 ms and it is not a first-call cost:
+/// measured three times in one process, `request_adapter` took 327, 197 and
+/// 202 ms. A window that reuses this one pays for its surface instead --
+/// `create_surface` is immediate and configuring it takes 3 ms. That is the
+/// whole difference between Unterm's 587 ms for a new window and Windows
+/// Terminal's 172 ms: WT's second window is served by a process that already
+/// has these.
+#[derive(Clone)]
+struct SharedGpu {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    format: wgpu::TextureFormat,
+}
+
+/// The backends to try, in order, each as (backend, software only).
+///
+/// `UNTERM_GPU_BACKEND` names one backend and makes it the only one tried --
+/// hardware, then software. It is how a machine whose default path hangs
+/// rather than fails can be told to go straight to one that works, and how
+/// the Windows-on-ARM test VM reaches Mesa's software Vulkan past the DX12
+/// attempts that never return there.
+///
+/// Without it: the platform's own backend, its portable fallback, then the
+/// same two in software -- and on Windows, Vulkan last of all. Some machines
+/// have a working Vulkan driver and nothing else: a VM with a software
+/// Vulkan ICD, or a GPU whose D3D12 driver is broken.
+fn gpu_attempts(requested: Option<&str>) -> Vec<(wgpu::Backends, bool)> {
+    let named = requested.and_then(|name| match name.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        "gl" | "opengl" | "gles" => Some(wgpu::Backends::GL),
+        "metal" => Some(wgpu::Backends::METAL),
+        _ => None,
+    });
+    if let Some(backend) = named {
+        return vec![(backend, false), (backend, true)];
+    }
+    let mut attempts = vec![(PRIMARY_GPU_BACKEND, false)];
+    if let Some(fallback) = FALLBACK_GPU_BACKEND {
+        attempts.push((fallback, false));
+    }
+    attempts.push((PRIMARY_GPU_BACKEND, true));
+    if let Some(fallback) = FALLBACK_GPU_BACKEND {
+        attempts.push((fallback, true));
+    }
+    if cfg!(target_os = "windows") {
+        attempts.push((wgpu::Backends::VULKAN, false));
+        attempts.push((wgpu::Backends::VULKAN, true));
+    }
+    attempts
+}
+
+fn request_graphics(window: Arc<Window>, width: u32, height: u32) -> anyhow::Result<Graphics> {
+    // Hardware first, then the same backends again with the software
+    // rasteriser. The last pass is what lets a machine with no usable GPU
+    // driver open a window at all.
+    //
+    // It was missing, and the failure it caused reads as the terminal being
+    // broken rather than the machine being unusual: on Windows on ARM inside
+    // a VM, DX12 finds an adapter but cannot configure a surface on the
+    // virtual display, and GL has no driver to find -- so both honest
+    // attempts fail and startup gave up with "no working GPU path", having
+    // never asked for WARP, which ships with D3D12 and needs no driver at
+    // all. Slow is a tradeoff a user can live with; not starting is not.
+    let attempts = gpu_attempts(std::env::var("UNTERM_GPU_BACKEND").ok().as_deref());
+    let mut failures = Vec::new();
+    for (backend, force_software) in attempts {
+        match try_backend(backend, window.clone(), width, height, force_software) {
+            Ok(graphics) => {
+                if !failures.is_empty() {
+                    let how = if force_software { " (software)" } else { "" };
+                    log::warn!(
+                        "fell back to {backend:?}{how} after ({})",
+                        failures.join("; ")
+                    );
+                }
+                return Ok(graphics);
+            }
+            Err(error) => {
+                let how = if force_software { " software" } else { "" };
+                failures.push(format!("{backend:?}{how}: {error:#}"));
+            }
+        }
+    }
+    anyhow::bail!("no working GPU path ({})", failures.join("; "))
+}
+
+/// Put a window on a GPU this process has already chosen.
+///
+/// Everything expensive -- loading the driver, enumerating adapters, opening
+/// a device -- happened for the first window. What is left is this window's
+/// own surface, which costs nothing to make and 3 ms to configure.
+///
+/// If the surface will not configure, say so rather than falling back: the
+/// fallback exists for "this machine's GPU stack does not work", and this
+/// process has already proved that it does.
+fn surface_on(
+    shared: SharedGpu,
+    window: Arc<Window>,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Graphics> {
+    let surface = shared
+        .instance
+        .create_surface(window)
+        .map_err(|error| anyhow::anyhow!("surface: {error}"))?;
+    let capabilities = surface.get_capabilities(&shared.adapter);
+    let format = if capabilities.formats.contains(&shared.format) {
+        shared.format
+    } else {
+        // A second monitor can want a format the first one did not offer.
+        *capabilities
+            .formats
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("surface offers no format"))?
+    };
+    surface.configure(
+        &shared.device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: capabilities.alpha_modes[0],
+            view_formats: vec![],
+        },
+    );
+    Ok(Graphics {
+        surface,
+        device: shared.device.clone(),
+        queue: shared.queue.clone(),
+        format,
+        shared,
+    })
+}
+
+/// Put Mica behind the window's frame, or leave the window exactly as it was.
+///
+/// Only on DX12, and only once every step has worked: DWM
+/// takes the backdrop (22H2 and later), a DirectComposition tree comes up, a
+/// surface on its visual offers premultiplied alpha and configures cleanly,
+/// and the tree commits. Then that surface replaces the window's own. Any
+/// failure keeps the window's own surface -- opaque, as before, never a black
+/// window -- because the frame's transparency lives only in the new one.
+#[cfg(windows)]
+fn attach_backdrop(live: &mut Live, shared: &SharedGpu, format: wgpu::TextureFormat) {
+    // Software (WARP) adapters included: the backdrop is only ever asked
+    // for, so whoever asked on a machine without a GPU has chosen the cost.
+    if shared.adapter.get_info().backend != wgpu::Backend::Dx12 {
+        log::info!("mica: not on DX12; keeping the opaque frame");
+        return;
+    }
+    if !crate::win_chrome::enable_mica_alt(&live.window) {
+        log::info!("mica: DWM refused the backdrop (before 22H2?); keeping the opaque frame");
+        return;
+    }
+    let Some(composition) = crate::win_chrome::Composition::new(&live.window) else {
+        log::info!("mica: no composition tree; keeping the opaque frame");
+        return;
+    };
+    let surface = match unsafe {
+        shared
+            .instance
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(composition.visual()))
+    } {
+        Ok(surface) => surface,
+        Err(error) => {
+            log::info!("mica: no surface on the visual ({error}); keeping the opaque frame");
+            return;
+        }
+    };
+    let capabilities = surface.get_capabilities(&shared.adapter);
+    if !capabilities.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        || !capabilities.formats.contains(&format)
+    {
+        log::info!("mica: the visual's surface cannot carry alpha; keeping the opaque frame");
+        return;
+    }
+    shared.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    surface.configure(
+        &shared.device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: live.width,
+            height: live.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        },
+    );
+    if let Some(error) = pollster::block_on(shared.device.pop_error_scope()) {
+        log::info!("mica: configuring the visual's surface failed ({error}); keeping the opaque frame");
+        return;
+    }
+    if !composition.commit() {
+        log::info!("mica: the composition tree would not commit; keeping the opaque frame");
+        return;
+    }
+    live.surface = surface;
+    live.composition = Some(composition);
+    live.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+    live.mica = true;
+    log::info!("mica: the frame shows Mica Alt");
+}
+
+#[cfg(not(windows))]
+fn attach_backdrop(_live: &mut Live, _shared: &SharedGpu, _format: wgpu::TextureFormat) {}
+
+/// Bring one backend all the way up, or say why it cannot come up.
+///
+/// The old probe stopped at "an adapter exists", and v0.61.0 taught us how
+/// little that proves: on machines where DX12 enumerates but cannot make a
+/// swapchain, `Surface::configure` failed *after* the choice was made, wgpu
+/// treats an uncaptured error as fatal, and a GUI-subsystem process died
+/// without a word -- an installed terminal that never opens. So a backend
+/// only wins once it has configured the real surface and handed back a real
+/// first frame; anything less moves on to the next backend.
+fn try_backend(
+    backend: wgpu::Backends,
+    window: Arc<Window>,
+    width: u32,
+    height: u32,
+    force_software: bool,
+) -> anyhow::Result<Graphics> {
+    crate::startup_trace::mark("graphics.instance.start");
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: backend,
+        ..Default::default()
+    });
+    crate::startup_trace::mark("graphics.instance.ready");
+    let surface = instance
+        .create_surface(window)
+        .map_err(|error| anyhow::anyhow!("surface: {error}"))?;
+    crate::startup_trace::mark("graphics.surface.ready");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        compatible_surface: Some(&surface),
+        // Ask for the software rasteriser only when the hardware paths have
+        // already been tried and refused. Asking for it first would hand a
+        // machine with a perfectly good GPU a slow one.
+        force_fallback_adapter: force_software,
+        ..Default::default()
+    }))
+    .map_err(|error| anyhow::anyhow!("adapter: {error}"))?;
+    crate::startup_trace::mark("graphics.adapter.ready");
+
+    let mut required_limits = wgpu::Limits::default();
+    required_limits.max_non_sampler_bindings = MAX_GPU_VIEW_DESCRIPTORS;
+    let descriptor = wgpu::DeviceDescriptor {
+        label: Some("unterm-render device"),
+        required_limits,
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    };
+    let device_result = pollster::block_on(adapter.request_device(&descriptor));
+    let (device, queue) = match device_result {
+        Ok(pair) => {
+            crate::startup_trace::mark("graphics.device.ready");
+            pair
+        }
+        // A downlevel adapter (ANGLE over an old driver) can refuse the
+        // default limits while still being perfectly able to draw a terminal.
+        Err(_) => {
+            let mut limits = wgpu::Limits::downlevel_defaults();
+            limits.max_non_sampler_bindings = MAX_GPU_VIEW_DESCRIPTORS;
+            let descriptor = wgpu::DeviceDescriptor {
+                label: Some("unterm-render device"),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                ..Default::default()
+            };
+            let pair = pollster::block_on(adapter.request_device(&descriptor))
+                .map_err(|error| anyhow::anyhow!("device: {error}"))?;
+            crate::startup_trace::mark("graphics.device.ready");
+            pair
+        }
+    };
+    // From here on a wgpu error is a log line, not a process death.
+    device.on_uncaptured_error(Box::new(|error| {
+        log::error!("wgpu: {error}");
+    }));
+
+    let capabilities = surface.get_capabilities(&adapter);
+    // Prefer a non-sRGB format: the colours here are already the values the
+    // config asked for, and an sRGB target would convert them a second time.
+    let format = capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(|format| !format.is_srgb())
+        .unwrap_or(capabilities.formats[0]);
+
+    // The part v0.61.0 never checked. The error scope turns a failed
+    // configure into a value; the first-frame request proves the swapchain
+    // is not just configured but usable.
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    surface.configure(
+        &device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        },
+    );
+    if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        anyhow::bail!("configure: {error}");
+    }
+    crate::startup_trace::mark("graphics.surface.configured");
+    match surface.get_current_texture() {
+        Ok(frame) => drop(frame),
+        Err(error) => anyhow::bail!("first frame: {error}"),
+    }
+    crate::startup_trace::mark("graphics.surface.probed");
+
+    Ok(Graphics {
+        shared: SharedGpu {
+            instance,
+            adapter,
+            device: device.clone(),
+            queue: queue.clone(),
+            format,
+        },
+        surface,
+        device,
+        queue,
+        format,
+    })
+}
+
+/// How many rows of each pane the tracker is shown.
+///
+/// A prompt asking a question is at the bottom; more than this is scrollback
+/// that has already been answered.
+const COCKPIT_TAIL_ROWS: usize = 8;
+
+use std::sync::Arc;
+use unterm_engine::next_core::{config, key_encoding};
+use unterm_engine::{
+    CreateSessionRequest, InputEngine, LaunchPolicySnapshot, ScreenEngine, SessionEngine,
+    SessionSnapshot,
+};
+use unterm_render::atlas::GlyphAtlas;
+use unterm_render::gpu::Renderer;
+use unterm_render::quads::FrameColors;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::ActiveEventLoop;
+use winit::window::{Window, WindowId};
+
+enum ClipboardResult {
+    Read {
+        pane_id: usize,
+        result: Result<String, String>,
+    },
+    Written(Result<(), String>),
+    DirectoryPicked {
+        then: crate::palette::BrowseThen,
+        result: Result<Option<std::path::PathBuf>, String>,
+    },
+    ScreenshotFinished {
+        mode: String,
+        result: Result<std::path::PathBuf, String>,
+    },
+    ExportFinished(Result<std::path::PathBuf, String>),
+    ScrollbackCaptured(Result<std::path::PathBuf, String>),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PaneNotice {
+    revision: u64,
+    unread: bool,
+    error: bool,
+    /// How many `OSC 9`/`777` notifications this pane had raised the last
+    /// time anyone looked, so each new one is announced exactly once.
+    notifications_seen: u64,
+    /// `OSC 9;4` progress the program in this pane last reported.
+    progress: Option<unterm_engine::TerminalProgress>,
+    /// How many finished commands (`OSC 133;D`) this pane had the last time
+    /// anyone looked, so each failure is noticed exactly once.
+    commands_seen: u64,
+    /// When the current foreground command started (`OSC 133;C`), used to
+    /// notify when a long-running background command (`>= 10s`) finishes.
+    command_started_at: Option<std::time::Instant>,
+    /// Exit code of the last finished command (`OSC 133;D`), if reported.
+    last_exit_code: Option<i32>,
+}
+
+/// The chevron's open dropdown: its rows, and where it sits.
+#[derive(Clone, Debug)]
+struct QuickMenu {
+    entries: Vec<crate::palette::Entry>,
+    hover: Option<usize>,
+    top_row: usize,
+    visible_rows: usize,
+    left: f32,
+    top: f32,
+    width: f32,
+    row_height: f32,
+}
+
+impl QuickMenu {
+    fn height(&self) -> f32 {
+        self.visible_rows as f32 * self.row_height
+    }
+
+    fn row_at(&self, x: f32, y: f32) -> Option<usize> {
+        if x < self.left || x >= self.left + self.width {
+            return None;
+        }
+        if y < self.top || y >= self.top + self.height() {
+            return None;
+        }
+        let visible = ((y - self.top) / self.row_height) as usize;
+        (visible < self.visible_rows).then_some(self.top_row + visible)
+    }
+
+    fn reveal_hover(&mut self) {
+        let Some(row) = self.hover else { return };
+        if row < self.top_row {
+            self.top_row = row;
+        } else if row >= self.top_row + self.visible_rows {
+            self.top_row = row + 1 - self.visible_rows;
+        }
+    }
+
+    fn scroll(&mut self, delta: isize) {
+        let max_top = self.entries.len().saturating_sub(self.visible_rows);
+        self.top_row = self.top_row.saturating_add_signed(delta).min(max_top);
+        if let Some(row) = self.hover {
+            self.hover = Some(
+                row.max(self.top_row)
+                    .min(self.top_row + self.visible_rows.saturating_sub(1)),
+            );
+        }
+    }
+
+    fn arrow_at(&self, x: f32, y: f32) -> Option<isize> {
+        if x < self.left + self.width - self.row_height || x >= self.left + self.width {
+            return None;
+        }
+        if y >= self.top && y < self.top + self.row_height && self.top_row > 0 {
+            Some(-1)
+        } else if y >= self.top + self.height() - self.row_height
+            && y < self.top + self.height()
+            && self.top_row + self.visible_rows < self.entries.len()
+        {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether a window size is one the terminal is actually being drawn at.
+///
+/// A window that has not been mapped yet reports 0x0, and depending on the
+/// platform and the winit build so can one that is minimised, occluded, or
+/// caught mid display change. None of those is a size, and nothing further
+/// down the chain can tell: the window width, the terminal area and the grid
+/// each floored at one cell, so a zero window arrived at the pane as a
+/// one-column terminal. Resizing a pane to one column does not narrow the
+/// view of its output, it truncates every line and the whole scrollback to a
+/// single character, and restoring the window cannot bring any of it back.
+/// So a window with no size is a window with nothing to say about grids.
+fn is_drawable_size(width: u32, height: u32) -> bool {
+    width > 0 && height > 0
+}
+
+fn styled_snapshot_has_text(snapshot: &unterm_engine::StyledScreenSnapshot) -> bool {
+    styled_lines_have_text(&snapshot.lines)
+}
+
+fn styled_lines_have_text(lines: &[unterm_engine::StyledScreenLine]) -> bool {
+    lines.iter().any(|line| {
+        line.cells
+            .iter()
+            .any(|cell| cell.width > 0 && !cell.ch.is_whitespace())
+    })
+}
+
+fn quick_menu_owns_keyboard(pending_confirmation_visible: bool) -> bool {
+    !pending_confirmation_visible
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickMenuMouseAction {
+    ActivateHovered,
+    Close,
+    Swallow,
+}
+
+fn quick_menu_mouse_action(
+    state: ElementState,
+    button: winit::event::MouseButton,
+    secondary: bool,
+) -> QuickMenuMouseAction {
+    if state != ElementState::Pressed {
+        return QuickMenuMouseAction::Swallow;
+    }
+    if button == winit::event::MouseButton::Left && !secondary {
+        QuickMenuMouseAction::ActivateHovered
+    } else {
+        QuickMenuMouseAction::Close
+    }
+}
+
+#[cfg(test)]
+mod quick_menu_tests {
+    use super::*;
+    use winit::event::MouseButton;
+
+    fn menu() -> QuickMenu {
+        let entries = (0..15)
+            .map(|index| crate::palette::Entry {
+                label: format!("item {index}"),
+                hint: String::new(),
+                command: crate::palette::Command::Action(crate::keys::Action::Copy),
+            })
+            .collect();
+        QuickMenu {
+            entries,
+            hover: Some(0),
+            top_row: 0,
+            visible_rows: 5,
+            left: 100.0,
+            top: 50.0,
+            width: 200.0,
+            row_height: 20.0,
+        }
+    }
+
+    #[test]
+    fn a_short_window_only_uses_the_rows_it_can_show() {
+        let menu = menu();
+        assert_eq!(menu.height(), 100.0);
+        assert_eq!(menu.row_at(120.0, 139.0), Some(4));
+        assert_eq!(menu.row_at(120.0, 151.0), None);
+    }
+
+    #[test]
+    fn scrolling_maps_visible_rows_back_to_the_real_entries() {
+        let mut menu = menu();
+        menu.scroll(4);
+        assert_eq!(menu.top_row, 4);
+        assert_eq!(menu.hover, Some(4));
+        assert_eq!(menu.row_at(120.0, 51.0), Some(4));
+        menu.scroll(99);
+        assert_eq!(menu.top_row, 10);
+    }
+
+    #[test]
+    fn keyboard_selection_pulls_the_visible_window_with_it() {
+        let mut menu = menu();
+        menu.hover = Some(8);
+        menu.reveal_hover();
+        assert_eq!(menu.top_row, 4);
+    }
+
+    #[test]
+    fn quick_menu_keeps_keyboard_unless_a_confirmation_is_visible() {
+        assert!(quick_menu_owns_keyboard(false));
+        assert!(!quick_menu_owns_keyboard(true));
+    }
+
+    #[test]
+    fn quick_menu_mouse_is_modal_over_mouse_reporting_tuis() {
+        assert_eq!(
+            quick_menu_mouse_action(ElementState::Pressed, MouseButton::Left, false),
+            QuickMenuMouseAction::ActivateHovered
+        );
+        assert_eq!(
+            quick_menu_mouse_action(ElementState::Pressed, MouseButton::Right, true),
+            QuickMenuMouseAction::Close
+        );
+        assert_eq!(
+            quick_menu_mouse_action(ElementState::Released, MouseButton::Left, false),
+            QuickMenuMouseAction::Swallow
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GitDock {
+    cwd: std::path::PathBuf,
+    panel: crate::git::Panel,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChromeOverrides {
+    active_surface: Option<[f32; 4]>,
+    inactive_surface: Option<[f32; 4]>,
+    active_foreground: Option<[f32; 4]>,
+    inactive_foreground: Option<[f32; 4]>,
+    active_edge: Option<[f32; 4]>,
+    inactive_edge: Option<[f32; 4]>,
+    selected_bg: Option<[f32; 4]>,
+    hover_bg: Option<[f32; 4]>,
+    dim_text: Option<[f32; 4]>,
+    button_foreground: Option<[f32; 4]>,
+    button_hover_foreground: Option<[f32; 4]>,
+    button_hover_background: Option<[f32; 4]>,
+}
+
+impl ChromeOverrides {
+    fn from_config(config: &config::Config) -> Self {
+        Self {
+            active_surface: configured_color(config, "window_frame.active_titlebar_bg")
+                .or_else(|| configured_color(config, "colors.tab_bar.background")),
+            inactive_surface: configured_color(config, "window_frame.inactive_titlebar_bg"),
+            active_foreground: configured_color(config, "window_frame.active_titlebar_fg")
+                .or_else(|| configured_color(config, "colors.tab_bar.active_tab.fg_color")),
+            inactive_foreground: configured_color(config, "window_frame.inactive_titlebar_fg"),
+            active_edge: configured_color(config, "window_frame.active_titlebar_border_bottom"),
+            inactive_edge: configured_color(config, "window_frame.inactive_titlebar_border_bottom"),
+            selected_bg: configured_color(config, "colors.tab_bar.active_tab.bg_color"),
+            hover_bg: configured_color(config, "colors.tab_bar.inactive_tab_hover.bg_color")
+                .or_else(|| configured_color(config, "window_frame.button_hover_bg")),
+            dim_text: configured_color(config, "colors.tab_bar.inactive_tab.fg_color")
+                .or_else(|| configured_color(config, "window_frame.inactive_titlebar_fg")),
+            button_foreground: configured_color(config, "window_frame.button_fg"),
+            button_hover_foreground: configured_color(config, "window_frame.button_hover_fg"),
+            button_hover_background: configured_color(config, "window_frame.button_hover_bg"),
+        }
+    }
+
+    fn apply(self, mut chrome: crate::chrome::Chrome, focused: bool) -> crate::chrome::Chrome {
+        let surface = if focused {
+            self.active_surface
+        } else {
+            self.inactive_surface.or(self.active_surface)
+        };
+        if let Some(surface) = surface {
+            chrome.surface = surface;
+            chrome.footer_bg = surface;
+            chrome.group_bg = surface;
+        }
+        let edge = if focused {
+            self.active_edge
+        } else {
+            self.inactive_edge.or(self.active_edge)
+        };
+        if let Some(edge) = edge {
+            chrome.outer_edge = edge;
+        }
+        if let Some(selected_bg) = self.selected_bg {
+            chrome.selected_bg = selected_bg;
+        }
+        if let Some(hover_bg) = self.hover_bg {
+            chrome.hover_bg = hover_bg;
+        }
+        if let Some(dim_text) = self.dim_text {
+            chrome.dim_text = dim_text;
+        }
+        chrome
+    }
+}
+
+fn configured_color(config: &config::Config, key: &str) -> Option<[f32; 4]> {
+    let color = config
+        .str_of(key)
+        .ok()
+        .flatten()
+        .and_then(unterm_engine::next_core::color::parse_hex)?;
+    Some([
+        color.red as f32 / 255.0,
+        color.green as f32 / 255.0,
+        color.blue as f32 / 255.0,
+        1.0,
+    ])
+}
+
+/// An image somebody left on the clipboard, made pasteable: written to the
+/// captures folder so the paste can be its path. The terminal form of "paste
+/// a picture" is a filename an agent can read.
+fn clipboard_image_to_file(picture: &arboard::ImageData) -> anyhow::Result<String> {
+    let dir = unterm_protocol::state_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".").join(".unterm"))
+        .join("captures");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|at| at.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("clipboard-{stamp}.png"));
+    let image = image::RgbaImage::from_raw(
+        picture.width as u32,
+        picture.height as u32,
+        picture.bytes.clone().into_owned(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("the clipboard image does not match its stated size"))?;
+    image.save_with_format(&path, image::ImageFormat::Png)?;
+    Ok(path.display().to_string())
+}
+
+/// A held sidebar row, from press until release. `engaged` stays false
+/// until the pointer has moved past the click-jitter slack — only then do
+/// cursor moves start carrying the tab through the strip.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    tab_id: usize,
+    origin: (f32, f32),
+    engaged: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PocketQrModal {
+    url: String,
+    pin: String,
+    matrix: Vec<Vec<bool>>,
+}
+
+pub struct App {
+    engine: crate::engine_backend::AppEngine,
+    /// The size the config asked for, which the reset key goes back to.
+    configured_font_points: f32,
+    /// The families to try after the primary one, kept because reopening the
+    /// font at a new size has to make the same choices as the first open.
+    font_fallbacks: Vec<String>,
+    /// The family the config named, if it named one.
+    font_family: Option<String>,
+    /// Terminal grid requested by the config for the first window.
+    initial_cols: usize,
+    initial_rows: usize,
+    /// Left, right, top and bottom terminal padding in logical pixels.
+    terminal_padding: [f32; 4],
+    /// Hue, saturation and brightness multipliers for unfocused panes.
+    inactive_pane_hsb: [f32; 3],
+    chrome_overrides: ChromeOverrides,
+    /// The shell the config asked for. Without this the session falls back to
+    /// `%COMSPEC%`, which on Windows is `cmd.exe` -- not what a config naming
+    /// `pwsh` meant, and it emits its output in the console codepage rather
+    /// than UTF-8.
+    shell: Option<portable_pty::CommandBuilder>,
+    /// Notices that the machine slept, so providers are re-probed and lapsed
+    /// leases are reported rather than failing later for no visible reason.
+    wake_watch: unterm_services::wake_watch::WakeWatch,
+    /// The tabs last written to `last_session.json`, and when that was
+    /// last checked. See `keep_last_session_current`.
+    last_session_written: Option<crate::session_restore::LastSession>,
+    last_session_checked: std::time::Instant,
+    /// Which page of the character picker is open: the group Ctrl+R turns
+    /// through while the picker's palette is up. Reset each time it opens.
+    charselect_group: crate::charselect::Group,
+    /// Where the first shell should start, if the command line said.
+    start_directory: Option<std::path::PathBuf>,
+    /// True when the launch named a directory or a program, so this window
+    /// must open a fresh shell rather than adopt whatever session a
+    /// populated Core had focused.
+    explicit_launch: bool,
+    /// What the previous window looked like, when a plain launch should
+    /// bring it back.
+    restore: Option<crate::session_restore::LastSession>,
+    clipboard_tx: std::sync::mpsc::Sender<ClipboardResult>,
+    clipboard_rx: std::sync::mpsc::Receiver<ClipboardResult>,
+    /// Whether the pane scrollbar is drawn at all — `enable_scroll_bar`,
+    /// which the schema promised and nothing read until now.
+    scrollbar_enabled: bool,
+    /// Whether the resident bottom status bar is on. Off by default in
+    /// the inbox design; a pending confirmation shows the strip anyway.
+    status_bar_enabled: bool,
+    /// The hyperlink rules in force: the config's own `hyperlink_rules`, or
+    /// the built-in set when it writes none.
+    link_rules: crate::links::Rules,
+    /// Whether the bell makes a sound.
+    audible_bell: bool,
+    /// How the bell's flash fades and what it colours -- `visual_bell`, with
+    /// the previous front end's defaults: no flash unless the config asks.
+    visual_bell: crate::terminal::VisualBell,
+    /// The config's `default_cwd`, when nothing else names a directory.
+    config_default_cwd: Option<std::path::PathBuf>,
+    /// `[window] close_confirmation = "NeverPrompt"` (or the older top-level
+    /// `window_close_confirmation`) turns the close confirmation off.
+    close_prompts: bool,
+    /// `window.decorations = true` asks for the system frame back.
+    system_decorations: bool,
+    /// Mica behind the frame on Windows 11, with `window.backdrop = "mica"`.
+    backdrop: bool,
+    /// The cursor the config asked for, and how fast it blinks.
+    cursor_style: crate::terminal::CursorStyle,
+    cursor_blink_ms: u64,
+    /// How fast SGR 5 and SGR 6 text blinks; zero turns a cadence off.
+    text_blink_ms: u64,
+    text_blink_rapid_ms: u64,
+    /// When the window opened, which is what a blink is measured from.
+    started: std::time::Instant,
+    /// The theme in force, so the picker can mark it and the next launch can
+    /// restore it.
+    theme_id: Option<String>,
+    /// The colours last handed to the kernel for programs that ask, and when.
+    colors_reported: Option<(unterm_engine::next_core::color::TerminalColors, std::time::Instant)>,
+    /// The cell size last told to the kernel, and when.
+    cell_size_reported: Option<((u32, u32), std::time::Instant)>,
+    /// Last Web Settings/CLI theme request observed by this window.
+    ///
+    /// Each native window is an independent observer of the process-local
+    /// mailbox, so one window applying a request does not consume it for the
+    /// others.
+    theme_request_seen: u64,
+    theme_file_mtime: Option<std::time::SystemTime>,
+    theme_file_checked_at: std::time::Instant,
+    /// The window being acted on, and everything true of it alone.
+    ///
+    /// The settings, the engine and the shell belong to the process; a tab
+    /// strip, a selection and a dirty-frame marker belong to one window.
+    /// Keeping both on the same `self` is what made "one window" mean "one
+    /// process", and one process per window is what makes every window pay
+    /// for its own GPU adapter -- 293 ms of it, measured.
+    ///
+    /// **Why a field and not `windows[active]`.** That was tried first and
+    /// reverted. A thousand call sites here take two fields of this struct at
+    /// once -- `&mut self.window.font` beside `&mut self.window.atlas` --
+    /// which the borrow checker allows because the fields are disjoint. Reach
+    /// them through an index and they stop being disjoint: both borrow the
+    /// vector, and the same thousand sites stop compiling. Keeping the active
+    /// window as a field keeps that property; the others park below.
+    window: WindowState,
+    /// When this process noticed its Core had been replaced.
+    ///
+    /// Pairs with `seen_session_epoch`: one decides, the other says how long
+    /// to keep saying so. Both are about the engine, so both belong here.
+    core_replaced_at: Option<std::time::Instant>,
+    /// When the Agent Cockpit was last fed.
+    ///
+    /// The poll it throttles asks the Core about every pane there is, not
+    /// about one window's. Held per window, a second window would double a
+    /// poll that already costs 28 ms at forty panes.
+    cockpit_fed_at: std::time::Instant,
+    /// The engine's session epoch this process has already reacted to.
+    ///
+    /// Belongs to the process, not to a window: it says what the *engine* has
+    /// been through. Held per window it starts at zero for every new one, so
+    /// opening a second window looked exactly like the Core being replaced --
+    /// and this process then "recovered" by spawning a shell nobody asked
+    /// for. Found by counting panes across a window close: two before, three
+    /// after.
+    seen_session_epoch: u64,
+    /// The GPU this process found, kept so later windows need not look.
+    gpu: Option<SharedGpu>,
+    /// What a second window is built from: the same settings the first was.
+    ///
+    /// Kept whole rather than as the dozen values `WindowState::fresh` reads
+    /// out of it, because a window opened now must be the window the config
+    /// describes, not the subset somebody remembered to copy.
+    config: config::Config,
+    configured_pixel_size: f64,
+    /// The windows that are not being acted on.
+    ///
+    /// Swapping one into `window` is how this process changes which window an
+    /// event means. A swap moves a struct of fields, not a frame or a
+    /// surface, and it happens once per event rather than once per frame.
+    parked: Vec<ParkedWindow>,
+    /// When an interactive region screenshot started, so double-clicks do not
+    /// spawn overlapping snipping sessions and early `Focused(true)` events
+    /// while `ms-screenclip:` is launching do not prematurely uncloak the window.
+    capture_started_at: Option<std::time::Instant>,
+}
+
+impl WindowState {
+    /// A window that has not been shown yet.
+    ///
+    /// Lifted out of `App::new` so a second window can be made the same way
+    /// the first one is. Everything here is either empty or a setting; what
+    /// makes a window *live* -- its surface, its renderer, its pane -- is
+    /// `App::start`.
+    fn fresh(
+        id: u64,
+        config: &config::Config,
+        pixel_size: f64,
+        shape: crate::terminal::Shape,
+        font: TerminalFont,
+        chrome_font: TerminalFont,
+        picture: Option<crate::background::Image>,
+    ) -> Self {
+        let sidebar_prefs = crate::sidebar::Prefs::load();
+        Self {
+            id,
+            picture,
+            font,
+            chrome_font,
+            drawn_confirmation: None,
+            drawn_suggestions: 0,
+            startup_first_frame_marked: false,
+            startup_terminal_content_marked: false,
+            preedit: crate::ime::Preedit::default(),
+            last_ime_event: None,
+            search: None,
+            bells_seen: 0,
+            bell_at: None,
+            dragging_scrollbar: false,
+            palette: None,
+            quick_menu: None,
+            copy_mode: None,
+            quick_select: None,
+            pane_select: None,
+            followed_active: None,
+            occluded: false,
+            clipboard_honoured: None,
+            inbox_open: false,
+            inbox_selected: 0,
+            sidebar_open: true,
+            cursor_icon: winit::window::CursorIcon::Default,
+            bar_title: String::new(),
+            top_bar_quiet: config
+            .str_of("top_bar")
+            .ok()
+            .flatten()
+            .map(|mode| mode != "full")
+            .unwrap_or(true),
+            sidebar_scroll: 0,
+            sidebar_points: sidebar_prefs.points,
+            sidebar_rail: sidebar_prefs.rail_choice,
+            sidebar_saved: sidebar_prefs,
+            sidebar_followed: None,
+            sidebar_hues: crate::sidebar::ProjectHues::default(),
+            dragging_sidebar_width: false,
+            dragging_tab: None,
+            sidebar_collapsed: Default::default(),
+            last_sidebar_click: None,
+            last_topbar_click: None,
+            terminal_click: None,
+            last_tree_click: None,
+            select_anchor: None,
+            select_granularity: SelectGranularity::Cell,
+            close_confirmed: false,
+            unmaximized_rect: None,
+            tab_titles: Default::default(),
+            pane_notices: Default::default(),
+            tree: None,
+            closing: false,
+            tray: None,
+            tray_refreshed: std::time::Instant::now(),
+            notice: None,
+            proxy_error_until: None,
+            git_panel: None,
+            composer: None,
+            mouse_modes: Default::default(),
+            held_mouse_button: None,
+            alt_held: false,
+            window_title: None,
+            quiet_since: None,
+            startup_session: None,
+            startup_input: String::new(),
+            restore_extra_tabs_pending: false,
+            pane_sizes: Default::default(),
+            focused: true,
+            kept_house_at: std::time::Instant::now(),
+            font_shape: shape,
+            font_points: pixel_size as f32,
+            scale: 1.0,
+            atlas: GlyphAtlas::new(1024, 1024),
+            colors: colors_from(config),
+            shift_held: false,
+            ctrl_held: false,
+            super_held: false,
+            pointer: (0.0, 0.0),
+            tabs: unterm_engine::next_core::tabs::TabRegistry::new(),
+            tab_id: None,
+            drag: None,
+            swallow_left_after_secondary: false,
+            secondary_gesture: crate::mouse::SecondaryGesture::default(),
+            selected: None,
+            state: None,
+            drawn_revision: None,
+            presented_at: None,
+            redraw_requested_at: None,
+            pending_input_redraw_at: None,
+            frame_sent: None,
+            caption_hover: None,
+            caption_hover_at: std::time::Instant::now(),
+            caption_left: None,
+            pointer_target: (None, None, None, None),
+            animate_until: None,
+            scroll_seen: None,
+            scrolled_at: None,
+            drawn_cursor_solid: None,
+            drawn_blink: None,
+            screen_blink: (false, false),
+            drawn_breath_step: None,
+            pocket_qr: None,
+            last_agent_states: Default::default(),
+            ssh_targets: Default::default(),
+        }
+    }
+}
+
+/// A window this process owns but is not currently acting on.
+///
+/// Held beside its id because winit delivers events per window, and the id is
+/// what says which of these an event means.
+struct ParkedWindow {
+    id: winit::window::WindowId,
+    state: WindowState,
+}
+
+/// Everything that belongs to one window rather than to the process.
+struct WindowState {
+    /// What an agent calls this window.
+    ///
+    /// Handed out by `unterm_engine::reserve_window_id`, and not winit's
+    /// `WindowId`: that one is an opaque platform handle, it changes when a
+    /// window is rebuilt after a spell in the tray, and it means nothing to
+    /// anybody outside this process. `instance.windows` reports this, and
+    /// `instance.focus` takes it.
+    id: u64,
+    font: TerminalFont,
+    /// The font the chrome is drawn in.
+    ///
+    /// A second face at its own size, because the chrome is not terminal
+    /// output: the previous front end drew every tab, sidebar row and status
+    /// segment at 13pt with a looser line height, and drawing them in the
+    /// terminal's font at the terminal's cell size is what made this window
+    /// read as a wall of output with a wall of output around it.
+    chrome_font: TerminalFont,
+    /// The size the font is asked for, in points, which the zoom keys move.
+    ///
+    /// Points rather than pixels, as the config and every other terminal mean
+    /// it: how many pixels that is depends on the display, and the display can
+    /// change while the window is open.
+    font_points: f32,
+    /// The display's scale, as winit reports it against 96 dpi.
+    scale: f32,
+    /// How far the cell is stretched around its glyphs.
+    font_shape: crate::terminal::Shape,
+    atlas: GlyphAtlas,
+    colors: FrameColors,
+    state: Option<Live>,
+    /// Whether shift is down, which is what separates a scroll from a key the
+    /// program should receive.
+    shift_held: bool,
+    /// Whether control is down.
+    ctrl_held: bool,
+    /// Whether super (Cmd on macOS / Win on Windows) is down.
+    super_held: bool,
+    /// Where the pointer is, in pixels. Winit reports movement and buttons
+    /// separately, so a click has to be told where it happened.
+    pointer: (f32, f32),
+    /// The split tree. next-core owns what an arrangement *is*; the window
+    /// only says when to split and reads back where the panes go.
+    tabs: unterm_engine::next_core::tabs::TabRegistry,
+    tab_id: Option<usize>,
+    /// The selection being dragged out, if one is.
+    drag: Option<crate::select::Drag>,
+    /// Whether the rest of the current left-button gesture is spoken for.
+    ///
+    /// A Ctrl+Left press consumed as a macOS secondary click swallows its own
+    /// drag and release: left alone they would fall through to the
+    /// left-button paths -- extend a selection, complete one, open a link --
+    /// and make a single click both paste and act.
+    swallow_left_after_secondary: bool,
+    /// One physical secondary click acts once, however many times the
+    /// platform delivers it.
+    secondary_gesture: crate::mouse::SecondaryGesture,
+    /// The text of the finished selection, kept so a copy key can find it.
+    selected: Option<String>,
+    /// The last screen we drew, so a frame is skipped when nothing changed.
+    /// A terminal is idle most of the time; redrawing an unchanged screen at
+    /// display rate is a fan that never stops.
+    drawn_revision: Option<u64>,
+    /// When the last frame was handed to the compositor. A flood of PTY
+    /// output must not draw faster than the display shows: past the
+    /// refresh interval the drawable pool runs dry and `nextDrawable`
+    /// turns the GUI thread into a queue behind the compositor.
+    presented_at: Option<std::time::Instant>,
+    /// When `tick` last asked for a frame that has not been drawn yet.
+    redraw_requested_at: Option<std::time::Instant>,
+    /// Fallback deadline for a keystroke/IME commit to force a frame if the
+    /// shell did not echo back within a few milliseconds.
+    pending_input_redraw_at: Option<std::time::Instant>,
+    /// What the compositor was last told about this window's frame: dark or
+    /// not, and the edge colour. See `sync_frame`.
+    frame_sent: Option<(bool, [u8; 3])>,
+    /// The caption button under the pointer, since when, and the one it
+    /// left and when -- what the hover fades are measured from.
+    caption_hover: Option<crate::topbar::Item>,
+    caption_hover_at: std::time::Instant,
+    caption_left: Option<(crate::topbar::Item, std::time::Instant)>,
+    /// What the pointer was last over in the chrome -- a bar item, a strip
+    /// row, a strip footer control, or a status bar segment -- so moving onto
+    /// something else asks for the frame that shows it.
+    pointer_target: (
+        Option<crate::topbar::Item>,
+        Option<usize>,
+        Option<usize>,
+        Option<crate::statusbar::SegmentKind>,
+    ),
+    /// Keep drawing until then: something on screen is still moving.
+    animate_until: Option<std::time::Instant>,
+    /// The scrollbar's memory: the view it last drew and when it last moved,
+    /// so an overlay bar shows while scrolling and fades once it stops.
+    scroll_seen: Option<(usize, usize)>,
+    scrolled_at: Option<std::time::Instant>,
+    /// Cursor phase represented by the last submitted frame.
+    ///
+    /// A blinking cursor changes only twice per period. Treating "blinking is
+    /// enabled" as "redraw every tick" kept an idle WebGPU surface busy.
+    drawn_cursor_solid: Option<bool>,
+    /// The text blink phase of the last submitted frame, and which cadences
+    /// that frame actually used -- so blinking text asks for one frame per
+    /// phase flip, and a screen with nothing blinking asks for none.
+    drawn_blink: Option<crate::terminal::BlinkPhase>,
+    screen_blink: (bool, bool),
+    /// The breathing phase the sidebar's working badge was last drawn at, so
+    /// an idle window repaints only when the phase actually changes — and not
+    /// at all when nothing is working.
+    drawn_breath_step: Option<u8>,
+    /// Which agent-write banner was on screen when we last drew, so one
+    /// appearing or being answered is itself a reason to draw again.
+    drawn_confirmation: Option<u64>,
+    /// Pending suggestions drawn in the last frame.
+    drawn_suggestions: usize,
+    /// Startup trace should record only the first presented frame.
+    startup_first_frame_marked: bool,
+    /// Startup trace should record when terminal text first reaches a frame.
+    startup_terminal_content_marked: bool,
+    /// Text an input method is still composing, not yet the shell's.
+    preedit: crate::ime::Preedit,
+    /// When the input method last spoke. A composition whose IME has gone
+    /// quiet is an orphan; one that talked milliseconds ago is live, and
+    /// winit hands us KeyboardInput alongside Ime events either way.
+    last_ime_event: Option<std::time::Instant>,
+    /// The open search, if there is one.
+    search: Option<crate::search::Search>,
+    /// How many bells the pane had rung when we last drew.
+    bells_seen: u64,
+    /// When the current flash started.
+    bell_at: Option<std::time::Instant>,
+    /// True while a drag is holding the scrollbar's thumb.
+    dragging_scrollbar: bool,
+    /// The open command palette or launcher, if there is one.
+    palette: Option<crate::palette::Palette>,
+    /// The chevron's dropdown, anchored under its button — a menu, not a
+    /// search box, which is what the palette would make of the same rows.
+    quick_menu: Option<QuickMenu>,
+    /// The keyboard selection, if copy mode is on.
+    copy_mode: Option<crate::copy_mode::CopyMode>,
+    /// Quick select's labels, and what has been typed towards one.
+    quick_select: Option<(Vec<crate::copy_mode::Labelled>, String)>,
+    /// A letter on every pane, while one is being picked.
+    pane_select: Option<crate::paneselect::Selector>,
+    /// The Core-wide active session this window last saw, so `sync_tabs`
+    /// follows a CHANGE of it (an Inbox jump aimed here) and not its mere
+    /// existence (every click in every other window on the same Core).
+    followed_active: Option<usize>,
+    /// Whether the compositor says nobody can see this window. Painting an
+    /// occluded window blocks on drawables that never come.
+    occluded: bool,
+    /// The last clipboard request honoured, so it is not honoured twice.
+    clipboard_honoured: Option<String>,
+    /// Whether the agent inbox is showing.
+    inbox_open: bool,
+    /// The inbox row the keyboard will open.
+    inbox_selected: usize,
+    /// Whether the strip of tabs down the left is showing.
+    sidebar_open: bool,
+    /// The pointer shape currently asked for, so a move that changes
+    /// nothing does not talk to the window system at all.
+    cursor_icon: winit::window::CursorIcon,
+    /// What the top bar's centre says: the window title without the
+    /// product name after it.
+    bar_title: String,
+    /// Whether the top bar hides its action row and facts line. On by
+    /// default; `top_bar = "full"` in the config restores them.
+    top_bar_quiet: bool,
+    /// The strip's first visible row, for lists longer than the window.
+    sidebar_scroll: usize,
+    /// The active row the strip last scrolled to show.
+    sidebar_followed: Option<usize>,
+    /// Which colour each project on the strip wears, kept so one project
+    /// opening or closing does not repaint the others.
+    sidebar_hues: crate::sidebar::ProjectHues,
+    /// Its width in points, once somebody has dragged it.
+    sidebar_points: Option<f32>,
+    /// Folded (`true`) or opened (`false`) by hand, remembered between runs;
+    /// `None` leaves it to the window's width.
+    sidebar_rail: Option<bool>,
+    /// What `sidebar.json` holds, so letting go of the grip writes only a
+    /// change.
+    sidebar_saved: crate::sidebar::Prefs,
+    /// True while a drag is holding the strip's right edge.
+    dragging_sidebar_width: bool,
+    /// A held tab row mid-reorder: which tab, and where it is being carried.
+    dragging_tab: Option<TabDrag>,
+    /// Projects the reader has folded away. Window state rather than disk
+    /// state: it survives repaints and resizing without any file being read.
+    sidebar_collapsed: std::collections::HashSet<String>,
+    /// The last press on a strip row, so only a true same-row double-click
+    /// opens the rename line rather than any two fast clicks anywhere.
+    last_sidebar_click: Option<crate::sidebar::RowClick>,
+    /// The last press on the top bar's empty stretch, so a double-click
+    /// there toggles maximise the way every title bar does.
+    last_topbar_click: Option<crate::sidebar::RowClick>,
+    /// The last press in the terminal, so a double-click can select the word
+    /// and a triple-click the line, as they always have.
+    terminal_click: Option<crate::sidebar::RowClick>,
+    /// The last press on a tree row: a single click browses the tree, and
+    /// only a same-row double-click reaches the shell, as 0.57.4 had it.
+    last_tree_click: Option<crate::sidebar::RowClick>,
+    /// Where the last selection started, so Shift+click extends it instead
+    /// of starting over.
+    select_anchor: Option<unterm_engine::next_core::selection::SelectionPoint>,
+    /// How the held drag grows: by cell, by word after a double-click, by
+    /// line after a triple-click. Without this the micro-move inside a real
+    /// double-click re-extends the drag to the pointer cell and shrinks the
+    /// word selection to wherever the pointer happened to sit.
+    select_granularity: SelectGranularity,
+    /// Whether the close confirmation has been answered.
+    close_confirmed: bool,
+    /// The window rect before a work-area maximise, so the second press
+    /// puts it back exactly where it was.
+    unmaximized_rect: Option<(
+        winit::dpi::PhysicalPosition<i32>,
+        winit::dpi::PhysicalSize<u32>,
+    )>,
+    /// Names the reader has given tabs, keyed by stable tab id. A named tab
+    /// keeps its name through program changes; an empty rename hands the tab
+    /// back to automatic titling.
+    tab_titles: std::collections::HashMap<usize, String>,
+    /// Output state for sidebar tabs; updated by the bounded Cockpit tail pass.
+    pane_notices: std::collections::HashMap<usize, PaneNotice>,
+    /// The file tree, while it is open. It shares the left dock with the tab
+    /// strip: two strips either side of a terminal is most of a narrow window,
+    /// so opening one closes the other.
+    tree: Option<crate::tree::Tree>,
+    /// Set when the close button is pressed, so the loop can exit.
+    closing: bool,
+    /// The menu-bar / notification-area indicator, while the window is parked
+    /// and its sessions run on in the Core. Its presence *is* the parked
+    /// state: this process only ever survives its window when there is
+    /// something on screen saying so.
+    tray: Option<crate::tray::Tray>,
+    /// When the indicator's counts were last refreshed, so a parked process
+    /// wakes to read them a few times a minute rather than at frame rate.
+    tray_refreshed: std::time::Instant,
+    /// Something that just happened, and when it stops being shown.
+    notice: Option<(String, std::time::Instant)>,
+    /// A press on the proxy chip tried to switch it on and the probe found
+    /// nothing listening; the chip says so until this instant.
+    proxy_error_until: Option<std::time::Instant>,
+    /// The git panel's contents, held while it is open.
+    ///
+    /// Read once when it opens rather than every frame: `git status` on a
+    /// large repository is not something to run sixty times a second, and a
+    /// panel that changes under the eye while being read is worse than one
+    /// that is a moment old.
+    git_panel: Option<GitDock>,
+    /// Prompts waiting to go into the focused pane, while the composer
+    /// is open. Closing it drops them: a queue that outlives the window
+    /// showing it would fire prompts nobody can see coming.
+    composer: Option<crate::composer::Composer>,
+    /// When the cockpit tracker last saw the panes.
+    /// What the program wants from the mouse, as of the last frame drawn.
+    ///
+    /// Cached rather than read per event: a motion arrives a hundred times a
+    /// second and building a screen snapshot for each would be most of a
+    /// frame's work spent deciding who owns a pointer that has not moved a
+    /// cell. Modes only change when the program writes an escape sequence,
+    /// which changes the screen, which draws a frame -- so the cache is never
+    /// more than one frame behind the thing that sets it.
+    mouse_modes: unterm_engine::next_core::mouse_encoding::MouseModes,
+    /// Which mouse button is down, so a drag reports the right one.
+    held_mouse_button: Option<unterm_engine::next_core::mouse_encoding::MouseButton>,
+    alt_held: bool,
+    /// The title last set, so an unchanged one is not set again every frame.
+    window_title: Option<String>,
+    /// The picture the config named, read once at startup. Uploaded to the
+    /// device when the window opens.
+    picture: Option<crate::background::Image>,
+    /// The size each pane was last told it is, so it is not told again.
+    pane_sizes: std::collections::HashMap<usize, (usize, usize)>,
+    /// Whether the window has the keyboard.
+    focused: bool,
+    /// When the housekeeping last ran.
+    kept_house_at: std::time::Instant,
+    /// Which Core generation this window's pane ids belong to. A change
+    /// means they belong to a process that is gone.
+    /// When the Core behind this window was last replaced, so the
+    /// recovery can be reported and then stop being reported.
+    /// When the window last had nothing to redraw, if it still has nothing.
+    ///
+    /// A window that has been still for a while is asked about far less often:
+    /// a terminal left open on a desk should not cost a core.
+    quiet_since: Option<std::time::Instant>,
+    startup_session: Option<std::thread::JoinHandle<anyhow::Result<SessionSnapshot>>>,
+    startup_input: String,
+    restore_extra_tabs_pending: bool,
+    pocket_qr: Option<PocketQrModal>,
+    last_agent_states:
+        std::collections::HashMap<u64, unterm_services::cockpit::status::AgentState>,
+    ssh_targets: std::collections::HashMap<usize, String>,
+}
+
+/// What closing the window should do to the sessions behind it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseOutcome {
+    /// End every session on the way out. What a terminal has always done,
+    /// and the right answer whenever nobody was asked anything.
+    EndSessions,
+    /// Leave them to the Core, which outlives this process. Chosen by the
+    /// close prompt, and by it alone.
+    KeepSessions,
+}
+
+/// Whether the process is going too, or only this window.
+///
+/// A separate question from `CloseOutcome`, which -- as its own comment says
+/// -- answers what happens to the *sessions*. For a while one value answered
+/// both: macOS keeps the process after its last window closes so the Dock
+/// icon can bring it back, and the branch that does so was keyed on
+/// `KeepSessions`. But "drain then exit", "cancel and exit" and the
+/// indicator's "quit everything" all pass `KeepSessions` too -- they leave
+/// the shells to the Core, which is exactly what that value means -- so all
+/// three stopped exiting and left an invisible process behind instead. Three
+/// commands with "exit" in their name, and none of them did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Leaving {
+    /// Only this view. On macOS the process stays, for the Dock icon.
+    WindowOnly,
+    /// The application. It ends here, whatever the platform's habit.
+    Process,
+}
+
+struct Live {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    renderer: Renderer,
+    atlas_texture: wgpu::Texture,
+    /// Number of glyphs represented by `atlas_texture`.
+    ///
+    /// Cursor blinking redraws an otherwise unchanged frame. Re-uploading the
+    /// whole atlas for every blink retains needless GPU allocations and was a
+    /// large part of the new renderer's idle memory and CPU cost.
+    atlas_uploaded_glyphs: usize,
+    /// The picture behind the terminal, uploaded once. Held here rather than
+    /// beside the window's other state because it belongs to the device that
+    /// draws it, and the device is here.
+    background: Option<wgpu::Texture>,
+    /// Its size, for working out which part of it fills the window.
+    background_size: Option<(u32, u32)>,
+    /// And how much of it shows through.
+    background_opacity: f32,
+    session_id: usize,
+    width: u32,
+    height: u32,
+    /// The composition tree the surface presents through, when the frame is
+    /// see-through for Mica. Dropped after the surface that uses it.
+    composition: Option<crate::win_chrome::Composition>,
+    /// How the surface's alpha reaches the compositor: `PreMultiplied`
+    /// behind Mica, the platform's default otherwise.
+    alpha_mode: wgpu::CompositeAlphaMode,
+    /// The frame is transparent and Mica shows through it.
+    mica: bool,
+}
+
+impl App {
+    /// How many windows this process is showing.
+    ///
+    /// The count the close prompt asks about: with another window still open,
+    /// closing this one is closing a view, and nothing has to be decided
+    /// about the sessions behind it.
+    fn window_count(&self) -> usize {
+        Self::window_count_for(self.parked.len())
+    }
+
+    /// The same count, over the number alone.
+    ///
+    /// Split out so the rule can be exercised without an `App` -- building
+    /// one needs a window, a font stack and a GPU device, so a test that
+    /// insisted on that would be testing winit. The first version of the
+    /// test below wrote `1 + parked` a second time inside itself, which
+    /// passed whatever this function did, including not existing.
+    fn window_count_for(parked: usize) -> usize {
+        1 + parked
+    }
+
+    /// The id of the window currently being acted on, if it has one yet.
+    fn active_window_id(&self) -> Option<winit::window::WindowId> {
+        self.window.state.as_ref().map(|live| live.window.id())
+    }
+
+    /// Make `id` the window this process is acting on.
+    ///
+    /// Returns false when no window here has that id. Swapping rather than
+    /// indexing is what lets every method below keep taking two fields of
+    /// `self.window` at once; see the field's own note.
+    fn focus_window(&mut self, id: winit::window::WindowId) -> bool {
+        if self.active_window_id() == Some(id) {
+            return true;
+        }
+        let Some(at) = self.parked.iter().position(|parked| parked.id == id) else {
+            return false;
+        };
+        // The active one has to keep its id on the way out, or the window it
+        // becomes could never be found again.
+        let Some(active_id) = self.active_window_id() else {
+            return false;
+        };
+        std::mem::swap(&mut self.window, &mut self.parked[at].state);
+        self.parked[at].id = active_id;
+        true
+    }
+
+    /// Tell the MCP surface what one window is showing.
+    fn note_window_view(state: &WindowState) {
+        let panes: Vec<usize> = state
+            .tabs
+            .tab_ids()
+            .into_iter()
+            .flat_map(|tab| state.tabs.pane_ids(tab))
+            .collect();
+        crate::mcp_host::note_window_view(state.id, state.tabs.tab_count(), &panes);
+    }
+
+    pub fn new(config: &config::Config) -> anyhow::Result<Self> {
+        // The config's own fallback list comes first: someone who named a font
+        // meant it, and the built-in list is only what to try after.
+        let fallbacks: Vec<String> = config
+            .list_of("font_fallback")
+            .ok()
+            .flatten()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| match value {
+                        unterm_engine::next_core::config::Value::Str(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let cursor_style = crate::terminal::CursorStyle::from_config(config);
+        let text_blink = crate::terminal::text_blink_rates(config);
+        let family: Option<String> = config
+            .str_of("font_family")
+            .ok()
+            .flatten()
+            // Accept an early next-core development spelling without making
+            // migrated 0.57 configs silently fall back to the bundled face.
+            .or_else(|| config.str_of("font").ok().flatten())
+            .map(str::to_string);
+        let shape = crate::terminal::Shape::from_config(config);
+        let settings = unterm_services::settings::Settings::from_config(config);
+        // 12px either side and 8 above and below, in logical pixels: text
+        // that starts 6px from the frame reads cramped next to Windows
+        // Terminal's 8 and Rio's 10. A configured value still wins.
+        let padding = |key: &str| {
+            let default = if key.ends_with("left") || key.ends_with("right") {
+                12.0
+            } else {
+                8.0
+            };
+            config
+                .float_of(key)
+                .ok()
+                .flatten()
+                .unwrap_or(default)
+                .max(0.0) as f32
+        };
+        let pixel_size = config
+            .float_of("font_size")
+            .ok()
+            .flatten()
+            .unwrap_or(13.0)
+            .max(6.0);
+
+        let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel();
+        let picture = crate::background::configured(config);
+        crate::startup_trace::mark("app.background.loaded");
+        let font = TerminalFont::open_named(
+            family.as_deref(),
+            crate::terminal::pixels_for_points(pixel_size as f32, 1.0),
+            &fallbacks,
+            shape,
+        )?;
+        crate::startup_trace::mark("app.terminal_font.opened");
+        let chrome_font = crate::chrome_font::open(&fallbacks, 1.0)?;
+        crate::startup_trace::mark("app.chrome_font.opened");
+        let shell = shell_from(config);
+        crate::startup_trace::mark("app.shell.selected");
+
+        Ok(Self {
+            engine: crate::engine_backend::AppEngine::from_environment(),
+            wake_watch: unterm_services::wake_watch::WakeWatch::new(),
+            last_session_written: None,
+            last_session_checked: std::time::Instant::now(),
+            charselect_group: Default::default(),
+            start_directory: None,
+            explicit_launch: false,
+            restore: None,
+            clipboard_tx,
+            clipboard_rx,
+            scrollbar_enabled: config
+                .bool_of("enable_scroll_bar")
+                .ok()
+                .flatten()
+                .unwrap_or(true),
+            status_bar_enabled: config
+                .bool_of("status_bar")
+                .ok()
+                .flatten()
+                .unwrap_or(false),
+            link_rules: crate::links::Rules::from_config(config),
+            audible_bell: config
+                .str_of("audible_bell")
+                .ok()
+                .flatten()
+                .map(|value| !value.eq_ignore_ascii_case("disabled"))
+                .unwrap_or(true),
+            visual_bell: crate::terminal::VisualBell::from_config(config),
+            config_default_cwd: config
+                .str_of("default_cwd")
+                .ok()
+                .flatten()
+                .map(std::path::PathBuf::from),
+            // `[window] close_confirmation` is the documented key, and the
+            // one the unterm.lua conversion writes; the top-level spelling is
+            // what this read alone, so both are honoured.
+            close_prompts: ["window.close_confirmation", "window_close_confirmation"]
+                .iter()
+                .find_map(|key| config.str_of(key).ok().flatten())
+                .map(|value| !value.eq_ignore_ascii_case("neverprompt"))
+                .unwrap_or(true),
+            // Asked for, not assumed: the composition path has only been run
+            // where Windows offers no Mica, so it stays opt-in until it has
+            // been seen on a Windows 11 desktop.
+            backdrop: matches!(
+                config
+                    .str_of("window.backdrop")
+                    .ok()
+                    .flatten()
+                    .map(|value| value.to_ascii_lowercase()),
+                Some(ref value) if value == "mica" || value == "on" || value == "true"
+            ),
+            system_decorations: config
+                .bool_of("window.decorations")
+                .ok()
+                .flatten()
+                .unwrap_or(false),
+            cursor_style: cursor_style.0,
+            cursor_blink_ms: cursor_style.1,
+            text_blink_ms: text_blink.0,
+            text_blink_rapid_ms: text_blink.1,
+            started: std::time::Instant::now(),
+            theme_id: crate::theme::remembered(),
+            colors_reported: None,
+            cell_size_reported: None,
+            theme_request_seen: 0,
+            theme_file_mtime: crate::theme::remembered_mtime(),
+            theme_file_checked_at: std::time::Instant::now(),
+            font_family: family,
+            initial_cols: settings.initial_cols,
+            initial_rows: settings.initial_rows,
+            terminal_padding: [
+                padding("window.padding_left"),
+                padding("window.padding_right"),
+                padding("window.padding_top"),
+                padding("window.padding_bottom"),
+            ],
+            inactive_pane_hsb: [
+                config
+                    .float_of("inactive_pane.hue")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1.0)
+                    .max(0.0) as f32,
+                config
+                    .float_of("inactive_pane.saturation")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1.0)
+                    .max(0.0) as f32,
+                config
+                    .float_of("inactive_pane.brightness")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1.0)
+                    .max(0.0) as f32,
+            ],
+            configured_font_points: pixel_size as f32,
+            font_fallbacks: fallbacks,
+            chrome_overrides: ChromeOverrides::from_config(config),
+            shell,
+            core_replaced_at: None,
+            cockpit_fed_at: std::time::Instant::now(),
+            seen_session_epoch: 0,
+            gpu: None,
+            config: config.clone(),
+            configured_pixel_size: pixel_size,
+            parked: Vec::new(),
+            capture_started_at: None,
+            window: WindowState::fresh(
+                unterm_engine::reserve_window_id(),
+                config,
+                pixel_size,
+                shape,
+                font,
+                chrome_font,
+                picture,
+            ),
+        })
+    }
+
+    fn start(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<Live> {
+        crate::startup_trace::mark("window.start");
+        let metrics = self.window.font.metrics();
+        let initial_width = metrics.width * self.initial_cols as f32
+            + crate::sidebar::adaptive_default_width(1) * self.chrome_pt()
+            + self.terminal_padding_left()
+            + self.terminal_padding_right();
+        let initial_height = self.top_bar_height()
+            + self.terminal_padding_top()
+            + metrics.height * self.initial_rows as f32
+            + self.status_bar_height()
+            + self.terminal_padding_bottom();
+        // The taskbar and Alt-Tab read this at runtime; Explorer reads the
+        // resource the build script embeds. Both, so the logo is there
+        // whichever way Windows asks for it.
+        let window_icon = {
+            const LOGO: &[u8] = include_bytes!("../../assets/icon/unterm-icon-256.png");
+            image::load_from_memory(LOGO)
+                .ok()
+                .map(|logo| logo.to_rgba8())
+                .and_then(|logo| {
+                    let (width, height) = logo.dimensions();
+                    winit::window::Icon::from_rgba(logo.into_raw(), width, height).ok()
+                })
+        };
+        let mut attributes = Window::default_attributes()
+            .with_title(unterm_protocol::product_name())
+            .with_window_icon(window_icon)
+            // The top bar is the title bar. A grey native one above a dark
+            // one is the three-stacked-strips look the design called out.
+            // The custom chrome is the default; `window.decorations = true`
+            // asks for the system's frame back and is finally listened to.
+            .with_decorations(self.system_decorations)
+            .with_inner_size(winit::dpi::LogicalSize::new(initial_width, initial_height));
+        // On macOS the custom chrome keeps the native frame: an invisible
+        // title bar over our own bar, so the traffic lights, the shadow and
+        // the rounded corners are the system's -- the way 0.57.4 integrated,
+        // and the difference between looking like a Mac app and a transplant.
+        #[cfg(target_os = "macos")]
+        if !self.system_decorations {
+            use winit::platform::macos::WindowAttributesExtMacOS as _;
+            attributes = attributes
+                .with_decorations(true)
+                .with_titlebar_transparent(true)
+                .with_fullsize_content_view(true)
+                .with_title_hidden(true);
+        }
+        if let Some(saved) = &self.restore {
+            attributes = attributes
+                .with_inner_size(winit::dpi::PhysicalSize::new(saved.width, saved.height));
+            if saved.maximized {
+                if let Some((left, top, width, height)) = unterm_services::work_area() {
+                    let restore_w = if saved.width > 0 && saved.width < width {
+                        saved.width
+                    } else {
+                        (width * 4 / 5).max(640)
+                    };
+                    let restore_h = if saved.height > 0 && saved.height < height {
+                        saved.height
+                    } else {
+                        (height * 4 / 5).max(400)
+                    };
+                    let restore_x = left + (width.saturating_sub(restore_w) / 2) as i32;
+                    let restore_y = top + (height.saturating_sub(restore_h) / 2) as i32;
+                    self.window.unmaximized_rect = Some((
+                        winit::dpi::PhysicalPosition::new(restore_x, restore_y),
+                        winit::dpi::PhysicalSize::new(restore_w, restore_h),
+                    ));
+                    attributes = attributes
+                        .with_position(winit::dpi::PhysicalPosition::new(left, top))
+                        .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
+                }
+            }
+        }
+        // The OS shows a window as soon as it exists. Keep the frame hidden
+        // until there is a pane to render, otherwise cold starts show a blank
+        // terminal while Core/GPU/session setup finishes.
+        let window = Arc::new(event_loop.create_window(attributes.with_visible(false))?);
+        crate::startup_trace::mark("window.created");
+        crate::win_chrome::set_startup_cloak(&window, true);
+        let want_maximized = self.restore.as_ref().map(|saved| saved.maximized) == Some(true);
+        if !want_maximized {
+            fit_to_monitor(&window);
+        }
+        if !self.system_decorations {
+            // Ask Windows 11 for what it draws itself: the rounded corners,
+            // a frame that knows it is dark, an edge in our colours, and the
+            // Snap Layouts flyout over the maximise button we draw.
+            crate::win_chrome::round_corners(&window);
+            crate::win_chrome::install_caption(&window);
+        }
+        // A new window, even one built for a parked state: nothing has been
+        // said to the compositor about this handle yet.
+        self.window.frame_sent = None;
+        #[cfg(windows)]
+        {
+            window.set_visible(true);
+            if want_maximized && (self.system_decorations || self.window.unmaximized_rect.is_none()) {
+                window.set_maximized(true);
+            }
+        }
+        #[cfg(not(windows))]
+        if want_maximized {
+            window.set_maximized(true);
+        }
+        // The window knows the display's scale; the font was opened before it
+        // existed, at 1.0. On a scaled panel every glyph until now was drawn
+        // at a fraction of its size.
+        let scale = window.scale_factor() as f32;
+        if (scale - self.window.scale).abs() > f32::EPSILON {
+            self.reopen_font(self.window.font_points, scale);
+        }
+        // So `instance.focus`, which arrives on the MCP thread, has a window
+        // to raise.
+        crate::mcp_host::remember_window(self.window.id, window.clone());
+        // And now that there is a window to answer with, offer it to the
+        // Core as the front end it can call back into. Ordered after
+        // `remember_window` because the first thing the Core asks for is
+        // this window's identity.
+        crate::engine_backend::attach_host_channel();
+        crate::startup_trace::mark("host_channel.attached");
+        // Without this the system never starts an input method, and a Chinese
+        // or Japanese keyboard can only produce Latin letters.
+        window.set_ime_allowed(true);
+
+        let size = window.inner_size();
+        // A window that has not been mapped yet reports 0x0. Every fallback
+        // between here and the grid floors at one cell, so believing that
+        // number hands the first pane a one-column terminal -- and for a pane
+        // that already holds output, one column is not a narrow view of it,
+        // it is the loss of it. Stand in the same default `window_width`
+        // uses until the first real `Resized` says otherwise.
+        let sized = is_drawable_size(size.width, size.height);
+        let (window_width, window_height) = if sized {
+            (size.width as f32, size.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
+        // The terminal's own area, not the whole window: the strip on the
+        // left and the padding either side are not columns the shell may
+        // write into. Sizing the first pane from the raw window meant every
+        // TUI launched at startup drew past the right edge until something
+        // resized the window.
+        let (cols, rows) = self.window.font.grid_for(
+            self.terminal_width_for(window_width),
+            self.terminal_height_for(window_height),
+        );
+        // A Core that outlived the previous window still holds its
+        // sessions; a window that opened onto a populated Core must
+        // show those, not stack a fresh shell on top of them. In Local
+        // mode the engine was born with this process and the list is
+        // empty, so this is the create path it always was.
+        //
+        // Unless this window was asked for something specific: `start
+        // --cwd` (Finder's "New Unterm Window Here", the in-app New
+        // Window command) or an explicit program. Adopting the focused
+        // old session then means a window at the wrong directory — the
+        // ask names a fresh shell, not a view of what was already there.
+        let adopted = if self.explicit_launch {
+            None
+        } else {
+            unterm_engine::SessionEngine::list_sessions(&self.engine)
+                .ok()
+                .and_then(|sessions| {
+                    let live: Vec<_> = sessions
+                        .into_iter()
+                        .filter(|session| !session.is_dead)
+                        .collect();
+                    let focused = live.iter().find(|session| session.is_active).cloned();
+                    let chosen = focused.or_else(|| live.first().cloned())?;
+                    // Adopt the pane the arrangement hangs from, not the one
+                    // that happens to be focused. `sync_tabs` rebuilds a split
+                    // onto a pane already in a tab, and the focused pane after
+                    // a split is the *new* one -- adopt that and its source has
+                    // nothing to attach to, so a two-pane split comes back as
+                    // two tabs. Focus is restored separately.
+                    Some(split_lineage_root(&live, chosen))
+                })
+        };
+        crate::startup_trace::mark(if adopted.is_some() {
+            "session.adopted"
+        } else {
+            "session.create_planned"
+        });
+        let mut startup_request = adopted.is_none().then(|| {
+            let env = launch_env_for_new_pane();
+            CreateSessionRequest {
+                cols,
+                rows,
+                command_dir: self
+                    .start_directory
+                    .clone()
+                    .or_else(|| {
+                        self.restore
+                            .as_ref()
+                            .and_then(|saved| saved.cwds.first())
+                            .map(std::path::PathBuf::from)
+                    })
+                    .or_else(|| self.config_default_cwd.clone())
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                command: prepare_shell(self.shell.clone()),
+                env,
+                launch_policy: LaunchPolicySnapshot::default(),
+            }
+        });
+        // Core session creation is IPC plus a shell spawn. Start it while the
+        // GPU path is still coming up so a cold window is not serially paying
+        // for both. Local mode stays synchronous because it owns the engine in
+        // this process.
+        let pending_core_session = match (&self.engine, startup_request.take()) {
+            (
+                crate::engine_backend::AppEngine::Core { client, .. },
+                Some(request),
+            ) => {
+                let client = client.clone();
+                crate::startup_trace::mark("session.create_thread_spawned");
+                Some(std::thread::spawn(move || {
+                    unterm_engine::SessionEngine::create_session(client.as_ref(), request)
+                }))
+            }
+            (_, request) => {
+                startup_request = request;
+                None
+            }
+        };
+
+        // A second window does not go looking for a GPU. The first one
+        // already found it, and finding it is the 250 ms.
+        let Graphics {
+            surface,
+            device,
+            queue,
+            format,
+            shared,
+        } = match self.gpu.clone() {
+            Some(shared) => surface_on(shared, window.clone(), size.width, size.height)?,
+            None => request_graphics(window.clone(), size.width, size.height)?,
+        };
+        self.gpu = Some(shared.clone());
+        crate::startup_trace::mark("graphics.ready");
+
+        let renderer = Renderer::new(device, queue, format);
+        let atlas_texture = renderer.upload_atlas(&self.window.atlas);
+        crate::startup_trace::mark("renderer.ready");
+        let atlas_uploaded_glyphs = self.window.atlas.len();
+
+        let session = match adopted {
+            Some(existing) => {
+                // This window's grid decides the size, not the one the
+                // previous window left behind -- but only once this window
+                // has a size of its own. An adopted session arrives with
+                // output already on it, and resizing it to a guess would
+                // truncate that output rather than reflow it. The first real
+                // `Resized` is a frame away and knows the answer.
+                if sized {
+                    let _ = self.engine.resize_session(existing.id, cols, rows);
+                }
+                Some(existing)
+            }
+            None if pending_core_session.is_some() => {
+                self.window.startup_session = pending_core_session;
+                None
+            }
+            None => Some(self.engine.create_session(
+                startup_request.expect("new startup session request is present"),
+            )?),
+        };
+        if session.is_some() {
+            crate::startup_trace::mark("session.ready");
+        } else {
+            crate::startup_trace::mark("session.pending");
+        }
+
+        // The first pane is a tab of one. Recording it here means a later split
+        // has an arrangement to grow rather than one to infer.
+        if let Some(session) = &session {
+            self.window.tab_id = self.window.tabs.create_tab(session.id).ok();
+        }
+
+        // Uploaded once: a photograph re-read every frame is a photograph read
+        // sixty times a second.
+        let picture = self.window.picture.as_ref();
+        let background =
+            picture.map(|image| renderer.upload_image(image.width, image.height, &image.rgba));
+        crate::startup_trace::mark("background.ready");
+        let live = Live {
+            window,
+            surface,
+            renderer,
+            atlas_texture,
+            atlas_uploaded_glyphs,
+            background,
+            background_size: picture.map(|image| (image.width, image.height)),
+            background_opacity: picture.map(|image| image.opacity).unwrap_or(0.0),
+            session_id: session.as_ref().map(|session| session.id).unwrap_or(0),
+            width: (window_width as u32).max(1),
+            height: (window_height as u32).max(1),
+            composition: None,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            mica: false,
+        };
+        let mut live = live;
+        live.configure(format);
+        if self.backdrop && !self.system_decorations && self.window.picture.is_none() {
+            if let Some(shared) = self.gpu.clone() {
+                attach_backdrop(&mut live, &shared, format);
+            }
+        }
+        crate::startup_trace::mark("live.configured");
+        #[cfg(not(windows))]
+        live.window.set_visible(true);
+        crate::startup_trace::mark("window.visible");
+        Ok(live)
+    }
+
+    fn draw(&mut self) {
+        if self.window.state.is_none() {
+            return;
+        }
+        let _slow = SlowGuard::new("draw");
+        // An occluded window gets no drawables: every acquire blocks its
+        // full timeout, and a loop of those reads as the whole terminal
+        // frozen (2026-08-09, thirty-second "stalls" at 70% CPU). Nothing
+        // needs painting where nothing is shown.
+        if self.window.occluded {
+            return;
+        }
+        let placements = self.placements();
+        let dividers = self.divider_quads();
+        let Some(window_width) = self.window.state.as_ref().map(|live| live.width as f32) else {
+            return;
+        };
+        // The tab registry is the source of truth for split focus.  Using the
+        // session that happened to create the window leaves the solid cursor,
+        // scrollbar and keyboard focus behind when another pane is clicked.
+        let session_id = self.focused_session();
+        self.engine.set_primary_pane(session_id);
+        // The very number `needs_redraw` compares, read before any screen
+        // is fetched so an update landing mid-draw still earns its frame.
+        // This used to record a sum of per-pane snapshot revisions instead
+        // — a different counter than the one compared, never equal in Core
+        // mode — and every idle tick redrew the whole window forever: the
+        // chronic 90%-CPU "GUI 卡" was this one line of double bookkeeping.
+        let generation = {
+            let panes: Vec<usize> = if placements.is_empty() {
+                if session_id == 0 {
+                    Vec::new()
+                } else {
+                    vec![session_id]
+                }
+            } else {
+                placements
+                    .iter()
+                    .map(|placement| placement.session_id)
+                    .collect()
+            };
+            if panes.is_empty() {
+                0
+            } else {
+                self.engine.render_generation(&panes)
+            }
+        };
+
+        let mut quads = unterm_render::quads::FrameQuads::default();
+        // The picture, under everything, filling the window with the middle of
+        // itself. Its alpha is how much shows through -- text has to win.
+        let picture = self.window.state.as_ref().and_then(|live| {
+            live.background_size
+                .map(|size| (size, live.background_opacity, live.width, live.height))
+        });
+        if let Some(((image_width, image_height), opacity, width, height)) = picture {
+            let window = (width as f32, height as f32);
+            let uv = crate::background::cover((image_width, image_height), window);
+            quads.image = Some(unterm_render::quads::GlyphQuad {
+                quad: unterm_render::quads::Quad {
+                    left: 0.0,
+                    top: 0.0,
+                    width: window.0,
+                    height: window.1,
+                    color: [1.0, 1.0, 1.0, opacity],
+                },
+                tex_left: uv[0],
+                tex_top: uv[1],
+                tex_right: uv[2],
+                tex_bottom: uv[3],
+            });
+        }
+        let cursor = self.cursor_style;
+        let solid_cursor = self.cursor_is_solid();
+        let blink = self.blink_phase();
+        let mut screen_blink = (false, false);
+        let mut terminal_has_content = false;
+        for placement in &placements {
+            let Ok(snapshot) = self.engine.read_styled_screen(placement.session_id) else {
+                continue;
+            };
+            // The screen can be bigger than the space it is drawn in for a
+            // moment -- a shrink waits to be sure before it reaches the pane --
+            // and nothing below stops at the pane's edge on its own. Unclipped,
+            // those rows land on the status bar and those columns on the pane
+            // beside it.
+            let snapshot = crate::terminal::clip_to_grid(&snapshot, placement.cols, placement.rows)
+                .unwrap_or(snapshot);
+            let background_start = quads.backgrounds.len();
+            let glyph_start = quads.glyphs.len();
+            let image_start = quads.inline_images.len();
+            if placement.session_id == session_id {
+                self.window.mouse_modes = snapshot.mouse;
+                self.note_bells(snapshot.bells);
+                self.take_clipboard_request(snapshot.clipboard_request.clone());
+            }
+            let blinking = crate::terminal::blinking_cells(&snapshot);
+            screen_blink = (screen_blink.0 || blinking.0, screen_blink.1 || blinking.1);
+            terminal_has_content |= styled_snapshot_has_text(&snapshot);
+            crate::terminal::append_pane(
+                &snapshot,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                self.window.colors,
+                placement.origin,
+                placement.session_id == session_id && solid_cursor,
+                cursor,
+                blink,
+                &mut quads,
+            );
+            for image in &mut quads.inline_images[image_start..] {
+                image.pane = placement.session_id;
+            }
+            if placement.session_id != session_id {
+                dim_pane_quads(
+                    &mut quads,
+                    background_start,
+                    glyph_start,
+                    self.inactive_pane_hsb[0],
+                    self.inactive_pane_hsb[1],
+                    self.inactive_pane_hsb[2],
+                );
+                // A picture is dimmed with its pane: the shader multiplies it
+                // by its quad's colour, so white dimmed is the dimming.
+                let tint = transform_hsv(
+                    [1.0, 1.0, 1.0, 1.0],
+                    self.inactive_pane_hsb[0],
+                    self.inactive_pane_hsb[1],
+                    self.inactive_pane_hsb[2],
+                );
+                for image in &mut quads.inline_images[image_start..] {
+                    image.glyph.quad.color = tint;
+                }
+            } else if placements.len() > 1 {
+                // Zero-height split-pane focus indicator: a crisp 2pt accent
+                // top line with a subtle 4pt ambient glow on the focused pane.
+                let metrics = self.window.font.metrics();
+                let pt = self.chrome_pt();
+                let chrome = self.chrome();
+                let grid_right = placement.origin.0 + placement.cols as f32 * metrics.width;
+                let max_grid_right = placements
+                    .iter()
+                    .map(|p| p.origin.0 + p.cols as f32 * metrics.width)
+                    .fold(0.0_f32, f32::max);
+                let pane_right = if (grid_right - max_grid_right).abs() <= 0.5 {
+                    self.terminal_left() + self.terminal_width()
+                } else {
+                    grid_right
+                };
+                let pane_width = (pane_right - placement.origin.0).max(0.0);
+                let bar_h = (2.0 * pt).round().max(2.0);
+                let glow_h = (4.0 * pt).round().max(2.0);
+                let mut glow = chrome.focus_rail;
+                glow[3] = 0.14;
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: placement.origin.0,
+                    top: placement.origin.1,
+                    width: pane_width,
+                    height: bar_h,
+                    color: chrome.focus_rail,
+                });
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: placement.origin.0,
+                    top: placement.origin.1 + bar_h,
+                    width: pane_width,
+                    height: glow_h,
+                    color: glow,
+                });
+            }
+        }
+        if placements.is_empty() {
+            if session_id != 0 {
+                let Ok(snapshot) = self.engine.read_styled_screen(session_id) else {
+                    return;
+                };
+                self.window.mouse_modes = snapshot.mouse;
+                self.note_bells(snapshot.bells);
+                self.take_clipboard_request(snapshot.clipboard_request.clone());
+                // Below the top bar, like every other pane. Drawn at the window's
+                // own origin it lands on the bar, which is what the first frame
+                // with a bar in it looked like.
+                let origin = (self.terminal_left(), self.terminal_top());
+                screen_blink = crate::terminal::blinking_cells(&snapshot);
+                terminal_has_content = styled_snapshot_has_text(&snapshot);
+                let image_start = quads.inline_images.len();
+                crate::terminal::append_pane(
+                    &snapshot,
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    self.window.colors,
+                    origin,
+                    solid_cursor,
+                    cursor,
+                    blink,
+                    &mut quads,
+                );
+                for image in &mut quads.inline_images[image_start..] {
+                    image.pane = session_id;
+                }
+            }
+        }
+        self.append_selection(&mut quads);
+        quads.backgrounds.extend(dividers);
+        self.append_scrollbar(&mut quads);
+        self.append_bell_flash(&mut quads);
+        self.append_hovered_link(&mut quads);
+        self.append_ghost_text(&mut quads);
+        self.append_preedit(&mut quads);
+        self.append_search_matches(&mut quads);
+        self.append_search_bar(window_width, &mut quads);
+        self.append_copy_mode(&mut quads);
+        self.append_quick_select(&mut quads);
+        self.append_pane_select(&mut quads);
+        // Everything from here up is a panel, and a panel has to cover what
+        // is behind it rather than sit in the same layer as it.
+        let overlays = quads.mark();
+        self.append_inbox(window_width, &mut quads);
+        self.append_git_panel(window_width, &mut quads);
+        self.append_composer(window_width, &mut quads);
+        self.append_suggestion(window_width, &mut quads);
+        self.append_top_bar(window_width, &mut quads);
+        self.append_sidebar(&mut quads);
+        self.append_tree(&mut quads);
+        self.append_status_bar(window_width, &mut quads);
+        // Over the status row it replaces, and inside the raised chrome
+        // group: appended after the raise it would sit beneath the bar it is
+        // supposed to cover, which is an invisible question.
+        self.append_confirmation_banner(window_width, &mut quads);
+        self.append_core_lost_banner(window_width, &mut quads);
+        self.append_pane_close_buttons(&mut quads);
+        self.append_pane_error_pills(&mut quads);
+        quads.raise_since(overlays);
+        // The true modals, above the docks as well: a tier is
+        // backgrounds-then-glyphs, so a palette in the overlay tier had the
+        // file tree's text bleeding through its card.
+        let modals = quads.mark();
+        self.append_palette(window_width, &mut quads);
+        self.append_tooltip(window_width, &mut quads);
+        self.append_rail_tooltip(&mut quads);
+        self.append_sidebar_peek(&mut quads);
+        self.append_quick_menu(&mut quads);
+        self.append_pocket_qr(window_width, &mut quads);
+        quads.raise_since_modal(modals);
+
+        // Where the terminal's opaque ground starts, for a frame behind Mica:
+        // right of the sidebar and below the top bar.
+        let mica_terminal = {
+            let metrics = self.window.font.metrics();
+            (self.dock_width(metrics), self.top_bar_height())
+        };
+        let Some(live) = self.window.state.as_mut() else {
+            return;
+        };
+        // The atlas may have grown while building this frame's glyphs, so
+        // upload after them. An unchanged atlas stays on the device: cursor
+        // blinking must not upload a megabyte of identical coverage.
+        if live.atlas_uploaded_glyphs != self.window.atlas.len() {
+            live.atlas_texture = live.renderer.upload_atlas(&self.window.atlas);
+            live.atlas_uploaded_glyphs = self.window.atlas.len();
+        }
+
+        let acquire_started = std::time::Instant::now();
+        let frame = match live.surface.get_current_texture() {
+            Ok(frame) => frame,
+            // A timeout means the compositor is not taking frames — an
+            // occluded or closing window. The acquire already blocked for
+            // a second; reconfiguring and asking again blocks a second
+            // more, every frame, which is the "clicking close froze the
+            // terminal" hang. The frame is skipped, full stop.
+            Err(wgpu::SurfaceError::Timeout) => {
+                crate::stallwatch::note_if_slow(
+                    "swapchain acquire (timed out)",
+                    acquire_started,
+                    0,
+                );
+                return;
+            }
+            // A lost or outdated swapchain (resize race, display sleep,
+            // driver reset) heals with one reconfigure. A second failure is
+            // this frame given up, not the process.
+            Err(error) => {
+                log::debug!("swapchain frame unavailable ({error}); reconfiguring");
+                live.configure(live.renderer.format());
+                match live.surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        log::warn!("swapchain unavailable after reconfigure: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        // Behind Mica the frame is cleared to nothing and the terminal gets
+        // its background as a quad of its own: the one surface that stays
+        // opaque, because text reads best on a solid ground.
+        let clear = if live.mica {
+            quads.backgrounds.insert(
+                0,
+                unterm_render::quads::Quad {
+                    left: mica_terminal.0,
+                    top: mica_terminal.1,
+                    width: (live.width as f32 - mica_terminal.0).max(0.0),
+                    height: (live.height as f32 - mica_terminal.1).max(0.0),
+                    color: self.window.colors.background,
+                },
+            );
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            self.window.colors.background
+        };
+        upload_inline_images(&self.engine, &live.renderer, &quads);
+        live.renderer.draw(
+            &view,
+            live.width,
+            live.height,
+            &quads,
+            &live.atlas_texture,
+            live.background.as_ref(),
+            clear,
+        );
+        frame.present();
+        if !self.window.startup_first_frame_marked {
+            self.window.startup_first_frame_marked = true;
+            crate::win_chrome::set_startup_cloak(&live.window, false);
+            crate::startup_trace::mark("first_frame.presented");
+        }
+        if terminal_has_content && !self.window.startup_terminal_content_marked {
+            self.window.startup_terminal_content_marked = true;
+            crate::startup_trace::mark("terminal_content.presented");
+        }
+        self.window.drawn_revision = Some(generation);
+        self.window.presented_at = Some(std::time::Instant::now());
+        self.window.redraw_requested_at = None;
+        self.window.pending_input_redraw_at = None;
+        self.window.drawn_cursor_solid = Some(solid_cursor);
+        self.window.drawn_blink = Some(blink);
+        self.window.screen_blink = screen_blink;
+        self.window.drawn_confirmation = unterm_mcp::handler::pending_confirmation_view().map(|v| v.id);
+        self.window.drawn_suggestions =
+            crate::engine_backend::mcp_state::pending_suggestions_for_pane(self.focused_session() as u64).len();
+    }
+
+    /// Offer a mouse event to the program. True when it took it.
+    ///
+    /// The front end asks before acting on a click of its own: with reporting
+    /// on, a drag that also selected text would give the user a selection they
+    /// did not ask for on top of a click that did work.
+    fn report_mouse(
+        &mut self,
+        kind: unterm_engine::next_core::mouse_encoding::MouseEventKind,
+        button: Option<unterm_engine::next_core::mouse_encoding::MouseButton>,
+    ) -> bool {
+        let Some(live) = self.window.state.as_ref() else {
+            return false;
+        };
+        let metrics = self.window.font.metrics();
+        let left = self.terminal_left();
+        let top = self.terminal_top();
+        let column = ((self.window.pointer.0 - left).max(0.0) / metrics.width.max(1.0)) as usize;
+        let row = ((self.window.pointer.1 - top).max(0.0) / metrics.height.max(1.0)) as usize;
+
+        let held = crate::mouse::Held {
+            shift: self.window.shift_held,
+            ctrl: self.window.ctrl_held,
+            alt: self.window.alt_held,
+        };
+        match crate::mouse::route(self.window.mouse_modes, kind, button, column, row, held) {
+            crate::mouse::Route::ToProgram(event) => {
+                let _ = self.engine.report_mouse(live.session_id, event);
+                true
+            }
+            crate::mouse::Route::ToTerminal => false,
+        }
+    }
+
+    /// Start a flash if the pane has rung since the last frame.
+    fn note_bells(&mut self, bells: u64) {
+        if bells > self.window.bells_seen {
+            self.window.bells_seen = bells;
+            // A flash that would never show must not start: `bell_at` is also
+            // what keeps the window asking for frames until the fade is over.
+            if !self.visual_bell.disabled() {
+                self.window.bell_at = Some(std::time::Instant::now());
+            }
+            // The bell is audible again, as `audible_bell` always promised;
+            // the flash alone left a background beep silent.
+            if self.audible_bell {
+                unterm_services::system_beep();
+            }
+        }
+    }
+
+    /// Whether the pointer is over the scrollbar's track.
+    /// Whether the pointer is on the status bar's quick-action button.
+    fn pointer_on_scrollbar(&self) -> bool {
+        if !self.scrollbar_enabled {
+            return false;
+        }
+        self.active_pane_scrollbar()
+            .is_some_and(|(_, left, top, track)| {
+                self.window.pointer.0 >= left
+                    && self.window.pointer.0 < left + crate::scrollbar::WIDTH
+                    && self.window.pointer.1 >= top
+                    && self.window.pointer.1 < top + track
+            })
+    }
+
+    /// Scroll to wherever the pointer is on the track.
+    fn scroll_to_pointer(&mut self) {
+        let Some((session_id, _left, track_top, track)) = self.active_pane_scrollbar() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(session_id) else {
+            return;
+        };
+        let total = snapshot.scrollback_rows + snapshot.rows;
+        let row = crate::scrollbar::row_at(total, snapshot.rows, self.window.pointer.1 - track_top, track);
+        let _ = self.engine.scroll_viewport_to(session_id, row as isize);
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    /// The active pane's scrollbar track.  0.57.4 anchored the bar to the
+    /// focused PositionedPane's right edge; a window-global right edge makes
+    /// the bar apparently vanish as soon as the left pane has focus.
+    fn active_pane_scrollbar(&self) -> Option<(usize, f32, f32, f32)> {
+        let session_id = self.focused_session();
+        let placements = self.placements();
+        let placement = placements
+            .iter()
+            .find(|placement| placement.session_id == session_id)?;
+        let metrics = self.window.font.metrics();
+        let grid_right = placement.origin.0 + placement.cols as f32 * metrics.width;
+        let rightmost = placements
+            .iter()
+            .all(|other| other.origin.0 + other.cols as f32 * metrics.width <= grid_right + 0.5);
+        let pane_right = if rightmost {
+            self.terminal_left() + self.terminal_width()
+        } else {
+            grid_right
+        };
+        Some((
+            session_id,
+            pane_right - crate::scrollbar::WIDTH,
+            placement.origin.1,
+            (placement.rows as f32 * metrics.height).max(1.0),
+        ))
+    }
+
+    /// The scrollbar, down the right edge.
+    ///
+    /// Only when there is history above: a bar that fills its whole track
+    /// tells the user nothing and takes a column to say it.
+
+    /// The bar along the bottom: where you are, and what agents are doing.
+    /// Run the bar's search in whichever mode it is in.
+    ///
+    /// Literal modes go to the kernel, which owns the scrollback. Regex is
+    /// matched here over the same lines: the kernel's dependency budget has
+    /// no room for a regex engine, and the bar should not care where the
+    /// matching happened.
+    fn run_search(
+        &self,
+        session_id: usize,
+        pattern: &str,
+        mode: crate::search::Mode,
+    ) -> Vec<unterm_engine::ScreenSearchMatch> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        match mode {
+            crate::search::Mode::CaseSensitive => self
+                .engine
+                .search(
+                    session_id,
+                    pattern,
+                    unterm_engine::SearchMode::CaseSensitive,
+                    MAX_SEARCH_MATCHES,
+                )
+                .unwrap_or_default(),
+            crate::search::Mode::CaseInsensitive => self
+                .engine
+                .search(
+                    session_id,
+                    pattern,
+                    unterm_engine::SearchMode::CaseInsensitive,
+                    MAX_SEARCH_MATCHES,
+                )
+                .unwrap_or_default(),
+            crate::search::Mode::Regex => {
+                let Ok(snapshot) = self.engine.read_scrollback_text(
+                    session_id,
+                    unterm_engine::ScrollbackTextRequest {
+                        start_line: None,
+                        end_line: None,
+                        tail_lines: None,
+                        escapes: false,
+                    },
+                ) else {
+                    return Vec::new();
+                };
+                unterm_services::search_regex::find_matches(
+                    &snapshot.lines,
+                    snapshot.first_row,
+                    pattern,
+                    MAX_SEARCH_MATCHES,
+                )
+            }
+        }
+    }
+
+    /// The parked-agent question, painted over the status row the way 0.57.4
+    /// painted it: the whole bar inverts, and one line asks and names its keys.
+    /// Say when the Core has gone, across the width of the window.
+    ///
+    /// The frames on screen were real a moment ago and still look it;
+    /// nothing about them says the shells behind them are gone. A
+    /// crash that leaves a window looking healthy is the crash getting
+    /// reported as normal, which is the one thing the gate forbids.
+    fn append_core_lost_banner(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        // Red while the shells are unreachable, amber for a while after
+        // they come back. The recovery is reported in the same strip as
+        // the loss because they are one event to the person watching:
+        // "it broke" without "it is fixed" reads as still broken.
+        const RECOVERY_NOTICE: std::time::Duration = std::time::Duration::from_secs(12);
+        let (key, color) = if !self.engine.sessions_reachable() {
+            ("core.lost", [0.62, 0.16, 0.12, 1.0])
+        } else if self
+            .core_replaced_at
+            .is_some_and(|at| at.elapsed() < RECOVERY_NOTICE)
+        {
+            ("core.replaced", [0.55, 0.38, 0.05, 1.0])
+        } else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let pt = self.chrome_pt();
+        let pad = (crate::ui_tokens::STATUS_BAR_VERTICAL_PADDING * pt)
+            .round()
+            .max(2.0);
+        let bar_height = (metrics.height + pad * 2.0).round().max(1.0);
+        let top = self.terminal_top();
+        // Starts where the terminal does. Run full-bleed and it lies
+        // across the dock, hiding the very tab list the message is
+        // telling the user has changed.
+        let left = self.dock_width(metrics);
+        let strip_width = (window_width - left).max(0.0);
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left,
+            top,
+            width: strip_width,
+            height: bar_height,
+            color,
+        });
+        let columns = (strip_width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+        let line = crate::sidebar::fit(
+            &unterm_services::i18n::t(key),
+            columns.saturating_sub(3),
+        );
+        let text_top = top
+            + ((bar_height - metrics.height) / 2.0
+                + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                .max(0.0);
+        let pen = left + (crate::ui_tokens::CHROME_PANEL_INSET * pt).round();
+        self.append_mono(&line, [1.0, 0.94, 0.92, 1.0], (pen, text_top), quads);
+    }
+
+    fn append_confirmation_banner(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let Some(view) = unterm_mcp::handler::pending_confirmation_view() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let height = self.window.state.as_ref().map(|live| live.height).unwrap_or(600) as f32;
+        // Its own strip, laid over the last row rather than taken out
+        // of the grid: a question that reflows the shell underneath it
+        // moves the cursor away from where the program left it, and
+        // every row after that is drawn a line off.
+        let pt = self.chrome_pt();
+        let pad = (crate::ui_tokens::STATUS_BAR_VERTICAL_PADDING * pt)
+            .round()
+            .max(2.0);
+        let bar_height = (metrics.height + pad * 2.0).round().max(1.0);
+        let top = height - bar_height - self.status_bar_height();
+        // Starts where the terminal does. Run full-bleed and it lies across
+        // the dock's own footer controls, leaving "new session" and settings
+        // sliced in half -- and the question belongs to the grid anyway, not
+        // to the strip listing the tabs.
+        let left = self.dock_width(metrics);
+        let strip_width = (window_width - left).max(0.0);
+        let columns = (strip_width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+        // Less the inset the pen starts at, or the last hint runs off the edge.
+        let line = crate::confirm::status_line(
+            &view.agent,
+            &view.method,
+            &view.input_preview,
+            columns.saturating_sub(3),
+        );
+
+        // Inverted, so the row cannot be mistaken for the facts it replaces.
+        let foreground = self.window.colors.foreground;
+        let background = self.window.colors.background;
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left,
+            top,
+            width: strip_width,
+            height: bar_height,
+            color: foreground,
+        });
+        let text_top = top
+            + ((bar_height - metrics.height) / 2.0
+                + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                .max(0.0);
+        let pen = left + (crate::ui_tokens::CHROME_PANEL_INSET * pt).round();
+        self.append_mono(&line, background, (pen, text_top), quads);
+    }
+
+    fn append_status_bar(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        // A parked agent write owns this row while it waits: drawing the
+        // facts under the question leaves both showing through the other.
+        if unterm_mcp::handler::pending_confirmation_count() > 0 {
+            return;
+        }
+        let metrics = self.window.font.metrics();
+        let height = self.window.state.as_ref().map(|live| live.height).unwrap_or(600) as f32;
+
+        if !self.status_bar_enabled {
+            // Persistent status bar is disabled. Render transient notices as a
+            // centered floating capsule Toast above the bottom edge of the terminal.
+            let Some(notice) = self.active_notice() else {
+                return;
+            };
+            let trimmed = notice.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let pt = self.chrome_pt();
+            let left = self.dock_width(metrics);
+            let strip_width = (window_width - left).max(0.0);
+            let max_cols = ((strip_width * 0.78) / metrics.width.max(1.0))
+                .floor()
+                .max(16.0) as usize;
+            let body = trimmed.trim_start_matches('\u{2713}').trim();
+            let clipped = crate::statusbar::middle(body, max_cols);
+            let display_text = format!("\u{2713}  {clipped}");
+            let text_w = self.chrome_width(&display_text);
+            let pad_x = (13.0 * pt).round();
+            let pill_h = (self.window.chrome_font.metrics().height + 10.0 * pt)
+                .round()
+                .max(24.0 * pt);
+            let pill_w = (text_w + pad_x * 2.0)
+                .round()
+                .min((strip_width - 24.0 * pt).max(48.0));
+            let pill_left = (left + (strip_width - pill_w) / 2.0).round();
+            let pill_top = (height - pill_h - 14.0 * pt).round().max(0.0);
+            let pill_r = pill_h / 2.0;
+            let chrome = self.chrome();
+
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                pill_left - 1.0,
+                pill_top - 1.0,
+                pill_w + 2.0,
+                pill_h + 2.0,
+                pill_r + 1.0,
+                chrome.toast_outline,
+            ));
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                pill_left,
+                pill_top,
+                pill_w,
+                pill_h,
+                pill_r,
+                chrome.toast_bg,
+            ));
+
+            let text_top = pill_top
+                + ((pill_h - self.window.chrome_font.metrics().height) / 2.0
+                    + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                    .max(0.0);
+            let text_left = pill_left + ((pill_w - text_w) / 2.0).max(pad_x * 0.5);
+            let pen = self.append_chrome("\u{2713}  ", chrome.status_ok, (text_left, text_top), quads);
+            self.append_chrome(&clipped, self.chrome_foreground(), (pen, text_top), quads);
+            return;
+        }
+
+        let bar_height = self.status_bar_height();
+        let top = height - bar_height;
+        let columns = (window_width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+
+        let status = self.status();
+        let segments = crate::statusbar::segments(&status, columns);
+        if segments.is_empty() {
+            return;
+        }
+
+        // The same surface as the top bar, so the window reads as one thing
+        // with two edges. Toning the foreground towards black instead is what
+        // left a black strip along the bottom of every light theme.
+        let chrome = self.chrome();
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: 0.0,
+            top,
+            width: window_width,
+            height: bar_height,
+            color: chrome.surface,
+        });
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: 0.0,
+            top,
+            width: window_width,
+            height: 1.0,
+            color: chrome.outer_edge,
+        });
+        let pt = self.chrome_pt();
+        let gap = self.mono_width(crate::statusbar::GAP);
+        // The segments are set in the terminal's own face, vertically centred
+        // with the slight upward nudge every one-line chrome row gets.
+        let text_top = top
+            + ((bar_height - metrics.height) / 2.0
+                + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                .max(0.0);
+        let teal = chrome.focus_rail;
+        let mut pen = (crate::ui_tokens::CHROME_PANEL_INSET * pt).round();
+        for segment in segments {
+            let color = if segment.dim {
+                chrome.dim_text
+            } else {
+                self.window.colors.foreground
+            };
+            // Whatever will not fit is not drawn: half a chip reads as a wrong
+            // value rather than as a missing one.
+            let wide = self.mono_width(&segment.text);
+            if pen + wide > window_width {
+                break;
+            }
+            match segment.teal_from {
+                // The whole segment is a value — the path — and reads teal.
+                Some(0) => {
+                    pen = self.append_mono(&segment.text, teal, (pen, text_top), quads);
+                }
+                // A chip: its label keeps the ordinary colour, and the answer
+                // after the colon takes the accent, as 0.57.4 drew it — or the
+                // close button's red for the moment a proxy probe has failed.
+                Some(at) if segment.text.is_char_boundary(at) => {
+                    let (label, value) = segment.text.split_at(at);
+                    let label = label.to_string();
+                    let value = value.to_string();
+                    let value_color = if segment.error {
+                        crate::window_buttons::CLOSE_HOVER
+                    } else {
+                        teal
+                    };
+                    pen = self.append_mono(&label, color, (pen, text_top), quads);
+                    pen = self.append_mono(&value, value_color, (pen, text_top), quads);
+                }
+                _ => {
+                    pen = self.append_mono(&segment.text, color, (pen, text_top), quads);
+                }
+            }
+            pen += gap;
+        }
+    }
+
+    /// Say what just happened, for a moment.
+    ///
+    /// 2400 milliseconds, as before: long enough to read on the way past,
+    /// short enough that it is gone before it becomes furniture.
+    fn show_notice(&mut self, message: String) {
+        const SHOWN_FOR: std::time::Duration = std::time::Duration::from_millis(2400);
+        self.window.notice = Some((message, std::time::Instant::now() + SHOWN_FOR));
+        self.window.drawn_revision = None;
+    }
+
+    /// The notice, if one is still up. Clears it once it is not.
+    fn active_notice(&self) -> Option<String> {
+        self.window.notice
+            .as_ref()
+            .filter(|(_, expires)| *expires > std::time::Instant::now())
+            .map(|(message, _)| message.clone())
+    }
+
+    /// What the status bar has to say right now.
+    fn status(&self) -> crate::statusbar::Status {
+        let session = self.window.state.as_ref().and_then(|live| {
+            unterm_engine::SessionEngine::list_sessions(&self.engine)
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|session| session.id == live.session_id)
+        });
+        let mcp = crate::engine_backend::mcp_state::insights_mcp_snapshot(0);
+        let agents = unterm_services::cockpit::status::snapshot();
+        let _ = agents;
+        let directory = session
+            .as_ref()
+            .and_then(|session| session.shell.cwd.clone())
+            .unwrap_or_default();
+        crate::statusbar::Status {
+            notice: self.active_notice(),
+            shell: session
+                .as_ref()
+                .map(|session| crate::statusbar::shell_label(&session.shell.process_name))
+                .unwrap_or_else(|| "shell".to_string()),
+            columns: session
+                .as_ref()
+                .map(|session| session.cols as usize)
+                .unwrap_or(0),
+            rows: session
+                .as_ref()
+                .map(|session| session.rows as usize)
+                .unwrap_or(0),
+            project: crate::sidebar::project_name(&directory),
+            directory,
+            agent_writes: mcp.input_count,
+            // A bolt on the chip says a write landed a moment ago, so a flash
+            // is noticeable without anyone comparing counts.
+            agent_wrote_recently: mcp
+                .seconds_since_last_input
+                .map(|seconds| seconds < 5.0)
+                .unwrap_or(false),
+            theme: self.theme().id.to_string(),
+            // The window's identity, if one is bound. Read here rather than
+            // cached because it changes only when somebody changes it.
+            profile: unterm_services::server_info::read_current().profile,
+            // The toggle, not the system proxy: the chip answers "will a new
+            // session get proxy env vars", and its click is the switch.
+            proxy: unterm_services::launch_env::unterm_proxy_enabled(),
+            proxy_unreachable: self
+                .window.proxy_error_until
+                .is_some_and(|until| until > std::time::Instant::now()),
+            // Decided once, at startup, and true for the rest of the process.
+            core_local: crate::engine_backend::core_fallback_reason().is_some(),
+        }
+    }
+
+    /// Whether the cursor is solid at this instant.
+    ///
+    /// A steady cursor always is. A blinking one is for half of each period;
+    /// the other half it is drawn as an outline rather than removed, so it
+    /// stays findable while it blinks.
+    fn cursor_is_solid(&self) -> bool {
+        if !self.cursor_style.blinking {
+            return true;
+        }
+        crate::terminal::blink_is_on(self.started.elapsed().as_millis(), self.cursor_blink_ms)
+    }
+
+    /// The phase blinking text is in right now, both cadences at once.
+    fn blink_phase(&self) -> crate::terminal::BlinkPhase {
+        crate::terminal::BlinkPhase::at(
+            self.started.elapsed().as_millis(),
+            self.text_blink_ms,
+            self.text_blink_rapid_ms,
+        )
+    }
+
+    /// Highlight what is selected.
+    ///
+    /// It was being tracked and copied, but never drawn -- so dragging across
+    /// text selected it, copying worked, and nothing on screen said which text
+    /// you had. Drawn in the scheme's own highlight, with its own text colour,
+    /// because those two were chosen together.
+    fn append_selection(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(selection) = self.window.drag.and_then(|drag| drag.selection()) else {
+            return;
+        };
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(live.session_id) else {
+            return;
+        };
+
+        let metrics = self.window.font.metrics();
+        // The selection is the focused pane's, drawn over that pane: from its
+        // own origin, which in a split is not the terminal's.
+        let origin = self.session_origin(live.session_id);
+        let theme = self.theme();
+
+        for (index, line) in snapshot.lines.iter().enumerate() {
+            let columns = selection.columns_for_row(line.row, line.cells.len().min(snapshot.cols.max(1)));
+            if columns.is_empty() {
+                continue;
+            }
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: origin.0 + columns.start as f32 * metrics.width,
+                top: origin.1 + index as f32 * metrics.height,
+                width: (columns.end - columns.start) as f32 * metrics.width,
+                height: metrics.height,
+                color: theme.selection,
+            });
+        }
+    }
+
+    /// Hand the kernel the colours this window draws with, so a program that
+    /// asks (`OSC 10/11/12/4`) is told the truth -- Claude Code, Codex and
+    /// Neovim pick their light or dark palette from the answer.
+    ///
+    /// On a change, and again every half minute: the Core may have been
+    /// replaced since, and a fresh one starts out knowing only the default.
+    /// Hand the kernel the size of one cell in pixels: pictures are measured
+    /// in cells from it, and image tools ask for it (`CSI 14 t` / `16 t`,
+    /// and the pty's own pixel size). On a change -- a zoom, a move to a
+    /// screen of another density -- and again every half minute, like the
+    /// colours, for a Core that has been replaced since.
+    fn report_cell_size(&mut self) {
+        let metrics = self.window.font.metrics();
+        // Exactly the cell the renderer lays the grid out on -- whole pixels
+        // already (`snap_cell`) -- so a picture sized in cells from this
+        // lands on the same pixels as the text around it.
+        let size = (
+            metrics.width.max(1.0) as u32,
+            metrics.height.max(1.0) as u32,
+        );
+        let fresh = self.cell_size_reported.as_ref().is_some_and(|(sent, at)| {
+            *sent == size && at.elapsed() < std::time::Duration::from_secs(30)
+        });
+        if fresh {
+            return;
+        }
+        if let Err(err) = unterm_engine::SessionEngine::set_cell_pixel_size(&self.engine, size.0, size.1) {
+            // An older Core does not know the method.
+            log::debug!("could not report the cell size: {err:#}");
+        }
+        self.cell_size_reported = Some((size, std::time::Instant::now()));
+    }
+
+    fn report_terminal_colors(&mut self) {
+        use unterm_engine::next_core::color::{Rgb, TerminalColors};
+        let rgb = |color: [f32; 4]| {
+            let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            Rgb::new(channel(color[0]), channel(color[1]), channel(color[2]))
+        };
+        let colors = TerminalColors {
+            foreground: rgb(self.window.colors.foreground),
+            background: rgb(self.window.colors.background),
+            cursor: rgb(self.theme().cursor),
+            ansi: std::array::from_fn(|index| {
+                rgb(self.window.colors.palette.get(index).copied().unwrap_or([0.0, 0.0, 0.0, 1.0]))
+            }),
+        };
+        let fresh = self.colors_reported.as_ref().is_some_and(|(sent, at)| {
+            *sent == colors && at.elapsed() < std::time::Duration::from_secs(30)
+        });
+        if fresh {
+            return;
+        }
+        match unterm_engine::SessionEngine::set_terminal_colors(&self.engine, colors) {
+            Ok(()) => self.colors_reported = Some((colors, std::time::Instant::now())),
+            // An older Core does not know the method; try again later rather
+            // than every tick.
+            Err(err) => {
+                log::debug!("could not report terminal colours: {err:#}");
+                self.colors_reported = Some((colors, std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// The scheme in force, for the colours that are its rather than the
+    /// frame's: the divider between panes, the scrollbar, the selection.
+    fn theme(&self) -> &'static crate::theme::Theme {
+        self.theme_id
+            .as_deref()
+            .and_then(crate::theme::by_id)
+            .unwrap_or_else(crate::theme::default_theme)
+    }
+
+    /// The frame's tones, from the terminal's own colours.
+    /// Open a window whose shells run as administrator. Windows asks through
+    /// UAC; saying no is an answer, not an error.
+    fn open_admin_window(&mut self) {
+        let directory = self.current_directory();
+        let message = match crate::admin::launch(directory.as_deref()) {
+            Ok(crate::admin::Launch::Started) => unterm_services::i18n::t("admin.requested"),
+            Ok(crate::admin::Launch::Declined) => unterm_services::i18n::t("admin.declined"),
+            Err(err) => {
+                log::warn!("administrator window: {err:#}");
+                unterm_services::i18n::t_args("admin.failed", &[("err", &format!("{err:#}"))])
+            }
+        };
+        self.show_notice(message);
+    }
+
+    /// Tell Windows what this window's frame looks like: dark or light, and
+    /// the colour of the one-pixel edge it draws around it -- brighter while
+    /// the window has focus, as the system's own windows do. Sent only when it
+    /// changed; a no-op off Windows.
+    fn sync_frame(&mut self) {
+        if self.system_decorations {
+            return;
+        }
+        let chrome = self.chrome();
+        // The seam colour is the foreground at a sixth of its strength,
+        // blended by the renderer over the bar. DWM takes an opaque
+        // COLORREF, so it is composited over the surface here first: sent
+        // as-is it lost its alpha and every window wore a near-white
+        // outline -- a frame drawn around the window, not the hairline
+        // Windows 11 gives each window's edge.
+        //
+        // And far quieter than the in-window seam: Windows 11's own dark
+        // border sits a few steps above the surface (#2d2d2d → ~#434343 in
+        // front, ~#363636 behind). The seam's sixth of the foreground, in
+        // linear light, came out #7c7c7c -- still a drawn frame.
+        let seam = chrome.outer_edge;
+        let edge = if seam[3] >= 0.999 {
+            // A theme that names its edge colour gets exactly that.
+            seam
+        } else {
+            let lift = if self.window.focused { 0.036 } else { 0.013 };
+            crate::chrome::mix(chrome.surface, self.window.colors.foreground, lift)
+        };
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let wanted = (!chrome.is_light, [byte(edge[0]), byte(edge[1]), byte(edge[2])]);
+        if self.window.frame_sent == Some(wanted) {
+            return;
+        }
+        if let Some(live) = self.window.state.as_ref() {
+            crate::win_chrome::set_dark(&live.window, wanted.0);
+            crate::win_chrome::set_border(&live.window, edge);
+            self.window.frame_sent = Some(wanted);
+        }
+    }
+
+    /// The left dock's own surface: see-through behind
+    /// Mica, so the backdrop is what shows there, and the chrome's tone
+    /// otherwise.
+    fn frame_surface(&self, surface: [f32; 4]) -> [f32; 4] {
+        if self.window.state.as_ref().is_some_and(|live| live.mica) {
+            [surface[0], surface[1], surface[2], 0.0]
+        } else {
+            surface
+        }
+    }
+
+    fn chrome(&self) -> crate::chrome::Chrome {
+        let chrome = crate::chrome::chrome(self.window.colors.background, self.window.colors.foreground);
+        // A chosen theme owns the whole window, exactly as 0.57.4 behaved:
+        // the legacy `colors.tab_bar` overrides migrated from a Lua config
+        // were written against the old default look, and pinning the bars to
+        // those static colours is what left a dark chrome around a light
+        // terminal after a theme switch.
+        if self.theme_id.is_some() {
+            return chrome;
+        }
+        self.chrome_overrides.apply(chrome, self.window.focused)
+    }
+
+    fn chrome_foreground(&self) -> [f32; 4] {
+        // With a theme active the bars use its foreground, dimmed to 0.7
+        // alpha when the window is not in front — 0.57.4's exact treatment.
+        if self.theme_id.is_some() {
+            let mut foreground = self.window.colors.foreground;
+            if !self.window.focused {
+                foreground[3] *= 0.7;
+            }
+            return foreground;
+        }
+        (if self.window.focused {
+            self.chrome_overrides.active_foreground
+        } else {
+            self.chrome_overrides
+                .inactive_foreground
+                .or(self.chrome_overrides.active_foreground)
+        })
+        .unwrap_or(self.window.colors.foreground)
+    }
+
+    /// Where the terminal's first column starts, the strip included.
+    ///
+    /// On a whole pixel, like every cell edge measured from it: a fraction
+    /// here -- a dock mid-animation -- would put every glyph in every pane
+    /// on a resampled sub-pixel phase.
+    fn terminal_left(&self) -> f32 {
+        let metrics = self.window.font.metrics();
+        (self.dock_width(metrics) + self.terminal_padding_left() + self.terminal_balance()).round()
+    }
+
+    /// Half of what the grid leaves over across the width, so the text sits
+    /// centred between its paddings instead of the remainder of a cell piling
+    /// up against the right edge. Never more than half a cell, and the
+    /// column count is unchanged: the width the grid is sized from does not
+    /// include it.
+    fn terminal_balance(&self) -> f32 {
+        let metrics = self.window.font.metrics();
+        let width = self.terminal_width();
+        let (cols, _) = self.window.font.grid_for(width, self.terminal_height());
+        ((width - cols as f32 * metrics.width) / 2.0).floor().max(0.0)
+    }
+
+    /// How much of the window the left dock has taken.
+    ///
+    /// One dock, whichever strip is in it. The terminal makes room rather than
+    /// being covered: a panel over the grid hides a row the shell still
+    /// believes in, and the cursor ends up somewhere nobody can see.
+    fn dock_width(&self, metrics: unterm_render::quads::CellMetrics) -> f32 {
+        self.dock_width_for(self.window_width(), metrics)
+    }
+
+    /// The same measurement against a window size the caller already knows.
+    ///
+    /// During `start` there is no `Live` yet, so every one of these used to
+    /// fall back to a hard-coded 800 — and the startup path sidestepped the
+    /// whole chain by sizing the first shell from the raw window width
+    /// instead. That handed the shell the sidebar's columns as well as its
+    /// own, which is why a TUI opened at launch was drawn wider than the grid
+    /// it lived in and why maximising fixed it: the resize was the first time
+    /// anything measured the terminal properly.
+    fn dock_width_for(
+        &self,
+        window_width: f32,
+        metrics: unterm_render::quads::CellMetrics,
+    ) -> f32 {
+        self.sidebar_width_now(window_width) + crate::tree::width(self.window.tree.is_some(), metrics)
+    }
+
+    /// The window's inner width, or a plausible stand-in before it exists.
+    fn window_width(&self) -> f32 {
+        self.window.state.as_ref().map(|live| live.width).unwrap_or(800) as f32
+    }
+
+    /// The window's inner height, same caveat.
+    fn window_height(&self) -> f32 {
+        self.window.state.as_ref().map(|live| live.height).unwrap_or(600) as f32
+    }
+
+    /// How wide the terminal is, once the strip and the gaps are taken.
+    fn terminal_width(&self) -> f32 {
+        self.terminal_width_for(self.window_width())
+    }
+
+    /// How wide the terminal is inside a window of this width.
+    ///
+    /// The floor is the engine's minimum grid, not one cell. Every piece of
+    /// chrome subtracted here has a minimum of its own that does not consult
+    /// the window -- the sidebar, the tree, the git panel -- so a narrow
+    /// enough window, or a large enough font, lets them ask for more than
+    /// there is. Flooring at one cell answered that with a one-column
+    /// terminal, and a one-column terminal is not a cramped view of a pane's
+    /// output, it is the loss of it: the next resize truncates every line and
+    /// the scrollback to a single character. Chrome drawing over the last
+    /// column is the cheaper failure.
+    fn terminal_width_for(&self, window_width: f32) -> f32 {
+        let metrics = self.window.font.metrics();
+        (window_width
+            - self.dock_width_for(window_width, metrics)
+            - self.git_panel_width_for(window_width)
+            - self.terminal_padding_left()
+            - self.terminal_padding_right())
+        .max(unterm_engine::MIN_SESSION_GRID as f32 * metrics.width)
+    }
+
+    /// What the strip shows: one line per tab, grouped by project.
+    fn sidebar_rows(&self) -> Vec<crate::sidebar::Row> {
+        let sessions =
+            unterm_engine::SessionEngine::list_sessions(&self.engine).unwrap_or_default();
+        let statuses = unterm_services::cockpit::status::snapshot();
+        let active = self.window.tab_id;
+        let tabs: Vec<crate::sidebar::TabInfo> = self
+            .window.tabs
+            .tab_ids()
+            .into_iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let pane = self.window.tabs.active_pane(tab);
+                let pane_ids = self.window.tabs.pane_ids(tab);
+                let session =
+                    pane.and_then(|pane| sessions.iter().find(|session| session.id == pane));
+                // Whatever the top bar has already learned. Asking afresh for
+                // every tab would walk the machine's process table once per
+                // tab, several times a second, to put a name on rows nobody is
+                // looking at -- and the pane in front is the one that matters.
+                let facts = pane.map(crate::statsbar::known_facts);
+                let badge = pane_ids
+                    .iter()
+                    .filter_map(|pane| crate::cockpit::badge_for_pane(&statuses, *pane as u64))
+                    .min_by_key(|badge| match badge {
+                        crate::cockpit::Badge::NeedsYou => 0,
+                        crate::cockpit::Badge::Done => 1,
+                        crate::cockpit::Badge::Working => 2,
+                    });
+                let indicators = crate::sidebar::Indicators {
+                    unread: pane_ids.iter().any(|pane| {
+                        self.window.pane_notices
+                            .get(pane)
+                            .map(|notice| notice.unread)
+                            .unwrap_or(false)
+                    }),
+                    error: pane_ids.iter().any(|pane| {
+                        self.window.pane_notices
+                            .get(pane)
+                            .map(|notice| notice.error)
+                            .unwrap_or(false)
+                    }),
+                    running: badge == Some(crate::cockpit::Badge::Working)
+                        || facts
+                            .as_ref()
+                            .map(|facts| !facts.title.is_empty())
+                            .unwrap_or(false),
+                    // The first pane of the tab that reports any: a split
+                    // with a build in one half shows the build.
+                    progress: pane_ids.iter().find_map(|pane| {
+                        self.window.pane_notices.get(pane).and_then(|notice| notice.progress)
+                    }),
+                };
+                crate::sidebar::TabInfo {
+                    index,
+                    // The most urgent of the tab's panes: a split where one
+                    // half is waiting is a tab that is waiting.
+                    badge,
+                    // A name the reader typed outranks anything computed: a
+                    // renamed tab keeps its name while programs come and go.
+                    // Computed names keep 0.57.4's spelling — the extension
+                    // dropped, the case left alone: `powershell`, not
+                    // `Powershell`.
+                    title: self.window.tab_titles.get(&tab).cloned().unwrap_or_else(|| {
+                        session
+                            .map(|session| {
+                                unterm_engine::next_core::tab_title::resolve_name(
+                                    &unterm_engine::next_core::tab_title::TabTitleRules {
+                                        capitalize: false,
+                                        fallback: "shell".to_string(),
+                                        ..Default::default()
+                                    },
+                                    unterm_engine::next_core::tab_title::TabContext {
+                                        pane_title: &session.title,
+                                        process_path: &session.shell.process_name,
+                                        index,
+                                    },
+                                )
+                            })
+                            .unwrap_or_default()
+                    }),
+                    agent: facts
+                        .as_ref()
+                        .and_then(|facts| {
+                            // The segment leads with a lightning bolt; the row
+                            // wants the name that follows it.
+                            facts
+                                .agent
+                                .trim()
+                                .strip_prefix('\u{26A1}')
+                                .map(|name| name.trim().to_string())
+                                .filter(|name| !name.is_empty())
+                        })
+                        .or_else(|| {
+                            // The cockpit knows the agent even when the
+                            // stats cache has not looked at this pane:
+                            // a waiting row must name who is waiting.
+                            pane_ids.iter().find_map(|pane| {
+                                statuses
+                                    .iter()
+                                    .find(|status| status.pane_id == *pane as u64)
+                                    .map(|status| status.agent.clone())
+                                    .filter(|agent| !agent.is_empty())
+                            })
+                        }),
+                    cwd: session.and_then(|session| session.shell.cwd.clone()),
+                    foreground: session
+                        .map(|session| session.shell.process_name.clone())
+                        .map(|name| crate::statusbar::short_name(&name)),
+                    task: session.and_then(|session| {
+                        let active_helpers = unterm_settings::helpers::active_count();
+                        let agent = facts.as_ref().map(|facts| facts.agent.trim().trim_start_matches('\u{26A1}').trim().to_string());
+                        let agent = agent.filter(|name| !name.is_empty()).or_else(|| {
+                            pane_ids.iter().find_map(|pane| {
+                                statuses
+                                    .iter()
+                                    .find(|status| status.pane_id == *pane as u64)
+                                    .map(|status| status.agent.clone())
+                                    .filter(|agent| !agent.is_empty())
+                            })
+                        });
+                        let base_task = agent.as_deref().and_then(|ag| {
+                            crate::sidebar::task_from_title(
+                                &session.title,
+                                Some(ag),
+                                &crate::statusbar::short_name(&session.shell.process_name),
+                            )
+                        });
+                        if active_helpers > 0 && Some(tab) == active {
+                            Some(match base_task {
+                                Some(t) => format!("{t} \u{00b7} \u{26A1}{active_helpers} 协同"),
+                                None => format!("\u{26A1}{active_helpers} Agent 协同中"),
+                            })
+                        } else {
+                            base_task
+                        }
+                    }),
+                    branch: session
+                        .and_then(|session| session.shell.cwd.as_deref())
+                        .and_then(|cwd| crate::git::branch_hint(std::path::Path::new(cwd))),
+                    active: Some(tab) == active,
+                    indicators,
+                }
+            })
+            .collect();
+        crate::sidebar::rows(&tabs, &self.window.sidebar_collapsed)
+    }
+
+    /// Draw the strip, if it is open.
+    /// The characters that match what has been typed.
+    ///
+    /// The recents are read fresh each time; the catalogue is built once and
+    /// kept, because it is a couple of hundred thousand rows and only the top
+    /// of it is ever drawn.
+    fn character_entries(&self, query: &str) -> Vec<crate::palette::Entry> {
+        let recents = crate::charselect::recent_choices();
+        crate::charselect::matching(
+            &recents,
+            crate::charselect::catalog(),
+            self.charselect_group,
+            query,
+            crate::palette::MAX_ROWS,
+        )
+        .into_iter()
+        .map(|choice| crate::palette::Entry {
+            label: format!("{}  {}", choice.glyph, choice.name),
+            hint: format!("{}  {}", choice.codepoints(), choice.group.heading()),
+            command: crate::palette::Command::TypeCharacter {
+                glyph: choice.glyph,
+                name: choice.name.into_owned(),
+            },
+        })
+        .collect()
+    }
+
+    /// Type a character at the prompt, and remember it was picked.
+    fn type_character(&mut self, glyph: &str, name: &str) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let _ = self.engine.write_input(live.session_id, glyph);
+        crate::charselect::remember(glyph, name);
+        self.window.drawn_revision = None;
+    }
+
+    /// Open or close the file tree.
+    ///
+    /// It takes the left dock, and the tab strip gives it up: two strips
+    /// either side of a terminal is most of a narrow window, and the two are
+    /// answering the same question -- where am I, and what else is here.
+    fn toggle_tree(&mut self) {
+        self.window.tree = match self.window.tree.take() {
+            Some(_) => None,
+            None => {
+                let here = self
+                    .current_directory()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                Some(crate::tree::Tree::new(here))
+            }
+        };
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    /// Which tree row a point is over.
+    fn tree_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (left, top, width, height) = self.tree_dock()?;
+        if x < left || x >= left + width || y < top || y >= top + height {
+            return None;
+        }
+        let metrics = self.window.font.metrics();
+        let row = ((y - top) / metrics.height.max(1.0)) as usize;
+        let tree = self.window.tree.as_ref()?;
+        let at = tree.scroll + row;
+        (at < tree.rows.len()).then_some(at)
+    }
+
+    /// A press on the file tree. Returns true when the tree took it.
+    ///
+    /// The disclosure arrow opens a directory; its name changes the focused
+    /// shell's directory. Keeping those hit targets separate is what makes a
+    /// file tree useful both for browsing and for navigating.
+    fn click_tree(&mut self) -> bool {
+        let Some(row) = self.tree_row_at(self.window.pointer.0, self.window.pointer.1) else {
+            return false;
+        };
+        let disclosure = self
+            .window.tree
+            .as_ref()
+            .and_then(|tree| tree.rows.get(row))
+            .is_some_and(|row| {
+                row.is_dir
+                    && !row.is_parent
+                    && !row.is_drive
+                    && self.tree_dock().is_some_and(|(left, _, _, _)| {
+                        let columns = row.depth * 2 + 2;
+                        self.window.pointer.0 < left + columns as f32 * self.window.font.metrics().width
+                    })
+            });
+        let plain_dir = self
+            .window.tree
+            .as_ref()
+            .and_then(|tree| tree.rows.get(row))
+            .is_some_and(|row| row.is_dir && !row.is_parent && !row.is_drive);
+        let click = match self.window.last_tree_click.take() {
+            Some(previous) => previous.again(row, self.window.pointer.0, self.window.pointer.1),
+            None => crate::sidebar::RowClick::first(row, self.window.pointer.0, self.window.pointer.1),
+        };
+        let doubled = click.streak() >= 2;
+        self.window.last_tree_click = Some(click);
+        // A single click on a directory browses -- the arrow and the name
+        // both toggle it open, as 0.57.4's tree did. Only a double-click
+        // reaches the shell with a cd; parent and drive rows re-root the
+        // view on one click because they are navigation, not commands.
+        let picked = self
+            .window.tree
+            .as_mut()
+            .and_then(|tree| tree.press(row, disclosure || (plain_dir && !doubled)));
+        match picked {
+            Some(crate::tree::Picked::Directory(path)) => {
+                if let Some(tree) = self.window.tree.as_mut() {
+                    tree.request_root(path.clone());
+                }
+                if doubled {
+                    self.change_directory(&path.display().to_string());
+                }
+            }
+            Some(crate::tree::Picked::File(path)) => {
+                if let Some(live) = self.window.state.as_ref() {
+                    let text = path.display().to_string();
+                    let quoted = format!("{} ", shell_quoted_path(&text));
+                    let _ = self.engine.write_input(live.session_id, &quoted);
+                }
+            }
+            None => {}
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// Where the file tree is on screen, so a press lands on the row it is
+    /// drawn on.
+    fn tree_dock(&self) -> Option<(f32, f32, f32, f32)> {
+        self.window.tree.as_ref()?;
+        let metrics = self.window.font.metrics();
+        let width = crate::tree::width(true, metrics);
+        let top = self.terminal_top() - self.chrome_inset();
+        let height = self.terminal_height() + self.chrome_inset() * 2.0;
+        // To the right of the tab strip when both are open, so the two docks
+        // do not draw over each other.
+        let window_width = self.window.state.as_ref().map(|live| live.width).unwrap_or(800) as f32;
+        let left = self.sidebar_width_now(window_width);
+        Some((left, top, width, height))
+    }
+
+    /// Draw the file tree, if it is open.
+    fn append_tree(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some((left, top, width, height)) = self.tree_dock() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let chrome = self.chrome();
+        let foreground = self.chrome_foreground();
+        let visible = (height / metrics.height).floor().max(1.0) as usize;
+
+        // Follow the pane. A tree still rooted where the shell used to be is
+        // a tree of somewhere else, and nothing on screen says so.
+        //
+        // Not while the pointer is over the tree, though: an agent in the
+        // pane changes directory as it works, and a follow mid-aim rebuilds
+        // the rows under the click — the reader picks a row and gets
+        // whatever moved into its place. The follow resumes when they leave.
+        let pointer_inside = self.window.pointer.0 >= left
+            && self.window.pointer.0 < left + width
+            && self.window.pointer.1 >= top
+            && self.window.pointer.1 < top + height;
+        let here = self.current_directory();
+        let rows = {
+            let Some(tree) = self.window.tree.as_mut() else {
+                return;
+            };
+            if let Some(here) = here {
+                if !pointer_inside {
+                    tree.follow_root(here);
+                }
+            }
+            tree.refresh();
+            // Never scrolled past the end: a tree showing nothing looks like a
+            // tree that failed to read the disk.
+            tree.scroll_by(0, visible);
+            tree.rows
+                .iter()
+                .skip(tree.scroll)
+                .take(visible)
+                .map(|row| (row.text(crate::tree::COLUMNS), row.is_hidden, row.is_dir))
+                .collect::<Vec<_>>()
+        };
+        let scroll = self.window.tree.as_ref().map(|tree| tree.scroll).unwrap_or(0);
+
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left,
+            top,
+            width,
+            height,
+            color: self.frame_surface(chrome.surface),
+        });
+        // The seam, so the strip and the terminal read as two surfaces of one
+        // window rather than one surface that changed colour.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: left + width - 1.0,
+            top,
+            width: 1.0,
+            height,
+            color: chrome.outer_edge,
+        });
+
+        // The row the pointer is on lifts like the tab strip's do. In rows
+        // one cell tall, this is the difference between clicking a name and
+        // guessing one.
+        if let Some(at) = self.tree_row_at(self.window.pointer.0, self.window.pointer.1) {
+            if at >= scroll && at - scroll < rows.len() {
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left,
+                    top: top + (at - scroll) as f32 * metrics.height,
+                    width: width - 1.0,
+                    height: metrics.height,
+                    color: chrome.hover_bg,
+                });
+            }
+        }
+
+        for (index, (text, hidden, is_dir)) in rows.iter().enumerate() {
+            let color = if *hidden {
+                chrome.dim_text
+            } else if *is_dir {
+                foreground
+            } else {
+                chrome.dim_text
+            };
+            crate::terminal::append_text(
+                text,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                color,
+                (left, top + index as f32 * metrics.height),
+                quads,
+            );
+        }
+    }
+
+    /// Where the tab strip is, and how tall one of its rows is.
+    ///
+    /// One place, so a row is pressed where it is drawn. Sized in points
+    /// against the display, not in terminal cells: it is chrome.
+    /// The fill behind a strip row: the row in front, or the one under the
+    /// pointer. Between the chrome's hover and selected tones, so the pill
+    /// carries the accent and the fill only lifts the row.
+    fn sidebar_selection_fill(&self, active: bool) -> [f32; 4] {
+        let chrome = self.chrome();
+        if active {
+            crate::chrome::mix(chrome.hover_bg, chrome.selected_bg, 0.3)
+        } else {
+            chrome.hover_bg
+        }
+    }
+
+    /// Fluent's selection pill at the leading edge of a row.
+    fn append_selection_pill(
+        &self,
+        tile_left: f32,
+        tile_top: f32,
+        tile_height: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let pt = crate::chrome_font::point(self.window.scale);
+        let wide = (crate::ui_tokens::SELECTION_PILL_WIDTH * pt).round().max(2.0);
+        let tall = (crate::ui_tokens::SELECTION_PILL_HEIGHT * pt)
+            .round()
+            .min((tile_height - 4.0 * pt).max(wide));
+        let inset = (1.5 * pt).round().max(1.0);
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            tile_left + inset,
+            (tile_top + (tile_height - tall) / 2.0).round(),
+            wide,
+            tall,
+            wide / 2.0,
+            self.chrome().focus_rail,
+        ));
+    }
+
+    /// A row's second line fitted to `room`: what comes before the branch cut
+    /// at its end if it must be, the branch cut once in its middle.
+    fn fit_subtitle(&mut self, subtitle: &str, room: f32) -> String {
+        if self.chrome_width(subtitle) <= room {
+            return subtitle.to_string();
+        }
+        const MARK: &str = "\u{e0a0} ";
+        let Some(at) = subtitle.find(MARK) else {
+            return self.chrome_fit(subtitle, room);
+        };
+        let (before, branch) = (&subtitle[..at], &subtitle[at + MARK.len()..]);
+        let mark = self.chrome_width(MARK);
+        // Whatever precedes the branch keeps its words while the branch still
+        // has room for a recognisable few characters; past that it gives way.
+        let floor = self.chrome_width("feat/abc\u{2026}xyz");
+        let before = if self.chrome_width(before) + mark + floor <= room {
+            before.to_string()
+        } else {
+            self.chrome_fit(before, (room * 0.4).max(0.0))
+        };
+        let rest = room - self.chrome_width(&before) - mark;
+        let branch = crate::sidebar::fit_middle(branch, rest, &mut |text| self.chrome_width(text));
+        if branch.is_empty() {
+            return self.chrome_fit(&before, room);
+        }
+        format!("{before}{MARK}{branch}")
+    }
+
+    /// One row of the strip on its rail: the tab's icon centred, its status
+    /// as a dot at the icon's shoulder, and the row in front marked as the
+    /// open strip marks it.
+    #[allow(clippy::too_many_arguments)]
+    fn append_sidebar_rail_row(
+        &mut self,
+        row: &crate::sidebar::Row,
+        project_colors: &std::collections::HashMap<String, [f32; 4]>,
+        left: f32,
+        width: f32,
+        row_top: f32,
+        row_height: f32,
+        spin: u8,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let pt = crate::chrome_font::point(self.window.scale);
+        let radius = crate::ui_tokens::CORNER_RADIUS * pt;
+        let chrome = self.chrome();
+        let foreground = self.chrome_foreground();
+        let line = self.window.chrome_font.metrics().height;
+        let nudge = crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt;
+        match row {
+            crate::sidebar::Row::Group {
+                key,
+                label,
+                collapsed,
+                active,
+                ..
+            } => {
+                // The project, as a lettered square in its own colour: what
+                // tells one run of terminal icons from the next. The project
+                // in front at full strength, the others quieter; a folded one
+                // quieter still, and pressing it opens it.
+                let size = (18.0 * pt).round().min((row_height - 4.0 * pt).max(8.0));
+                let square_left = (left + (width - size) / 2.0).round();
+                let square_top = (row_top + (row_height - size) / 2.0).round();
+                let mut fill = project_colors.get(key).copied().unwrap_or(chrome.dim_text);
+                fill[3] = if *active {
+                    1.0
+                } else if *collapsed {
+                    0.35
+                } else {
+                    0.6
+                };
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    square_left,
+                    square_top,
+                    size,
+                    size,
+                    (4.0 * pt).round(),
+                    fill,
+                ));
+                let letter = crate::sidebar::project_initial(label);
+                let wide = self.chrome_width(&letter);
+                let mut ink = if chrome.is_light {
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    [0.08, 0.08, 0.09, 1.0]
+                };
+                ink[3] = fill[3].max(0.7);
+                self.append_chrome(
+                    &letter,
+                    ink,
+                    (
+                        (square_left + (size - wide) / 2.0).round(),
+                        (square_top + (size - line) / 2.0 + nudge).round(),
+                    ),
+                    quads,
+                );
+            }
+            crate::sidebar::Row::Tab {
+                active,
+                icon,
+                badge,
+                indicators,
+                ..
+            } => {
+                let inset = (4.0 * pt).round();
+                let gap = (1.0 * pt).round();
+                let (tile_left, tile_top) = (left + inset, row_top + gap);
+                let (tile_width, tile_height) =
+                    ((width - inset * 2.0).max(1.0), (row_height - gap * 2.0).max(1.0));
+                let hovered = self.window.pointer.0 >= tile_left
+                    && self.window.pointer.0 < tile_left + tile_width
+                    && self.window.pointer.1 >= tile_top
+                    && self.window.pointer.1 < tile_top + tile_height;
+                if *active || hovered {
+                    quads.backgrounds.extend(unterm_render::rounded::panel(
+                        tile_left,
+                        tile_top,
+                        tile_width,
+                        tile_height,
+                        radius,
+                        self.sidebar_selection_fill(*active),
+                    ));
+                }
+                if *active {
+                    self.append_selection_pill(tile_left, tile_top, tile_height, quads);
+                }
+                let glyph = icon.to_string();
+                let wide = self.chrome_width(&glyph);
+                let icon_left = (left + (width - wide) / 2.0).round();
+                let icon_top = (tile_top + (tile_height - line) / 2.0 + nudge).round();
+                let color = if *icon == crate::sidebar::ROBOT {
+                    chrome.focus_rail
+                } else if *active || hovered {
+                    foreground
+                } else {
+                    chrome.dim_text
+                };
+                self.append_chrome(&glyph, color, (icon_left, icon_top), quads);
+
+                // The status the open strip spells out at the row's end, as
+                // a dot; a working agent keeps its spinner.
+                let mark: Option<(String, [f32; 4])> = match badge {
+                    Some(working @ crate::cockpit::Badge::Working) => {
+                        Some((working.glyph(spin).to_string(), working.color()))
+                    }
+                    Some(badge) => Some(("\u{2022}".to_string(), badge.color())),
+                    None if indicators.error => Some(("\u{2022}".to_string(), [0.95, 0.35, 0.35, 1.0])),
+                    None if indicators.unread => {
+                        Some(("\u{2022}".to_string(), crate::cockpit::Badge::NeedsYou.color()))
+                    }
+                    None => None,
+                };
+                if let Some((mark, color)) = mark {
+                    let mark_wide = self.chrome_width(&mark);
+                    self.append_chrome(
+                        &mark,
+                        color,
+                        (
+                            (icon_left + wide - mark_wide * 0.3).round(),
+                            (icon_top - line * 0.35).round(),
+                        ),
+                        quads,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rail's footer: a new session, one square.
+    fn append_sidebar_rail_footer(
+        &mut self,
+        left: f32,
+        width: f32,
+        footer_top: f32,
+        footer_height: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let pt = crate::chrome_font::point(self.window.scale);
+        let chrome = self.chrome();
+        let inset = (4.0 * pt).round();
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: left + inset,
+            top: footer_top,
+            width: (width - inset * 2.0).max(0.0),
+            height: 1.0,
+            color: chrome.inner_highlight,
+        });
+        let hovered = self.window.pointer.0 >= left
+            && self.window.pointer.0 < left + width
+            && self.window.pointer.1 >= footer_top
+            && self.window.pointer.1 < footer_top + footer_height;
+        if hovered {
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                left + inset,
+                footer_top + 2.0 * pt,
+                (width - inset * 2.0).max(1.0),
+                footer_height - 4.0 * pt,
+                crate::ui_tokens::CORNER_RADIUS * pt,
+                chrome.hover_bg,
+            ));
+        }
+        let text_top = ((footer_height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+            .max(0.0);
+        let wide = self.chrome_width("+");
+        let ink = if hovered { self.chrome_foreground() } else { chrome.dim_text };
+        self.append_chrome(
+            "+",
+            ink,
+            ((left + (width - wide) / 2.0).round(), footer_top + text_top),
+            quads,
+        );
+    }
+
+    /// The name of the rail row under the pointer: the rail shows icons, and
+    /// an icon with no name on hover is a guess.
+    fn append_rail_tooltip(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        if !self.sidebar_on_rail() || self.window.dragging_sidebar_width {
+            return;
+        }
+        let Some((left, _top, width, _height, _)) = self.sidebar_dock() else {
+            return;
+        };
+        let (x, y) = self.window.pointer;
+        let Some(at) = self.sidebar_row_at(x, y) else {
+            return;
+        };
+        let label = {
+            let rows = self.sidebar_rows();
+            match rows.get(at) {
+                Some(crate::sidebar::Row::Tab { label, subtitle, .. }) => match subtitle {
+                    Some(subtitle) => format!("{label}  \u{00b7}  {subtitle}"),
+                    None => label.clone(),
+                },
+                Some(crate::sidebar::Row::Group { label, hint, .. }) => match hint {
+                    Some(hint) => format!("{hint}/{label}"),
+                    None => label.clone(),
+                },
+                None => return,
+            }
+        };
+        let Some((row_top, row_height)) = self.sidebar_row_bounds(at) else {
+            return;
+        };
+        let pt = crate::chrome_font::point(self.window.scale);
+        let chrome = self.chrome();
+        let pad = 8.0 * pt;
+        let text = self.chrome_fit(&label, 360.0 * pt);
+        let box_width = self.chrome_width(&text) + pad * 2.0;
+        let box_height = self.chrome_row_height();
+        let box_left = left + width + 4.0 * pt;
+        let box_top = (row_top + (row_height - box_height) / 2.0).round();
+        let mark = quads.mark();
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            box_left,
+            box_top,
+            box_width,
+            box_height,
+            crate::ui_tokens::CORNER_RADIUS * pt,
+            chrome.group_bg,
+        ));
+        let text_top = ((box_height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+            .max(0.0);
+        let color = self.window.colors.foreground;
+        self.append_chrome(&text, color, (box_left + pad, box_top + text_top), quads);
+        quads.raise_since(mark);
+    }
+
+    /// Hovering over a non-active tab in the expanded sidebar shows a compact
+    /// floating preview of that pane's last 5 non-empty lines of terminal output.
+    fn append_sidebar_peek(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        if !self.window.sidebar_open
+            || self.sidebar_on_rail()
+            || self.window.dragging_sidebar_width
+            || self.window.palette.is_some()
+            || self.window.quick_menu.is_some()
+            || self.window.inbox_open
+        {
+            return;
+        }
+        let Some((left, _top, width, _height, _)) = self.sidebar_dock() else {
+            return;
+        };
+        let (x, y) = self.window.pointer;
+        let Some(at) = self.sidebar_row_at(x, y) else {
+            return;
+        };
+        let (tab_index, header) = {
+            let rows = self.sidebar_rows();
+            let Some(crate::sidebar::Row::Tab {
+                index,
+                label,
+                subtitle,
+                active,
+                ..
+            }) = rows.get(at)
+            else {
+                return;
+            };
+            if *active {
+                return;
+            }
+            let heading = match subtitle {
+                Some(sub) => format!("{label}  \u{00b7}  {sub}"),
+                None => label.clone(),
+            };
+            (*index, heading)
+        };
+        let Some(tab_id) = self.window.tabs.tab_ids().get(tab_index).copied() else {
+            return;
+        };
+        let Some(pane_id) = self.window.tabs.active_pane(tab_id) else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(pane_id) else {
+            return;
+        };
+        let mut tail: Vec<String> = snapshot
+            .lines
+            .iter()
+            .rev()
+            .filter_map(|line| {
+                let s: String = line
+                    .cells
+                    .iter()
+                    .filter(|cell| cell.width > 0)
+                    .map(|cell| cell.ch)
+                    .collect();
+                let trimmed = s.trim_end().to_string();
+                (!trimmed.trim().is_empty()).then_some(trimmed)
+            })
+            .take(5)
+            .collect();
+        tail.reverse();
+        if tail.is_empty() {
+            return;
+        }
+        let Some((row_top, row_height)) = self.sidebar_row_bounds(at) else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let pt = crate::chrome_font::point(self.window.scale);
+        let max_cols = 54usize;
+        let header_fitted = crate::sidebar::fit(&header, max_cols);
+        let fitted_tail: Vec<String> = tail
+            .into_iter()
+            .map(|line| crate::sidebar::fit(&line, max_cols))
+            .collect();
+        let widest = fitted_tail
+            .iter()
+            .chain(std::iter::once(&header_fitted))
+            .map(|line| crate::sidebar::columns(line))
+            .max()
+            .unwrap_or(24)
+            .max(24) as f32;
+        let pad = metrics.width * 1.25;
+        let box_width = (metrics.width * widest + pad * 2.0).round();
+        let line_step = (metrics.height * 1.22).round();
+        let box_height = (line_step * (fitted_tail.len() + 1) as f32 + pad * 1.2).round();
+        let box_left = (left + width + 8.0 * pt).round();
+        let win_height = self
+            .window
+            .state
+            .as_ref()
+            .map(|live| live.height as f32)
+            .unwrap_or(800.0);
+        let box_top = (row_top + (row_height - box_height) / 2.0)
+            .clamp(self.top_bar_height() + 4.0 * pt, (win_height - box_height - 8.0 * pt).max(0.0))
+            .round();
+        let foreground = self.window.colors.foreground;
+        let quiet = self.chrome().dim_text;
+        let mark = quads.mark();
+        self.append_flyout(
+            box_left,
+            box_top,
+            box_width,
+            box_height,
+            mix(self.window.colors.background, foreground, 0.08),
+            quads,
+        );
+        let text_top = box_top + pad * 0.6;
+        crate::terminal::append_text(
+            &header_fitted,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            foreground,
+            (box_left + pad, text_top),
+            quads,
+        );
+        for (idx, line) in fitted_tail.iter().enumerate() {
+            crate::terminal::append_text(
+                line,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                quiet,
+                (box_left + pad, text_top + line_step * (idx + 1) as f32),
+                quads,
+            );
+        }
+        quads.raise_since(mark);
+    }
+
+    /// Where the strip row at `index` is drawn, if it is on screen.
+    fn sidebar_row_bounds(&self, index: usize) -> Option<(f32, f32)> {
+        let (_left, top, _width, height, _) = self.sidebar_dock()?;
+        let pt = crate::chrome_font::point(self.window.scale);
+        let first = top + crate::ui_tokens::CHROME_SECTION_GAP * pt;
+        let visible = self.sidebar_visible_rows()?;
+        let rows = self.sidebar_rows();
+        let scroll = crate::sidebar::clamp_scroll(self.window.sidebar_scroll, rows.len(), visible);
+        let bottom = top + height - self.sidebar_footer_height();
+        self.sidebar_layout(&rows, scroll, first, bottom)
+            .into_iter()
+            .find(|(at, _, _)| *at == index)
+            .map(|(_, row_top, row_height)| (row_top, row_height))
+    }
+
+    /// Whether the strip is folded to its column of icons: by hand, or
+    /// because the window is too narrow to spare it (until opened by hand).
+    fn sidebar_on_rail(&self) -> bool {
+        let window_width = self.window.state.as_ref().map(|live| live.width).unwrap_or(800) as f32;
+        self.sidebar_on_rail_at(window_width)
+    }
+
+    /// The same, for a window of `window_width` pixels -- which `start` knows
+    /// before the window's state does. Asked without it, the first shell was
+    /// sized for the 800px fallback: on the rail, and 22 columns too wide.
+    fn sidebar_on_rail_at(&self, window_width: f32) -> bool {
+        self.window.sidebar_rail.unwrap_or_else(|| {
+            crate::sidebar::rail_by_default(window_width / self.window.scale.max(0.1))
+        })
+    }
+
+    /// The strip's width in pixels right now: nothing when it is closed, the
+    /// rail when folded, otherwise what it was dragged to or the default.
+    fn sidebar_width_now(&self, window_width: f32) -> f32 {
+        if !self.window.sidebar_open {
+            return 0.0;
+        }
+        if self.sidebar_on_rail_at(window_width) {
+            return crate::sidebar::rail_width(self.font_scale());
+        }
+        crate::sidebar::width(
+            true,
+            self.window.sidebar_points,
+            self.window.tabs.tab_ids().len(),
+            window_width,
+            self.font_scale(),
+        )
+    }
+
+    fn sidebar_dock(&self) -> Option<(f32, f32, f32, f32, f32)> {
+        if !self.window.sidebar_open {
+            return None;
+        }
+        let window_width = self.window.state.as_ref().map(|live| live.width).unwrap_or(800) as f32;
+        let width = self.sidebar_width_now(window_width);
+        let top = self.terminal_top() - self.chrome_inset();
+        let height = self.terminal_height() + self.chrome_inset() * 2.0;
+        Some((0.0, top, width, height, self.sidebar_row_height()))
+    }
+
+    /// A tab row: two chrome lines, the title and then where it is.
+    fn sidebar_row_height(&self) -> f32 {
+        (self.chrome_row_height() * crate::ui_tokens::SIDEBAR_ROW_LINES).round()
+    }
+
+    /// The footer's one line of actions.
+    fn sidebar_footer_height(&self) -> f32 {
+        self.chrome_row_height()
+    }
+
+    /// How tall one row of the strip is. Heights follow what a row holds: a
+    /// tab with a second line gets two, a tab without one gets one, and a
+    /// project header gets one plus the air above it that separates it from
+    /// the project before. A grid of equal two-line rows left every header
+    /// and every one-line tab with an empty line of its own -- the gaps
+    /// between projects were those.
+    fn sidebar_row_extent(&self, row: &crate::sidebar::Row) -> f32 {
+        let line = self.chrome_row_height();
+        if self.sidebar_on_rail() {
+            // One icon a row, Fluent's 40px item; a project is its lettered
+            // square.
+            return match row {
+                crate::sidebar::Row::Group { .. } => (line * 1.15).round(),
+                crate::sidebar::Row::Tab { .. } => (line * 1.25).round(),
+            };
+        }
+        match row {
+            crate::sidebar::Row::Group { .. } => (line * 1.2).round(),
+            crate::sidebar::Row::Tab { subtitle: Some(_), .. } => (line * 1.55).round(),
+            crate::sidebar::Row::Tab { .. } => (line * 0.95).round(),
+        }
+    }
+
+    /// Where each visible row sits, from `scroll` down to the footer: the
+    /// index into `rows`, its top and its height. The painter and the hit
+    /// test both read this, so a row is pressed exactly where it is drawn.
+    fn sidebar_layout(
+        &self,
+        rows: &[crate::sidebar::Row],
+        scroll: usize,
+        first: f32,
+        bottom: f32,
+    ) -> Vec<(usize, f32, f32)> {
+        let mut placed = Vec::new();
+        let mut top = first;
+        for (index, row) in rows.iter().enumerate().skip(scroll) {
+            let height = self.sidebar_row_extent(row);
+            if top + height > bottom {
+                break;
+            }
+            placed.push((index, top, height));
+            top += height;
+        }
+        placed
+    }
+
+    /// The scale text and pt tokens are drawn at, as distinct from the
+    /// display's own factor.
+    ///
+    /// Winit gives the renderer physical pixels and a single display scale.
+    /// Applying that scale twice made a configured 12pt face render as 27pt
+    /// at 150% DPI, and enlarged both its row metrics and all custom chrome.
+    /// The old front end's DPI virtualisation is already accounted for by
+    /// winit's physical surface; the font must consume the scale exactly once.
+    fn font_scale_for(scale: f32) -> f32 {
+        scale
+    }
+
+    fn font_scale(&self) -> f32 {
+        Self::font_scale_for(self.window.scale)
+    }
+
+    /// One point in pixels on this display.
+    fn chrome_pt(&self) -> f32 {
+        crate::chrome_font::point(self.font_scale())
+    }
+
+    /// The gap between a docked panel and what is beside it.
+    fn chrome_inset(&self) -> f32 {
+        (crate::ui_tokens::CHROME_PANEL_INSET * self.chrome_pt()).round()
+    }
+
+    /// How tall the bar along the top is.
+    fn top_bar_height(&self) -> f32 {
+        crate::topbar::height(
+            self.chrome_row_height(),
+            self.chrome_pt(),
+            self.window.top_bar_quiet,
+        )
+    }
+
+    /// Where the terminal's first row starts, below the bar.
+    fn terminal_top(&self) -> f32 {
+        self.top_bar_height() + self.terminal_padding_top()
+    }
+
+    /// Which window edge the pointer is on, if it may grab one.
+    ///
+    /// The window buttons are excluded: a press aimed at closing the
+    /// window must never start a resize instead, and they sit against
+    /// the very corner the band would otherwise own.
+    fn resize_edge_at_pointer(&self) -> Option<winit::window::ResizeDirection> {
+        let live = self.window.state.as_ref()?;
+        let size = (live.width as f32, live.height as f32);
+        let pt = self.chrome_pt();
+        if self.window.pointer.1 < self.top_bar_height()
+            && self.window.pointer.0 >= size.0 - crate::topbar::window_button_band(pt)
+        {
+            return None;
+        }
+        crate::topbar::resize_edge(self.window.pointer, size, pt)
+    }
+
+    /// Say what the pointer can do here, by its shape.
+    ///
+    /// The window draws its own frame, so its resize band is invisible:
+    /// an edge that leaves the arrow alone is an edge nobody discovers,
+    /// and the window reads as one that cannot be resized. The grid
+    /// takes an I-beam for the same reason every terminal does -- that
+    /// is where text is selected.
+    fn sidebar_grip_at(&self, x: f32, y: f32) -> bool {
+        if !self.window.sidebar_open {
+            return false;
+        }
+        let Some((left, top, width, height, _)) = self.sidebar_dock() else {
+            return false;
+        };
+        if y < top || y >= top + height {
+            return false;
+        }
+        let pt = self.chrome_pt();
+        let edge = left + width;
+        (x - edge).abs() <= crate::ui_tokens::LEFT_TAB_BAR_GRIP * pt / 2.0
+    }
+
+    fn apply_cursor(&mut self) {
+        use winit::window::CursorIcon;
+        let Some((width, height)) = self
+            .window.state
+            .as_ref()
+            .map(|live| (live.width as f32, live.height as f32))
+        else {
+            return;
+        };
+        let (x, y) = self.window.pointer;
+        let on_top_bar_control = matches!(
+            self.hovered_top_bar_item(),
+            Some(
+                crate::topbar::Item::Cockpit
+                    | crate::topbar::Item::Stats
+                    | crate::topbar::Item::Menu
+                    | crate::topbar::Item::Action(_)
+                    | crate::topbar::Item::Minimise
+                    | crate::topbar::Item::Maximise
+                    | crate::topbar::Item::Close
+            )
+        );
+        let on_sidebar_control = self.window.sidebar_open
+            && y >= 0.0
+            && (self.sidebar_footer_action_at(x, y).is_some()
+                || self.sidebar_row_at(x, y).is_some());
+        let on_status_control = self.status_bar_enabled
+            && y >= height - self.status_bar_height()
+            && matches!(
+                self.status_bar_segment_at_pointer(),
+                Some(
+                    crate::statusbar::SegmentKind::Cwd
+                        | crate::statusbar::SegmentKind::Project
+                        | crate::statusbar::SegmentKind::CaptureInclude
+                        | crate::statusbar::SegmentKind::CaptureExclude
+                        | crate::statusbar::SegmentKind::Theme
+                        | crate::statusbar::SegmentKind::Mcp
+                        | crate::statusbar::SegmentKind::Proxy
+                        | crate::statusbar::SegmentKind::Profile
+                        | crate::statusbar::SegmentKind::Core
+                )
+            );
+        let icon = if self.window.dragging_sidebar_width || self.sidebar_grip_at(x, y) {
+            CursorIcon::EwResize
+        } else if let Some(direction) = self.resize_edge_at_pointer() {
+            crate::topbar::resize_cursor(direction)
+        } else if on_top_bar_control || on_sidebar_control || on_status_control {
+            CursorIcon::Pointer
+        } else if x >= self.terminal_left()
+            && x < width - self.git_panel_width()
+            && y >= self.terminal_top()
+            && y < height - self.status_bar_height()
+        {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
+        };
+        if self.window.cursor_icon == icon {
+            return;
+        }
+        self.window.cursor_icon = icon;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.set_cursor(icon);
+        }
+    }
+
+    fn terminal_padding_left(&self) -> f32 {
+        (self.terminal_padding[0] * self.window.scale).round()
+    }
+
+    fn terminal_padding_right(&self) -> f32 {
+        (self.terminal_padding[1] * self.window.scale).round()
+    }
+
+    fn terminal_padding_top(&self) -> f32 {
+        (self.terminal_padding[2] * self.window.scale).round()
+    }
+
+    fn terminal_padding_bottom(&self) -> f32 {
+        (self.terminal_padding[3] * self.window.scale).round()
+    }
+
+    /// How tall one chrome row is: its text plus the padding above and below.
+    fn chrome_row_height(&self) -> f32 {
+        let pt = crate::chrome_font::point(self.font_scale());
+        (self.window.chrome_font.metrics().height + crate::ui_tokens::CHROME_ROW_PADDING_Y * 2.0 * pt)
+            .round()
+            .max(1.0)
+    }
+
+    /// Draw a run of chrome text in the chrome's own face, returning where it
+    /// ended so the next piece of the row can start there.
+    fn append_chrome(
+        &mut self,
+        text: &str,
+        color: [f32; 4],
+        origin: (f32, f32),
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) -> f32 {
+        let width = crate::terminal::append_chrome_text(
+            text,
+            &mut self.window.chrome_font,
+            &mut self.window.atlas,
+            color,
+            origin,
+            quads,
+        );
+        origin.0 + width
+    }
+
+    /// How wide a piece of chrome text will be.
+    fn chrome_width(&mut self, text: &str) -> f32 {
+        crate::terminal::chrome_text_width(text, &mut self.window.chrome_font, &mut self.window.atlas)
+    }
+
+    /// Chrome-layer text in the terminal's monospace face. The 0.57.4 bars
+    /// drew their facts and status segments in the terminal font — aligned
+    /// baselines against the grid they describe — and only buttons and labels
+    /// in the UI face.
+    fn append_mono(
+        &mut self,
+        text: &str,
+        color: [f32; 4],
+        origin: (f32, f32),
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) -> f32 {
+        let width = crate::terminal::append_chrome_text(
+            text,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            color,
+            origin,
+            quads,
+        );
+        origin.0 + width
+    }
+
+    /// How wide a piece of monospace chrome text will be.
+    fn mono_width(&mut self, text: &str) -> f32 {
+        crate::terminal::chrome_text_width(text, &mut self.window.font, &mut self.window.atlas)
+    }
+
+    /// Shorten `text` until it fits `room` pixels, keeping its start.
+    ///
+    /// Measured in the face it is drawn in rather than in cells: a proportional
+    /// label measured on a grid is wrong by however much the face differs, in
+    /// whichever direction it differs.
+    fn chrome_fit(&mut self, text: &str, room: f32) -> String {
+        if room <= 0.0 {
+            return String::new();
+        }
+        if self.chrome_width(text) <= room {
+            return text.to_string();
+        }
+        let mut used = self.chrome_width("\u{2026}");
+        let mut kept = String::new();
+        for ch in text.chars() {
+            let wide = self.chrome_width(&ch.to_string());
+            if used + wide > room {
+                break;
+            }
+            kept.push(ch);
+            used += wide;
+        }
+        format!("{kept}\u{2026}")
+    }
+
+    /// How many rows of the strip are on screen.
+    ///
+    /// The footer's row is reserved, and the section gap above the list is
+    /// not a row. Shared so the wheel bounds itself against the same number
+    /// the painter and the hit test use -- three copies of this arithmetic
+    /// is three chances for the wheel to stop somewhere the eye does not.
+    ///
+    /// Counted from the end of the list with each row's own height: the rows
+    /// that fit when the strip is scrolled as far as it goes, which is the
+    /// number `clamp_scroll` bounds against. Dividing by one nominal row
+    /// height stopped being right when rows took the height of what they
+    /// hold -- a strip half empty still said it overflowed, drew a
+    /// scrollbar, and scrolled its first project out of sight.
+    fn sidebar_visible_rows(&self) -> Option<usize> {
+        let (_left, top, _width, height, _row_height) = self.sidebar_dock()?;
+        let pt = crate::chrome_font::point(self.window.scale);
+        let first = top + crate::ui_tokens::CHROME_SECTION_GAP * pt;
+        let footer_top = top + height - self.sidebar_footer_height();
+        let extents: Vec<f32> = self
+            .sidebar_rows()
+            .iter()
+            .map(|row| self.sidebar_row_extent(row))
+            .collect();
+        Some(crate::sidebar::rows_that_fit_at_end(&extents, footer_top - first))
+    }
+
+    /// Which strip row a point is over.
+    fn sidebar_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (left, top, width, height, _row_height) = self.sidebar_dock()?;
+        if x < left || x >= left + width || y < top || y >= top + height {
+            return None;
+        }
+        let pt = crate::chrome_font::point(self.window.scale);
+        let first = top + crate::ui_tokens::CHROME_SECTION_GAP * pt;
+        if y < first {
+            return None;
+        }
+        let visible = self.sidebar_visible_rows()?;
+        let rows = self.sidebar_rows();
+        let scroll = crate::sidebar::clamp_scroll(self.window.sidebar_scroll, rows.len(), visible);
+        let bottom = top + height - self.sidebar_footer_height();
+        self.sidebar_layout(&rows, scroll, first, bottom)
+            .into_iter()
+            .find(|(_, row_top, row_height)| y >= *row_top && y < row_top + row_height)
+            .map(|(index, _, _)| index)
+    }
+
+    /// 0 = new session, 1 = the shell picker, 2 = settings — one row,
+    /// three zones. Pure geometry: the footer is pinned to the bottom
+    /// edge, so no session list has to be walked to find it.
+    fn sidebar_footer_action_at(&mut self, x: f32, y: f32) -> Option<usize> {
+        let (left, top, width, height, _) = self.sidebar_dock()?;
+        let row_height = self.sidebar_footer_height();
+        let footer_top = top + height - row_height;
+        if x < left || x >= left + width || y < footer_top || y >= top + height {
+            return None;
+        }
+        // The rail's footer is one square: a new session.
+        if self.sidebar_on_rail() {
+            return Some(0);
+        }
+        let pt = crate::chrome_font::point(self.window.scale);
+        let inset = crate::ui_tokens::CHROME_PANEL_INSET * pt;
+        if x < left + inset || x >= left + width - inset {
+            return None;
+        }
+        let footer_left = left + inset;
+        let footer_width = (width - inset * 2.0).max(0.0);
+        let (picker_left, picker_right, settings_left) =
+            self.sidebar_footer_zones(footer_left, footer_width, row_height, pt);
+        if x >= settings_left {
+            Some(2)
+        } else if x >= picker_right {
+            // The stretch between the split's dropdown and settings is
+            // just floor: a click there chose neither and does nothing.
+            None
+        } else if x >= picker_left {
+            Some(1)
+        } else {
+            Some(0)
+        }
+    }
+
+    /// Where the footer's three controls sit: `(picker_left, picker_right,
+    /// settings_left)`.
+    ///
+    /// The shell picker rides the trailing edge of the new-session label --
+    /// a split button, the way a browser's new-tab button carries its
+    /// dropdown -- rather than being parked across the row next to settings,
+    /// where it read as a control nobody could name. One function for both
+    /// hit-testing and drawing, so the two cannot drift apart.
+    fn sidebar_footer_zones(
+        &mut self,
+        footer_left: f32,
+        footer_width: f32,
+        row_height: f32,
+        pt: f32,
+    ) -> (f32, f32, f32) {
+        use unterm_services::i18n::t;
+        let square = crate::sidebar::footer_mark_width(row_height);
+        let settings_text = format!("\u{EB51}  {}", t("sidebar.settings"));
+        let settings_width = (self.chrome_width(&settings_text) + 16.0 * pt)
+            .round()
+            .max(square)
+            .min((footer_width * 0.42).max(square));
+        let settings_left = (footer_left + footer_width - settings_width)
+            .max(footer_left + square * 2.0);
+        let gap = (6.0 * pt).round();
+        let split_right = (settings_left - gap).max(footer_left + square);
+        let picker_left = (split_right - square).max(footer_left);
+        (picker_left, split_right, settings_left)
+    }
+
+    /// A press on the tab strip. Returns true when the strip took it.
+    ///
+    /// A tab row goes there; a project header folds or unfolds. Folding is what
+    /// makes the strip usable with ten projects open, and it is the header's
+    /// only job -- there is nothing else to press on it.
+    fn click_sidebar(&mut self) -> bool {
+        if let Some(action) = self.sidebar_footer_action_at(self.window.pointer.0, self.window.pointer.1) {
+            match action {
+                0 => self.new_tab(),
+                1 => self.open_shell_selector(),
+                2 => self.open_settings(),
+                _ => unreachable!(),
+            }
+            self.window.drawn_revision = None;
+            return true;
+        }
+        let Some(at) = self.sidebar_row_at(self.window.pointer.0, self.window.pointer.1) else {
+            return false;
+        };
+        let Some(row) = self.sidebar_rows().get(at).cloned() else {
+            return false;
+        };
+        match row {
+            crate::sidebar::Row::Tab { index, .. } => {
+                // The second press on the same row, nearby and soon enough,
+                // asks for a name; the first one focuses the tab as always.
+                let click = match self.window.last_sidebar_click.take() {
+                    Some(previous) => previous.again(at, self.window.pointer.0, self.window.pointer.1),
+                    None => crate::sidebar::RowClick::first(at, self.window.pointer.0, self.window.pointer.1),
+                };
+                let renames = click.streak() >= 2;
+                self.window.last_sidebar_click = Some(click);
+                if renames {
+                    self.open_tab_rename(index);
+                } else {
+                    self.select_tab_at(index);
+                    // Keep holding to carry the tab to a new place in the
+                    // strip; letting go before moving is just the click.
+                    self.window.dragging_tab =
+                        self.window.tabs.tab_ids().get(index).copied().map(|tab_id| TabDrag {
+                            tab_id,
+                            origin: self.window.pointer,
+                            engaged: false,
+                        });
+                }
+            }
+            crate::sidebar::Row::Group { key, .. } => {
+                // The arrow folds the project; its name goes to it. The same
+                // split the file tree makes, for the same reason -- and here
+                // it is the difference between a click that does something
+                // and one that does not.
+                //
+                // Folding on any press meant a project row was the one row in
+                // the strip a click could not reach anything from. With one
+                // tab to a project, which is the common shape, pressing the
+                // name folded the tab being aimed at out of sight and
+                // pressing again put it back: two presses, nothing moved.
+                // That is what "sometimes the tab will not switch" was, and
+                // the presses are in `open.log` -- a run of them on one row,
+                // a second apart, then one on the row below that switched at
+                // once.
+                let arrow_zone = self.chrome_row_height();
+                // The rail has no arrow: a project there is a rule, or the
+                // folder of a folded one, and pressing it goes to it.
+                let on_arrow = !self.sidebar_on_rail()
+                    && self
+                    .sidebar_dock()
+                    .is_some_and(|(left, _, _, _, _)| self.window.pointer.0 < left + arrow_zone);
+                if on_arrow {
+                    if !self.window.sidebar_collapsed.remove(&key) {
+                        self.window.sidebar_collapsed.insert(key);
+                    }
+                } else {
+                    // Unfolded first: a project that is folded has no tab row
+                    // to find, and going to it is what was asked for.
+                    self.window.sidebar_collapsed.remove(&key);
+                    let rows = self.sidebar_rows();
+                    if let Some(index) = crate::sidebar::tab_at_or_after(&rows, at) {
+                        self.select_tab_at(index);
+                    }
+                }
+            }
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// A same-row double-click on the strip: ask for the tab's name on the
+    /// palette line. Enter applies it, an empty line hands the tab back to
+    /// automatic titling, Esc leaves the name alone. Deliberate by
+    /// construction — reached only through `RowClick`'s same-row streak, never
+    /// from switching tabs quickly.
+    fn open_tab_rename(&mut self, index: usize) {
+        let Some(tab_id) = self.window.tabs.tab_ids().get(index).copied() else {
+            return;
+        };
+        let mut palette = crate::palette::Palette::writing(vec![crate::palette::Entry {
+            label: "Rename tab".to_string(),
+            hint: "Enter applies · empty line resets to auto-title · Esc cancels".to_string(),
+            command: crate::palette::Command::RenameTab { tab_id },
+        }]);
+        palette.query = self.window.tab_titles.get(&tab_id).cloned().unwrap_or_default();
+        self.window.palette = Some(palette);
+    }
+
+    /// Draw the tab strip: projects, their tabs, and the row of actions under
+    /// them.
+    ///
+    /// The strip *is* the tab bar -- the top bar carries none. A vertical list
+    /// reads a tab better than a horizontal one: a tab is identified by a
+    /// project and a command, which fit along a row rather than across one.
+    fn append_sidebar(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some((left, top, width, height, _row_height)) = self.sidebar_dock() else {
+            return;
+        };
+        let pt = crate::chrome_font::point(self.window.scale);
+        let inset = crate::ui_tokens::CHROME_PANEL_INSET * pt;
+        let radius = crate::ui_tokens::CORNER_RADIUS * pt;
+        let chrome = self.chrome();
+        let foreground = self.chrome_foreground();
+
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left,
+            top,
+            width,
+            height,
+            color: self.frame_surface(chrome.surface),
+        });
+        // The seam, so the strip and the terminal read as two surfaces of one
+        // window rather than one surface that changed colour.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: left + width - 1.0,
+            top,
+            width: 1.0,
+            height,
+            color: chrome.outer_edge,
+        });
+
+        // The bottom row is reserved for the actions, so the list never
+        // draws under them even when it fills the strip.
+        let footer_height = self.sidebar_footer_height();
+        let footer_reserve = top + height - footer_height;
+        let rows = self.sidebar_rows();
+        let first_row = top + crate::ui_tokens::CHROME_SECTION_GAP * pt;
+        let visible = self.sidebar_visible_rows().unwrap_or(1);
+
+        // Follow the selection when it moves. A strip longer than the window
+        // that stays put while tabs are switched shows a list with nothing
+        // selected in it; one that snaps back on every frame will not let
+        // the wheel look anywhere else. And the answer is kept: the clicks
+        // and the rail's tooltips read the saved scroll, and a painter that
+        // scrolled only for itself had them naming the wrong row.
+        let mut scroll = self.window.sidebar_scroll;
+        let active = rows
+            .iter()
+            .position(|row| matches!(row, crate::sidebar::Row::Tab { active: true, .. }));
+        if active != self.window.sidebar_followed {
+            if let Some(active) = active {
+                let extents: Vec<f32> = rows.iter().map(|row| self.sidebar_row_extent(row)).collect();
+                scroll = crate::sidebar::scroll_to_show_extents(
+                    scroll,
+                    active,
+                    &extents,
+                    footer_reserve - first_row,
+                );
+            }
+            self.window.sidebar_followed = active;
+        }
+        let scroll = crate::sidebar::clamp_scroll(scroll, rows.len(), visible);
+        self.window.sidebar_scroll = scroll;
+        // The actions are pinned to the bottom edge: controls that
+        // wander with the list length have to be found again every
+        // time one is added.
+        let footer_top = footer_reserve;
+
+        // A list longer than the strip says so, the way Fluent's scroll
+        // views do: no track, a hairline thumb at rest that thickens and
+        // darkens while the pointer is over the strip. A full-strength
+        // track and thumb down the edge was the brightest stripe in the
+        // window, standing beside a list with nothing to scroll.
+        if rows.len() > visible {
+            let over = self.window.pointer.0 >= left
+                && self.window.pointer.0 < left + width
+                && self.window.pointer.1 >= top
+                && self.window.pointer.1 < top + height;
+            let full = (crate::ui_tokens::CHROME_SCROLLBAR_WIDTH * pt)
+                .max(crate::ui_tokens::CHROME_SCROLLBAR_MIN_WIDTH);
+            let bar = if over { full } else { (full * 0.4).round().max(2.0) };
+            let track_left = left + width - full + (full - bar) / 2.0 - 2.0 * pt;
+            let track_height = footer_reserve - first_row;
+            let span = visible as f32 / rows.len() as f32;
+            let thumb_height =
+                (track_height * span).max(crate::ui_tokens::CHROME_SCROLLBAR_MIN_THUMB_HEIGHT * pt);
+            let travel = track_height - thumb_height;
+            let progress = scroll as f32 / (rows.len() - visible) as f32;
+            let mut thumb = chrome.dim_text;
+            thumb[3] *= if over { 0.45 } else { 0.22 };
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                track_left.round(),
+                (first_row + travel * progress).round(),
+                bar,
+                thumb_height.round(),
+                bar / 2.0,
+                thumb,
+            ));
+        }
+
+        // A working agent's row turns a quarter-circle spinner. Same
+        // repaint discipline as the breath it replaces: the paint
+        // records which quantised phase it drew, and the idle tick
+        // asks for a frame only when that phase has moved on.
+        let spin_step = rows
+            .iter()
+            .any(|row| {
+                matches!(
+                    row,
+                    crate::sidebar::Row::Tab {
+                        badge: Some(crate::cockpit::Badge::Working),
+                        ..
+                    }
+                )
+            })
+            .then(|| {
+                let elapsed = unterm_services::cockpit::status::breath_epoch()
+                    .elapsed()
+                    .as_millis() as u64;
+                crate::sidebar::spin_step(elapsed)
+            });
+        self.window.drawn_breath_step = spin_step;
+        let spin = spin_step.unwrap_or(0);
+
+        let content_left = left + inset;
+        let content_width = width - inset * 2.0;
+
+        let on_rail = self.sidebar_on_rail();
+        let project_colors = self.window.sidebar_hues.colors(&rows, chrome.is_light);
+        for (index, row_top, row_height) in self.sidebar_layout(&rows, scroll, first_row, footer_reserve) {
+            let row = &rows[index];
+            if on_rail {
+                self.append_sidebar_rail_row(row, &project_colors, left, width, row_top, row_height, spin, quads);
+                continue;
+            }
+            match row {
+                crate::sidebar::Row::Group {
+                    key,
+                    label,
+                    hint,
+                    collapsed,
+                    active,
+                    ..
+                } => {
+                    // A project header is wayfinding: the fold arrow, the
+                    // folder and the name, in a quieter voice than the rows
+                    // it organises, sitting low in its row so it reads as
+                    // the heading of what follows. No count: the rows are
+                    // right there to be counted, and the grey pill beside
+                    // every header was the heaviest thing in the strip.
+                    let line = self.window.chrome_font.metrics().height;
+                    // Low in its row: the air above separates projects, and
+                    // the header sits close to the tabs it names.
+                    let text_top = (row_top + row_height - line - 3.0 * pt
+                        + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                        .max(row_top);
+                    let mut pen = content_left + 4.0 * pt;
+                    let arrow = if *collapsed {
+                        crate::sidebar::CLOSED
+                    } else {
+                        crate::sidebar::OPEN
+                    };
+                    pen = self.append_chrome(&arrow.to_string(), chrome.dim_text, (pen, text_top), quads);
+                    pen += 3.0 * pt;
+                    // In the project's own colour, the one its square wears
+                    // on the rail, so the two views name a project alike.
+                    let mut folder = project_colors.get(key).copied().unwrap_or(chrome.dim_text);
+                    if !*active {
+                        folder[3] = 0.6;
+                    }
+                    pen = self.append_chrome(
+                        &crate::sidebar::FOLDER.to_string(),
+                        folder,
+                        (pen, text_top),
+                        quads,
+                    );
+                    pen += 6.0 * pt;
+                    let right = content_left + content_width - 4.0 * pt;
+                    if let Some(hint) = hint {
+                        let shown = self.chrome_fit(&format!("{hint}/"), right - pen);
+                        pen = self.append_chrome(&shown, chrome.dim_text, (pen, text_top), quads);
+                    }
+                    let mut faint = chrome.dim_text;
+                    faint[3] *= if *active { 0.85 } else { 0.65 };
+                    let shown = self.chrome_fit(label, right - pen);
+                    self.append_chrome(&shown, faint, (pen, text_top), quads);
+                }
+                crate::sidebar::Row::Tab {
+                    label,
+                    subtitle,
+                    detail,
+                    active,
+                    icon,
+                    grouped,
+                    badge,
+                    indicators,
+                    ..
+                } => {
+                    // Children sit under their header, so tabs and projects
+                    // read as parent and child rather than as peers.
+                    let indent = if *grouped { 8.0 * pt } else { 0.0 };
+                    let row_left = content_left + indent;
+                    let row_width = (content_width - indent).max(1.0);
+                    let gap = (1.0 * pt).round();
+                    let tile_top = row_top + gap;
+                    let tile_height = (row_height - gap * 2.0).max(1.0);
+
+                    // The tab in front, the way Windows 11 marks the page in
+                    // front of a navigation pane: a quiet fill and the accent
+                    // pill at its leading edge. The solid card it used to be
+                    // was the heaviest shape in the window, and it said
+                    // "selected" no louder than the pill does.
+                    let hovered = self.window.pointer.0 >= row_left
+                        && self.window.pointer.0 < row_left + row_width
+                        && self.window.pointer.1 >= tile_top
+                        && self.window.pointer.1 < tile_top + tile_height;
+                    if *active || hovered {
+                        if *active {
+                            quads.backgrounds.extend(unterm_render::rounded::panel(
+                                row_left - 1.0,
+                                tile_top - 1.0,
+                                row_width + 2.0,
+                                tile_height + 2.0,
+                                radius + 1.0,
+                                chrome.selected_outline,
+                            ));
+                        }
+                        quads.backgrounds.extend(unterm_render::rounded::panel(
+                            row_left,
+                            tile_top,
+                            row_width,
+                            tile_height,
+                            radius,
+                            self.sidebar_selection_fill(*active),
+                        ));
+                    }
+                    if *active {
+                        self.append_selection_pill(row_left, tile_top, tile_height, quads);
+                    }
+
+                    let line = self.window.chrome_font.metrics().height;
+                    let nudge = crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt;
+                    let line_gap = (1.5 * pt).round();
+                    let (first_top, second_top) = if subtitle.is_some() {
+                        let block = line * 2.0 + line_gap;
+                        let first = (tile_top + (tile_height - block) / 2.0 + nudge).max(tile_top);
+                        (first, Some(first + line + line_gap))
+                    } else {
+                        ((tile_top + (tile_height - line) / 2.0 + nudge).max(tile_top), None)
+                    };
+
+                    let mut pen = row_left + 8.0 * pt;
+                    pen = self.append_chrome(
+                        &icon.to_string(),
+                        if *icon == crate::sidebar::ROBOT {
+                            chrome.focus_rail
+                        } else if *active {
+                            foreground
+                        } else {
+                            chrome.dim_text
+                        },
+                        (pen, first_top),
+                        quads,
+                    );
+                    pen += 7.0 * pt;
+                    let text_left = pen;
+
+                    // The row's one status mark, against the right edge of
+                    // the first line: a hand asks, a spinner works, a tick
+                    // finished, a triangle errored, a dot has unread output.
+                    let mut right = row_left + row_width - 8.0 * pt;
+                    let indicator: Option<(&str, [f32; 4])> = if let Some(badge) = badge {
+                        Some((badge.glyph(spin), badge.color()))
+                    } else if indicators.error {
+                        Some(("\u{25B2}", [0.95, 0.35, 0.35, 1.0]))
+                    } else if indicators.unread {
+                        Some(("\u{2022}", crate::cockpit::Badge::NeedsYou.color()))
+                    } else {
+                        None
+                    };
+                    if let Some((glyph, color)) = indicator {
+                        let wide = self.chrome_width(glyph);
+                        right -= wide;
+                        self.append_chrome(glyph, color, (right, first_top), quads);
+                        right -= 6.0 * pt;
+                    }
+                    // `OSC 9;4` progress: a hairline along the foot of the
+                    // row, the way a taskbar button carries it. A build in a
+                    // background tab can be watched without going to it.
+                    if let Some(progress) = indicators.progress {
+                        let (fill, color) = crate::sidebar::progress_bar(progress);
+                        let track_left = row_left + 8.0 * pt;
+                        let track_width = (row_width - 16.0 * pt).max(1.0);
+                        let thickness = (2.0 * pt).round().max(1.0);
+                        let top = tile_top + tile_height - thickness - (2.0 * pt).round();
+                        let mut track = color;
+                        track[3] *= 0.25;
+                        quads.backgrounds.extend(unterm_render::rounded::panel(
+                            track_left, top, track_width, thickness, thickness / 2.0, track,
+                        ));
+                        let width = (track_width * fill).max(thickness);
+                        quads.backgrounds.extend(unterm_render::rounded::panel(
+                            track_left, top, width, thickness, thickness / 2.0, color,
+                        ));
+                    }
+                    // The command beside the label only when it is not the
+                    // shell repeating itself.
+                    let text = match detail {
+                        Some(detail)
+                            if !crate::sidebar::same_program(detail, label)
+                                && !is_a_shell(detail)
+                                && subtitle.is_none() =>
+                        {
+                            format!("{label}  {detail}")
+                        }
+                        _ => label.clone(),
+                    };
+                    let shown = self.chrome_fit(&text, right - text_left);
+                    let mut title_color = foreground;
+                    if !*active {
+                        title_color[3] *= 0.86;
+                    }
+                    self.append_chrome(&shown, title_color, (text_left, first_top), quads);
+
+                    if let (Some(subtitle), Some(second_top)) = (subtitle, second_top) {
+                        let mut quiet = chrome.dim_text;
+                        quiet[3] *= 0.8;
+                        let shown = self.fit_subtitle(subtitle, row_left + row_width - 8.0 * pt - text_left);
+                        self.append_chrome(&shown, quiet, (text_left, second_top), quads);
+                    }
+                }
+            }
+        }
+
+        // Two full-width actions pinned to the bottom: new session
+        // (with the shell picker on its trailing split, the way a
+        // browser's new-tab button carries its dropdown) and settings.
+        // The tab navigator moved into the chevron menu and the
+        // palette — relocated, never dropped.
+        if on_rail {
+            self.append_sidebar_rail_footer(left, width, footer_top, footer_height, quads);
+            return;
+        }
+        use unterm_services::i18n::t;
+        // The footer is one chrome line, not a two-line list row.
+        let row_height = footer_height;
+        let text_offset = ((row_height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+            .max(0.0);
+        let footer_left = left + inset;
+        let footer_width = (width - inset * 2.0).max(0.0);
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: footer_left,
+            top: footer_top,
+            width: footer_width,
+            height: 1.0,
+            color: chrome.inner_highlight,
+        });
+        let hovered = self.sidebar_footer_action_at(self.window.pointer.0, self.window.pointer.1);
+        let square = crate::sidebar::footer_mark_width(row_height);
+        let (picker_left, picker_right, settings_left) =
+            self.sidebar_footer_zones(footer_left, footer_width, row_height, pt);
+        let main_width = (picker_left - footer_left).max(1.0);
+        let split_width = (picker_right - footer_left).max(1.0);
+        let settings_width = (footer_left + footer_width - settings_left).max(square);
+        let pill_top = footer_top + 2.0 * pt;
+        let pill_h = (row_height - 4.0 * pt).max(1.0);
+        let ink = |on: bool| if on { foreground } else { chrome.dim_text };
+
+        // Left capsule: [+ 新建会话 | ▾]
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            footer_left - 1.0,
+            pill_top - 1.0,
+            split_width + 2.0,
+            pill_h + 2.0,
+            radius + 1.0,
+            chrome.selected_outline,
+        ));
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            footer_left,
+            pill_top,
+            split_width,
+            pill_h,
+            radius,
+            chrome.group_bg,
+        ));
+        if hovered == Some(0) {
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                footer_left,
+                pill_top,
+                main_width,
+                pill_h,
+                radius,
+                chrome.hover_bg,
+            ));
+        }
+        if hovered == Some(1) {
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                picker_left,
+                pill_top,
+                square,
+                pill_h,
+                radius,
+                chrome.hover_bg,
+            ));
+        }
+        // Subtle 1px divider between "+ 新建会话" and "▾"
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: picker_left,
+            top: pill_top + 4.0 * pt,
+            width: 1.0,
+            height: (pill_h - 8.0 * pt).max(1.0),
+            color: chrome.selected_outline,
+        });
+
+        // Right capsule: [⚙ 设置]
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            settings_left - 1.0,
+            pill_top - 1.0,
+            settings_width + 2.0,
+            pill_h + 2.0,
+            radius + 1.0,
+            chrome.selected_outline,
+        ));
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            settings_left,
+            pill_top,
+            settings_width,
+            pill_h,
+            radius,
+            if hovered == Some(2) {
+                chrome.hover_bg
+            } else {
+                chrome.group_bg
+            },
+        ));
+
+        let mut pen = footer_left + 8.0 * pt;
+        pen = self.append_chrome(
+            "+",
+            ink(hovered == Some(0)),
+            (pen, footer_top + text_offset),
+            quads,
+        );
+        pen += 5.0 * pt;
+        let new_label = self.chrome_fit(
+            &t("sidebar.new_session"),
+            (picker_left - pen - 5.0 * pt).max(0.0),
+        );
+        self.append_chrome(
+            &new_label,
+            ink(hovered == Some(0)),
+            (pen, footer_top + text_offset),
+            quads,
+        );
+        let wide = self.chrome_width("\u{25BE}");
+        let mut picker_ink = ink(hovered == Some(1));
+        if hovered != Some(1) {
+            picker_ink[3] *= 0.78;
+        }
+        self.append_chrome(
+            "\u{25BE}",
+            picker_ink,
+            (
+                picker_left + ((square - wide) / 2.0).max(0.0),
+                footer_top + text_offset + 1.0 * pt,
+            ),
+            quads,
+        );
+        let settings_label = format!("\u{EB51}  {}", t("sidebar.settings"));
+        let settings_fit = self.chrome_fit(&settings_label, (settings_width - 10.0 * pt).max(0.0));
+        let settings_text_w = self.chrome_width(&settings_fit);
+        self.append_chrome(
+            &settings_fit,
+            ink(hovered == Some(2)),
+            (
+                settings_left + ((settings_width - settings_text_w) / 2.0).max(4.0 * pt),
+                footer_top + text_offset,
+            ),
+            quads,
+        );
+    }
+
+    /// The line of facts about the pane in front, for the top bar.
+    ///
+    /// Everything in it comes from a cache that refreshes on another thread,
+    /// so this is cheap enough to call while painting -- which it has to be,
+    /// because the bar is repainted whenever anything moves.
+    ///
+    /// Empty on a narrow window: the actions are what the bar is for, and
+    /// pushing one off to make room for a memory figure is the wrong trade.
+    /// The bar itself drops the whole line if what is left does not hold it.
+    fn stats_line(&self, window_width: f32) -> String {
+        if window_width / self.window.scale.max(0.1) < crate::statsbar::MIN_WIDTH {
+            return String::new();
+        }
+        let Some(live) = self.window.state.as_ref() else {
+            return String::new();
+        };
+        crate::statsbar::compose(&crate::statsbar::facts_for(live.session_id).segments())
+    }
+
+    /// The bar as it is laid out right now.
+    ///
+    /// One place, so a piece is pressed where it is drawn. Measured through the
+    /// chrome's own face: a proportional label measured on the terminal's grid
+    /// puts every button somewhere other than where it looks.
+    fn top_bar(&mut self, window_width: f32) -> Vec<crate::topbar::Placed> {
+        let pt = self.chrome_pt();
+        let logical = window_width / self.window.scale.max(0.1);
+        let stats = self.stats_line(window_width);
+        let title = self.window.bar_title.clone();
+        // The tally: how many agents the Cockpit sees, and how many wait.
+        let cockpit = {
+            let statuses = unterm_services::cockpit::status::snapshot();
+            let waiting = crate::cockpit::attention_count(&statuses);
+            if statuses.is_empty() {
+                String::new()
+            } else if waiting > 0 {
+                format!("{} ✋{waiting}", statuses.len())
+            } else {
+                format!("{}", statuses.len())
+            }
+        };
+        let proxy = if unterm_services::i18n::current_locale().starts_with("zh") {
+            "代理".to_string()
+        } else {
+            "Proxy".to_string()
+        };
+        let open = self.window.tree.is_some();
+        // The measuring closure needs the fonts and the atlas, and so does the
+        // caller afterwards -- so they are taken apart for the call and put
+        // back by the borrow ending. The facts line alone is measured in the
+        // terminal face, because that is the face it is drawn in.
+        let (mono, ui, atlas) = (&mut self.window.font, &mut self.window.chrome_font, &mut self.window.atlas);
+        let mut measure = |text: &str| {
+            if !stats.is_empty() && text == stats {
+                crate::terminal::chrome_text_width(text, mono, atlas)
+            } else {
+                crate::terminal::chrome_text_width(text, ui, atlas)
+            }
+        };
+        crate::topbar::layout_with_proxy(
+            window_width,
+            logical,
+            pt,
+            &stats,
+            &cockpit,
+            &proxy,
+            &title,
+            open,
+            self.window.top_bar_quiet,
+            &mut measure,
+        )
+    }
+
+    /// Draw the bar along the top: the wordmark, the facts, the actions and the
+    /// window buttons. No tabs -- those are in the strip down the left.
+    fn append_top_bar(&mut self, window_width: f32, quads: &mut unterm_render::quads::FrameQuads) {
+        let height = self.top_bar_height();
+        let chrome = self.chrome();
+        let foreground = self.chrome_foreground();
+
+        // Opaque even over Mica. With the frame extended into the client
+        // area, DWM draws its own minimise/maximise/close there, and a
+        // transparent bar showed them through ours -- every button twice.
+        // The backdrop shows in the strip instead.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: 0.0,
+            top: 0.0,
+            width: window_width,
+            height,
+            color: chrome.surface,
+        });
+        // A hairline under it, so the bar and the terminal read as two surfaces
+        // of one window rather than one surface with a seam.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: 0.0,
+            top: height - 1.0,
+            width: window_width,
+            height: 1.0,
+            color: chrome.outer_edge,
+        });
+
+        let bar = self.top_bar(window_width);
+        let hovered = self.hovered_top_bar_item();
+        let now = std::time::Instant::now();
+        let caption_hover = hovered.filter(|item| {
+            matches!(
+                item,
+                crate::topbar::Item::Minimise | crate::topbar::Item::Maximise | crate::topbar::Item::Close
+            )
+        });
+        if caption_hover != self.window.caption_hover {
+            if let Some(previous) = self.window.caption_hover {
+                self.window.caption_left = Some((previous, now));
+            }
+            self.window.caption_hover = caption_hover;
+            self.window.caption_hover_at = now;
+            self.window.animate_until = Some(now + std::time::Duration::from_millis(170));
+        }
+        let pt = self.chrome_pt();
+        let radius = crate::ui_tokens::CORNER_RADIUS * pt;
+        let text_top = ((height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::TOPBAR_TEXT_NUDGE * pt)
+            .max(0.0);
+
+        for piece in &bar {
+            let is_hovered = hovered == Some(piece.item);
+
+            // The window buttons, in this desktop's own style: see
+            // `window_buttons`. Hover fades in and out over 150ms, as Windows
+            // Terminal's do, and a background window's glyphs are dimmed.
+            let maximized = self.window.unmaximized_rect.is_some()
+                || self
+                    .window.state
+                    .as_ref()
+                    .is_some_and(|live| live.window.is_maximized());
+            if let Some(button) = crate::topbar::window_button(piece.item, maximized) {
+                let style = crate::window_buttons::style();
+                let scale = self.window.scale;
+                if piece.item == crate::topbar::Item::Maximise {
+                    // Where Snap Layouts should open, in client pixels.
+                    if let Some(live) = self.window.state.as_ref() {
+                        crate::win_chrome::set_maximise_button(
+                            &live.window,
+                            Some(crate::win_chrome::ButtonRect {
+                                left: piece.left.round() as i32,
+                                top: 0,
+                                width: piece.width.round() as i32,
+                                height: height.round() as i32,
+                            }),
+                        );
+                    }
+                }
+                let hover = if caption_hover == Some(piece.item) {
+                    crate::window_buttons::fade(now - self.window.caption_hover_at)
+                } else if let Some((left, at)) = self.window.caption_left {
+                    if left == piece.item {
+                        1.0 - crate::window_buttons::fade(now - at)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let pressed = piece.item == crate::topbar::Item::Maximise
+                    && self
+                        .window.state
+                        .as_ref()
+                        .is_some_and(|live| crate::win_chrome::maximise_pressed(&live.window));
+                let state = crate::window_buttons::State {
+                    hover,
+                    pressed,
+                    active: self.window.focused,
+                };
+                let mut fill = crate::window_buttons::fill(style, button, state, chrome.is_light);
+                if button != crate::window_buttons::Button::Close {
+                    if let Some(custom) = self.chrome_overrides.button_hover_background {
+                        fill = [custom[0], custom[1], custom[2], custom[3] * hover];
+                    }
+                }
+                match style {
+                    crate::window_buttons::Style::Fluent => {
+                        if fill[3] > 0.0 {
+                            quads.backgrounds.push(unterm_render::quads::Quad {
+                                left: piece.left,
+                                top: 0.0,
+                                width: piece.width,
+                                height,
+                                color: fill,
+                            });
+                        }
+                    }
+                    crate::window_buttons::Style::Adwaita => {
+                        let (x, y, d) = crate::window_buttons::adwaita_circle(
+                            piece.left, 0.0, piece.width, height, scale,
+                        );
+                        quads.backgrounds.extend(unterm_render::rounded::panel(x, y, d, d, d / 2.0, fill));
+                    }
+                }
+                let mut color = crate::window_buttons::glyph_color(style, button, state, chrome.is_light);
+                if !(button == crate::window_buttons::Button::Close && hover > 0.5) {
+                    let custom = if hover > 0.5 {
+                        self.chrome_overrides
+                            .button_hover_foreground
+                            .or(self.chrome_overrides.button_foreground)
+                    } else {
+                        self.chrome_overrides.button_foreground
+                    };
+                    if let Some(custom) = custom {
+                        color = [custom[0], custom[1], custom[2], custom[3] * color[3]];
+                    }
+                }
+                quads.backgrounds.extend(crate::window_buttons::glyph(
+                    style,
+                    button,
+                    piece.left,
+                    0.0,
+                    piece.width,
+                    height,
+                    scale,
+                    color,
+                ));
+                continue;
+            }
+
+            // An action under the pointer gets a rounded surface, inset from
+            // the bar's edges so it reads as a button rather than as a column.
+            if is_hovered
+                && !matches!(
+                    piece.item,
+                    crate::topbar::Item::Wordmark | crate::topbar::Item::Title
+                )
+            {
+                let inset = 3.0 * pt;
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left,
+                    inset,
+                    piece.width,
+                    height - inset * 2.0,
+                    radius,
+                    chrome.hover_bg,
+                ));
+            }
+
+            // The project toggle says whether it is on, the way a pressed
+            // button does: without it there is no way to tell the strip is
+            // hidden rather than empty.
+            if piece.item == crate::topbar::Item::Action(crate::keys::Action::TreeSidebar)
+                && self.window.tree.is_some()
+            {
+                let inset = 3.0 * pt;
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left,
+                    inset,
+                    piece.width,
+                    height - inset * 2.0,
+                    radius,
+                    chrome.selected_bg,
+                ));
+            }
+
+            // The cockpit tally is a pill even at rest — the window's
+            // one aggregate view of the agents — and it turns the
+            // waiting amber the moment any of them needs an answer.
+            let cockpit_waiting = piece.item == crate::topbar::Item::Cockpit
+                && crate::cockpit::attention_count(
+                    &unterm_services::cockpit::status::snapshot(),
+                ) > 0;
+            if piece.item == crate::topbar::Item::Cockpit && !piece.label.is_empty() {
+                let inset = 3.0 * pt;
+                let pill_h = height - inset * 2.0;
+                let pill_r = pill_h / 2.0;
+                let outline = if cockpit_waiting {
+                    let mut amber = crate::cockpit::Badge::NeedsYou.color();
+                    amber[3] = 0.36;
+                    amber
+                } else {
+                    chrome.selected_outline
+                };
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left - 1.0,
+                    inset - 1.0,
+                    piece.width + 2.0,
+                    pill_h + 2.0,
+                    pill_r + 1.0,
+                    outline,
+                ));
+                let mut fill = if cockpit_waiting {
+                    let mut amber = crate::cockpit::Badge::NeedsYou.color();
+                    amber[3] = 0.16;
+                    amber
+                } else {
+                    chrome.hover_bg
+                };
+                if is_hovered {
+                    fill[3] = (fill[3] + 0.10).min(1.0);
+                }
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left,
+                    inset,
+                    piece.width,
+                    pill_h,
+                    pill_r,
+                    fill,
+                ));
+            }
+
+            let proxy_on = piece.item == crate::topbar::Item::Proxy
+                && unterm_services::launch_env::unterm_proxy_enabled();
+            if piece.item == crate::topbar::Item::Proxy && !piece.label.is_empty() {
+                let inset = 3.0 * pt;
+                let pill_h = height - inset * 2.0;
+                let pill_r = pill_h / 2.0;
+                let outline = if proxy_on {
+                    chrome.status_ok_outline
+                } else {
+                    chrome.selected_outline
+                };
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left - 1.0,
+                    inset - 1.0,
+                    piece.width + 2.0,
+                    pill_h + 2.0,
+                    pill_r + 1.0,
+                    outline,
+                ));
+                let mut fill = if proxy_on {
+                    chrome.status_ok_bg
+                } else {
+                    chrome.hover_bg
+                };
+                if is_hovered {
+                    fill[3] = (fill[3] + 0.10).min(1.0);
+                }
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    piece.left,
+                    inset,
+                    piece.width,
+                    pill_h,
+                    pill_r,
+                    fill,
+                ));
+            }
+
+            let text = match (piece.icon, piece.label.is_empty()) {
+                (Some(icon), true) => icon.to_string(),
+                (Some(icon), false) => format!("{icon}  {}", piece.label),
+                (None, _) => piece.label.clone(),
+            };
+            // The wordmark may be the mark alone (Fluent), which has no text
+            // and is still drawn.
+            if text.trim().is_empty() && piece.item != crate::topbar::Item::Wordmark {
+                continue;
+            }
+            if piece.item == crate::topbar::Item::Stats {
+                // 0.57.4 set the facts line in the terminal face, tinted
+                // toward the accent: data against the grid it describes, not
+                // another label in the UI face.
+                let accent = chrome.focus_rail;
+                let tinted = [
+                    foreground[0] + (accent[0] - foreground[0]) * 0.45,
+                    foreground[1] + (accent[1] - foreground[1]) * 0.45,
+                    foreground[2] + (accent[2] - foreground[2]) * 0.45,
+                    1.0,
+                ];
+                let mono_top = ((height - self.window.font.metrics().height) / 2.0
+                    + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                    .max(0.0);
+                self.append_mono(&text, tinted, (piece.left, mono_top), quads);
+                continue;
+            }
+            let color = match piece.item {
+                // The facts about a pane are context, not the thing being
+                // read. The wordmark carries the brand at the bar's own
+                // full strength, as 0.57.4 set it.
+                crate::topbar::Item::Wordmark => foreground,
+                crate::topbar::Item::Stats => chrome.dim_text,
+                // The title is context, not a label to read first: it
+                // sits below the brand and the tally in the bar's own
+                // order of voices.
+                crate::topbar::Item::Title => {
+                    let mut quiet = chrome.dim_text;
+                    // On Windows it is the title bar's title, beside the icon,
+                    // and Fluent sets that in secondary text; centred on macOS
+                    // and GNOME it is a quieter subtitle.
+                    if crate::topbar::native_traffic_lights()
+                        || crate::window_buttons::style() != crate::window_buttons::Style::Fluent
+                    {
+                        quiet[3] *= 0.66;
+                    }
+                    quiet
+                }
+                crate::topbar::Item::Cockpit if cockpit_waiting => {
+                    crate::cockpit::Badge::NeedsYou.color()
+                }
+                crate::topbar::Item::Proxy if proxy_on => chrome.status_ok,
+                _ if is_hovered => foreground,
+                _ => chrome.dim_text,
+            };
+            if piece.item == crate::topbar::Item::Wordmark {
+                // The icon's mark, in the icon's two colours — the
+                // prompt chevron in the chrome's foreground, the status
+                // dot in the icon's amber. Same geometry the installer
+                // and taskbar icons are generated from.
+                let cell_width = self.chrome_width("M");
+                let em = crate::ui_tokens::UI_FONT_SIZE as f32 * pt;
+                let mark_height = (em * 0.95).round().max(8.0);
+                let mark_width = (mark_height * crate::brand::ASPECT).round().max(8.0);
+                let mark_top = ((height - mark_height) / 2.0).max(0.0);
+                let key_for = |part: u32| unterm_render::atlas::GlyphKey {
+                    stack: crate::chrome_font::STACK,
+                    face: usize::MAX,
+                    glyph_index: u32::MAX - part,
+                    pixel_size: mark_height as u32,
+                };
+                if self.window.atlas.get(key_for(0)).is_none() {
+                    let mark =
+                        crate::brand::rasterize(mark_width as usize, mark_height as usize);
+                    self.window.atlas.insert(key_for(0), &mark.chevron);
+                    self.window.atlas.insert(key_for(1), &mark.dot);
+                }
+                for (part, tint) in [
+                    (0, foreground),
+                    (1, crate::brand::DOT_COLOR),
+                ] {
+                    if let Some(slot) = self.window.atlas.get(key_for(part)) {
+                        quads.glyphs.push(unterm_render::quads::glyph_quad(
+                            slot,
+                            piece.left,
+                            mark_top + mark_height,
+                            tint,
+                            &self.window.atlas,
+                        ));
+                    }
+                }
+                self.append_chrome(
+                    &text,
+                    color,
+                    (piece.left + cell_width * (0.95 + 0.42), text_top),
+                    quads,
+                );
+                continue;
+            }
+            // Icons are centred in their button; text starts where it was put.
+            let left = if piece.icon.is_some() {
+                let wide = self.chrome_width(&text);
+                piece.left + ((piece.width - wide) / 2.0).max(0.0)
+            } else {
+                piece.left
+            };
+            self.append_chrome(&text, color, (left, text_top), quads);
+        }
+    }
+
+    /// The name of whatever the pointer is resting on, if it has one to give.
+    ///
+    /// Only the icons with no words beside them: a button that says what it
+    /// does needs no second chance to say it.
+    fn append_tooltip(&mut self, window_width: f32, quads: &mut unterm_render::quads::FrameQuads) {
+        if self.window.pointer.1 >= self.top_bar_height() {
+            return;
+        }
+        let bar = self.top_bar(window_width);
+        let Some(piece) = bar
+            .iter()
+            .find(|piece| piece.contains(self.window.pointer.0))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(tooltip) = piece.tooltip.filter(|text| !text.trim().is_empty()) else {
+            return;
+        };
+
+        let pt = self.chrome_pt();
+        let chrome = self.chrome();
+        let wide = self.chrome_width(&tooltip);
+        let pad = 6.0 * pt;
+        let width = wide + pad * 2.0;
+        let height = self.chrome_row_height();
+        // Under the button it names, and never off the right edge.
+        let left = (piece.left + piece.width / 2.0 - width / 2.0)
+            .clamp(0.0, (window_width - width).max(0.0));
+        let top = self.top_bar_height() + 2.0 * pt;
+
+        // Over everything: a tooltip behind the text it explains is no help.
+        let mark = quads.mark();
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left,
+            top,
+            width,
+            height,
+            crate::ui_tokens::CORNER_RADIUS * pt,
+            chrome.group_bg,
+        ));
+        let text_top = ((height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+            .max(0.0);
+        let color = self.window.colors.foreground;
+        self.append_chrome(&tooltip, color, (left + pad, top + text_top), quads);
+        quads.raise_since(mark);
+    }
+
+    /// A press on the top bar. Returns true when the bar took it.
+    ///
+    /// The empty parts drag the window, which is the first thing anyone tries
+    /// on a window with no title bar -- and the last thing they find missing.
+    fn click_top_bar(&mut self) -> bool {
+        if self.window.pointer.1 >= self.top_bar_height() {
+            return false;
+        }
+        // What is a handle is the bar's own question to answer -- the same
+        // list that decided where things were drawn. Deciding it again here
+        // is how a piece comes to be drawn in one place and grabbed in
+        // another.
+        if self.pointer_is_on_a_drag_handle() {
+            // The second press on the same spot toggles maximise, the way
+            // every title bar has always answered a double-click.
+            let click = match self.window.last_topbar_click.take() {
+                Some(previous) => previous.again(0, self.window.pointer.0, self.window.pointer.1),
+                None => crate::sidebar::RowClick::first(0, self.window.pointer.0, self.window.pointer.1),
+            };
+            let toggles = click.streak() >= 2;
+            self.window.last_topbar_click = Some(click);
+            if toggles {
+                self.toggle_maximize();
+            } else if let Some(live) = self.window.state.as_ref() {
+                let _ = live.window.drag_window();
+            }
+            return true;
+        }
+        let Some(item) = self.hovered_top_bar_item() else {
+            return true;
+        };
+
+        match item {
+            // These are handles, and were taken above.
+            crate::topbar::Item::Wordmark | crate::topbar::Item::Title => {}
+            crate::topbar::Item::Cockpit => {
+                if self.window.inbox_open {
+                    self.window.inbox_open = false;
+                } else if self.inbox_rows().is_empty() {
+                    self.open_console();
+                } else {
+                    self.window.inbox_open = true;
+                    self.window.inbox_selected = 0;
+                }
+                self.window.drawn_revision = None;
+            }
+            // The pane facts begin with the running shell. In 0.57.4 that
+            // shell identity was an entry point to the shell selector; making
+            // it a drag handle in the new chrome removed the visible picker.
+            crate::topbar::Item::Stats => self.open_shell_selector(),
+            crate::topbar::Item::Proxy => {
+                self.toggle_proxy();
+                self.window.drawn_revision = None;
+            }
+            crate::topbar::Item::Menu => self.open_quick_menu(),
+            crate::topbar::Item::Action(action) => {
+                if let Some(live) = self.window.state.as_ref() {
+                    let session_id = live.session_id;
+                    self.run_key_action(action, session_id);
+                }
+            }
+            crate::topbar::Item::Minimise => {
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.set_minimized(true);
+                }
+            }
+            crate::topbar::Item::Maximise => {
+                self.toggle_maximize();
+            }
+            crate::topbar::Item::Close => self.close_pressed(),
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// The bar as it is drawn right now, and which column the pointer is in.
+    ///
+    /// One place, so what is hit is always what was drawn.
+    /// Which piece of the top bar the pointer is over.
+    /// Hover is drawn from where the pointer is when a frame is painted, and
+    /// nothing else paints a quiet window -- so a pointer moving onto a
+    /// button, or off it, asks for one frame, and only then.
+    fn refresh_pointer_target(&mut self) {
+        let (x, y) = self.window.pointer;
+        let target = (
+            self.hovered_top_bar_item(),
+            if y >= 0.0 { self.sidebar_row_at(x, y) } else { None },
+            if y >= 0.0 {
+                self.sidebar_footer_action_at(x, y)
+            } else {
+                None
+            },
+            if y >= 0.0 {
+                self.status_bar_segment_at_pointer()
+            } else {
+                None
+            },
+        );
+        if target == self.window.pointer_target {
+            return;
+        }
+        self.window.pointer_target = target;
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    fn hovered_top_bar_item(&mut self) -> Option<crate::topbar::Item> {
+        // Over a maximise button that answers Snap Layouts, Windows sends the
+        // window non-client messages instead of the moves winit reports; the
+        // window procedure records the hover for us.
+        if self
+            .window.state
+            .as_ref()
+            .is_some_and(|live| crate::win_chrome::maximise_hovered(&live.window))
+        {
+            return Some(crate::topbar::Item::Maximise);
+        }
+        if self.window.pointer.1 >= self.top_bar_height() {
+            return None;
+        }
+        let width = self.window.state.as_ref()?.width as f32;
+        let bar = self.top_bar(width);
+        crate::topbar::hit(&bar, self.window.pointer.0)
+    }
+
+    /// Whether a press here should drag the window rather than do something.
+    fn pointer_is_on_a_drag_handle(&mut self) -> bool {
+        if self.window.pointer.1 >= self.top_bar_height() {
+            return false;
+        }
+        let Some(width) = self.window.state.as_ref().map(|live| live.width as f32) else {
+            return false;
+        };
+        let bar = self.top_bar(width);
+        crate::topbar::is_drag_handle(&bar, self.window.pointer.0)
+    }
+
+    fn append_scrollbar(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        if !self.scrollbar_enabled {
+            return;
+        }
+        let Some((session_id, left, track_top, track)) = self.active_pane_scrollbar() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(session_id) else {
+            return;
+        };
+
+        let total = snapshot.scrollback_rows + snapshot.rows;
+        let top_row = snapshot
+            .lines
+            .first()
+            .map(|line| line.row.max(0) as usize)
+            .unwrap_or(0);
+        let Some(thumb) = crate::scrollbar::thumb(total, snapshot.rows, top_row, track) else {
+            return;
+        };
+
+        // An overlay, not a gutter: no track, a thin thumb that is there
+        // while it has something to say -- the view is back in history, the
+        // pointer is at the edge to grab it, or it just moved -- and fades
+        // away once it stops. A bar standing beside every pane at rest was
+        // one more stripe of chrome around text that already had edges.
+        let now = std::time::Instant::now();
+        let seen = (session_id, top_row);
+        if self.window.scroll_seen.is_some_and(|previous| previous.0 == session_id && previous.1 != top_row) {
+            self.window.scrolled_at = Some(now);
+        }
+        self.window.scroll_seen = Some(seen);
+        let scale = self.window.scale.max(0.5);
+        let in_history = top_row + snapshot.rows < total;
+        let near = self.window.pointer.0 >= left - 12.0 * scale
+            && self.window.pointer.0 < left + crate::scrollbar::WIDTH + 4.0 * scale
+            && self.window.pointer.1 >= track_top
+            && self.window.pointer.1 < track_top + track;
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(900);
+        let fade = std::time::Duration::from_millis(crate::ui_tokens::MOTION_SLOW_MS);
+        let recent = self.window.scrolled_at.map_or(0.0, |at| {
+            let since = now.saturating_duration_since(at);
+            if since <= HOLD {
+                1.0
+            } else {
+                1.0 - ((since - HOLD).as_secs_f32() / fade.as_secs_f32()).min(1.0)
+            }
+        });
+        let visibility = if in_history || near { 1.0 } else { recent };
+        if recent > 0.0 && recent < 1.0 || (recent == 1.0 && !in_history && !near) {
+            self.window.animate_until = Some(now + std::time::Duration::from_millis(40));
+        }
+        if visibility <= 0.0 {
+            return;
+        }
+        let width = if near {
+            crate::scrollbar::WIDTH
+        } else {
+            (4.0 * scale).round().max(2.0)
+        };
+        let inset = ((crate::scrollbar::WIDTH - width) / 2.0).max(0.0);
+        let mut color = self.theme().scrollbar;
+        color[3] *= 0.85 * visibility;
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left + inset,
+            track_top + thumb.top,
+            width,
+            thumb.height,
+            width / 2.0,
+            color,
+        ));
+    }
+
+    /// The visual bell, as `visual_bell` configures it: a flash that rises
+    /// and falls on the config's own curves, over the whole background or
+    /// over just the cursor's cell.
+    fn append_bell_flash(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(rung_at) = self.window.bell_at else {
+            return;
+        };
+        let Some(intensity) = self.visual_bell.intensity_at(rung_at.elapsed().as_millis()) else {
+            // The fade is over; stop asking for frames on its behalf.
+            self.window.bell_at = None;
+            return;
+        };
+        // The previous front end coloured the flash with the palette's
+        // `visual_bell` entry and fell back to the foreground; this theme
+        // format has no such entry, so the foreground is the flash.
+        let mut color = self.window.colors.foreground;
+        color[3] = intensity;
+        let quad = match self.visual_bell.target {
+            crate::terminal::BellTarget::BackgroundColor => {
+                let Some(live) = self.window.state.as_ref() else {
+                    return;
+                };
+                unterm_render::quads::Quad {
+                    left: 0.0,
+                    top: 0.0,
+                    width: live.width as f32,
+                    height: live.height as f32,
+                    color,
+                }
+            }
+            crate::terminal::BellTarget::CursorColor => {
+                let Some((left, top)) = self.cursor_cell_origin() else {
+                    return;
+                };
+                let metrics = self.window.font.metrics();
+                unterm_render::quads::Quad {
+                    left,
+                    top,
+                    width: metrics.width,
+                    height: metrics.height,
+                    color,
+                }
+            }
+        };
+        quads.backgrounds.push(quad);
+    }
+
+    /// The focused pane's cursor cell, in window pixels, if it is on screen.
+    fn cursor_cell_origin(&self) -> Option<(f32, f32)> {
+        // Only the check that a window exists; the geometry below is the App's.
+        self.window.state.as_ref()?;
+        let session_id = self.focused_session();
+        let snapshot = self.engine.read_styled_screen(session_id).ok()?;
+        if !snapshot.cursor.visible {
+            return None;
+        }
+        let row = usize::try_from(snapshot.cursor.y).ok()?;
+        if row >= snapshot.rows || snapshot.cursor.x >= snapshot.cols.max(1) {
+            return None;
+        }
+        let origin = self
+            .placements()
+            .into_iter()
+            .find(|placement| placement.session_id == session_id)
+            .map(|placement| placement.origin)
+            .unwrap_or((self.terminal_left(), self.terminal_top()));
+        let metrics = self.window.font.metrics();
+        Some((
+            origin.0 + snapshot.cursor.x as f32 * metrics.width,
+            origin.1 + row as f32 * metrics.height,
+        ))
+    }
+
+    /// Underline the link the pointer is over, so a link is discoverable by
+    /// pointing at it -- as it always was.
+    ///
+    /// Only while the modifier is down: a line that appears under everything
+    /// the pointer passes is noise, and one that appears when clicking would
+    /// do something is a hint.
+    fn append_hovered_link(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some((link, origin)) = self.hovered_link() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        // From the hovered pane's own origin -- the dock, the padding and
+        // any pane to its left included -- the same origin its text is drawn
+        // from. Measured from the window's edge the line sat a sidebar's
+        // width left of the link.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: origin.0 + link.start as f32 * metrics.width,
+            top: origin.1
+                + link.row as f32 * metrics.height
+                + unterm_render::decorations::underline_top(metrics),
+            width: (link.end - link.start) as f32 * metrics.width,
+            height: unterm_render::decorations::thickness(metrics),
+            color: self.window.colors.foreground,
+        });
+    }
+
+    /// Where a session's pane is drawn: its placement's origin in a split,
+    /// the terminal's own origin otherwise. The one answer the text, the
+    /// cursor, the selection and the pointer all measure from.
+    fn session_origin(&self, session_id: usize) -> (f32, f32) {
+        self.placements()
+            .into_iter()
+            .find(|placement| placement.session_id == session_id)
+            .map(|placement| placement.origin)
+            .unwrap_or((self.terminal_left(), self.terminal_top()))
+    }
+
+    /// The link the pointer is over, if any.
+    fn link_under_pointer(&self) -> Option<crate::links::Link> {
+        self.hovered_link().map(|(link, _)| link)
+    }
+
+    /// The link the pointer is over, and the origin of the pane it is in.
+    ///
+    /// The pane under the pointer, read from its own snapshot and measured
+    /// from its own origin: in a split, the focused pane's text tested against
+    /// the terminal's corner found links that were not there.
+    fn hovered_link(&self) -> Option<(crate::links::Link, (f32, f32))> {
+        let live = self.window.state.as_ref()?;
+        let session_id = self.pane_under_pointer().unwrap_or(live.session_id);
+        let snapshot = self.engine.read_styled_screen(session_id).ok()?;
+        let metrics = self.window.font.metrics();
+        let origin = self.session_origin(session_id);
+        let (x, y) = (
+            self.window.pointer.0 - origin.0,
+            self.window.pointer.1 - origin.1,
+        );
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let column = (x / metrics.width.max(1.0)) as usize;
+        let row = (y / metrics.height.max(1.0)) as usize;
+        if column >= snapshot.cols.max(1) {
+            return None;
+        }
+
+        let line = snapshot.lines.get(row)?;
+        crate::links::links_in_row(row, line, &self.link_rules)
+            .into_iter()
+            .find(|link| link.covers(row, column))
+            .map(|link| (link, origin))
+    }
+
+    /// Which cell the pointer is over, in scrollback coordinates.
+    ///
+    /// Against the pane the selection belongs to -- the focused one, which a
+    /// press in another pane makes it first -- by that pane's origin and
+    /// that pane's viewport.
+    fn cell_under_pointer(&self) -> unterm_engine::next_core::selection::SelectionPoint {
+        let session_id = self.window.state.as_ref().map(|live| live.session_id);
+        // The viewport's top row, so a selection made while scrolled back stays
+        // on the text it was made on rather than on whatever is there later.
+        let top = session_id
+            .and_then(|session_id| self.engine.read_styled_screen(session_id).ok())
+            .map(|snapshot| snapshot.lines.first().map(|line| line.row).unwrap_or(0))
+            .unwrap_or(0);
+
+        // From the pane's own origin, not the window's: the bar above, the
+        // gap around the grid and any pane to the left are not part of it,
+        // and a selection measured from the window's corner lands rows above
+        // and columns left of where it was drawn.
+        let metrics = self.window.font.metrics();
+        let origin = session_id
+            .map(|session_id| self.session_origin(session_id))
+            .unwrap_or((self.terminal_left(), self.terminal_top()));
+        crate::select::cell_at(
+            self.window.pointer.0 - origin.0,
+            self.window.pointer.1 - origin.1,
+            metrics,
+            top,
+        )
+    }
+
+    /// Extract what the current drag covers.
+    fn update_selection(&mut self) {
+        use unterm_engine::next_core::selection::{selected_text, SelectionRow};
+
+        let Some(drag) = self.window.drag else {
+            return;
+        };
+        let Some(selection) = drag.selection() else {
+            // Still a click, not a selection.
+            return;
+        };
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(live.session_id) else {
+            return;
+        };
+
+        let rows: Vec<SelectionRow> = snapshot
+            .lines
+            .iter()
+            .map(|line| SelectionRow {
+                row: line.row,
+                text: selection_row_text(&line.cells),
+                wrapped: line.wrapped,
+            })
+            .collect();
+
+        let text = strip_spacer_marks(selected_text(&selection, &rows));
+        if !text.is_empty() {
+            // What was selected, so a copy that comes out wrong can be traced
+            // to the selection rather than to the clipboard.
+            log::debug!("selected {} char(s): {:?}", text.chars().count(), text);
+        }
+        self.window.selected = (!text.is_empty()).then_some(text);
+    }
+
+    /// The columns of the non-space run around a column, on one grid row.
+    fn word_bounds_at(&self, row: i64, column: usize) -> Option<(usize, usize)> {
+        let live = self.window.state.as_ref()?;
+        let snapshot = self.engine.read_styled_screen(live.session_id).ok()?;
+        let line = snapshot.lines.iter().find(|line| line.row == row)?;
+        let chars: Vec<char> = selection_row_text(&line.cells).chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let at = column.min(chars.len() - 1);
+        if chars[at].is_whitespace() {
+            return None;
+        }
+        let mut start = at;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let mut end = at;
+        while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Select the run of non-space characters under a double-click.
+    fn select_word_at(&mut self, cell: unterm_engine::next_core::selection::SelectionPoint) {
+        use unterm_engine::next_core::selection::{SelectionPoint, SelectionShape};
+        let Some((start, end)) = self.word_bounds_at(cell.row, cell.column) else {
+            return;
+        };
+        let mut drag = crate::select::Drag::start(
+            SelectionPoint::new(start, cell.row),
+            SelectionShape::Linear,
+        );
+        drag.extend(SelectionPoint::new(end, cell.row));
+        self.window.drag = Some(drag);
+        self.update_selection();
+    }
+
+    /// Select the whole row under a triple-click.
+    fn select_line_at(&mut self, cell: unterm_engine::next_core::selection::SelectionPoint) {
+        use unterm_engine::next_core::selection::{SelectionPoint, SelectionShape};
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(live.session_id) else {
+            return;
+        };
+        let width = snapshot.cols.max(1);
+        let mut drag =
+            crate::select::Drag::start(SelectionPoint::new(0, cell.row), SelectionShape::Linear);
+        drag.extend(SelectionPoint::new(width.saturating_sub(1), cell.row));
+        self.window.drag = Some(drag);
+        self.update_selection();
+    }
+
+    /// Grow the held drag to the pointer, snapping to what the click streak
+    /// established: a double-click drag grows word by word, a triple-click
+    /// drag row by row, and a plain drag cell by cell.
+    fn extend_drag_to(&mut self, point: unterm_engine::next_core::selection::SelectionPoint) {
+        use unterm_engine::next_core::selection::{SelectionPoint, SelectionShape};
+        if self.window.drag.is_none() {
+            return;
+        }
+        let anchor = match (self.window.select_granularity, self.window.select_anchor) {
+            (SelectGranularity::Cell, _) | (_, None) => {
+                if let Some(drag) = self.window.drag.as_mut() {
+                    drag.extend(point);
+                }
+                return;
+            }
+            (_, Some(anchor)) => anchor,
+        };
+        let forward = (point.row, point.column) >= (anchor.row, anchor.column);
+        let (from, to) = match self.window.select_granularity {
+            SelectGranularity::Word => {
+                let (a_start, a_end) = self
+                    .word_bounds_at(anchor.row, anchor.column)
+                    .unwrap_or((anchor.column, anchor.column));
+                let pointer_word = self.word_bounds_at(point.row, point.column);
+                if forward {
+                    (
+                        SelectionPoint::new(a_start, anchor.row),
+                        SelectionPoint::new(
+                            pointer_word.map_or(point.column, |(_, end)| end),
+                            point.row,
+                        ),
+                    )
+                } else {
+                    (
+                        SelectionPoint::new(a_end, anchor.row),
+                        SelectionPoint::new(
+                            pointer_word.map_or(point.column, |(start, _)| start),
+                            point.row,
+                        ),
+                    )
+                }
+            }
+            SelectGranularity::Line => {
+                let cols = self
+                    .window.state
+                    .as_ref()
+                    .and_then(|live| self.engine.read_styled_screen(live.session_id).ok())
+                    .map_or(1, |snapshot| snapshot.cols.max(1));
+                if forward {
+                    (
+                        SelectionPoint::new(0, anchor.row),
+                        SelectionPoint::new(cols - 1, point.row),
+                    )
+                } else {
+                    (
+                        SelectionPoint::new(cols - 1, anchor.row),
+                        SelectionPoint::new(0, point.row),
+                    )
+                }
+            }
+            SelectGranularity::Cell => unreachable!("handled above"),
+        };
+        let mut drag = crate::select::Drag::start(from, SelectionShape::Linear);
+        drag.extend(to);
+        self.window.drag = Some(drag);
+    }
+
+    /// Put the selection on the clipboard.
+    ///
+    /// A selection nobody can copy is decoration, and this is the one action
+    /// every terminal user reaches for within a minute of selecting anything.
+    /// Carry out a key binding.
+    fn run_key_action(&mut self, action: crate::keys::Action, session_id: usize) {
+        use crate::keys::Action;
+        if std::env::var_os("UNTERM_TRACE_KEYS").is_some() {
+            log::info!("  run_key_action {:?} font={}pt", action, self.window.font_points);
+        }
+        match action {
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste_clipboard(),
+            Action::SplitRight => {
+                self.split(unterm_engine::next_core::layout::SplitAxis::Horizontal)
+            }
+            Action::SplitDown => self.split(unterm_engine::next_core::layout::SplitAxis::Vertical),
+            Action::CopyMode => {
+                self.window.copy_mode = Some(crate::copy_mode::CopyMode::default());
+                self.window.drawn_revision = None;
+            }
+            Action::QuickSelect => self.open_quick_select(),
+            Action::Insights => self.open_insights(),
+            Action::CockpitInbox => {
+                if self.window.inbox_open {
+                    self.window.inbox_open = false;
+                } else if self.inbox_rows().is_empty() {
+                    self.open_console();
+                } else {
+                    self.window.inbox_open = true;
+                    self.window.inbox_selected = 0;
+                }
+                self.window.drawn_revision = None;
+            }
+            Action::GitPanel => self.toggle_git_panel(),
+            Action::DirJump => {
+                // The in-app jump palette is the feature, as 0.57.4 had it;
+                // the OS picker stays one of its rows (and Ctrl+O). Wired
+                // straight to the picker, the palette was orphaned -- and on
+                // anything but Windows, the action was only a failure toast.
+                let entries = self.dir_jump_entries("");
+                self.open_browser(entries, unterm_services::i18n::t("dirjump.placeholder"));
+            }
+            Action::LeftTabBar => {
+                self.window.sidebar_open = !self.window.sidebar_open;
+                self.resize_panes();
+                self.window.drawn_revision = None;
+            }
+            Action::ThemePicker => {
+                let entries = self.theme_entries();
+                self.open_palette(entries);
+            }
+            Action::Composer => {
+                self.window.composer = match self.window.composer.take() {
+                    Some(_) => None,
+                    None => Some(crate::composer::Composer::default()),
+                };
+                self.window.drawn_revision = None;
+            }
+            Action::CommandPalette => {
+                self.open_named_palette(
+                    self.command_palette_entries(),
+                    unterm_services::i18n::t("menu.command_palette"),
+                );
+            }
+            Action::Launcher => self.open_shell_selector(),
+            Action::Search => {
+                self.window.search = Some(crate::search::Search::default());
+                self.window.drawn_revision = None;
+            }
+            Action::NewTab => self.new_tab(),
+            Action::NextTab => self.cycle_tab(1),
+            Action::PreviousTab => self.cycle_tab(-1),
+            Action::CloseTab => self.close_tab(),
+            Action::NewWindow => self.new_window(),
+            Action::NewAdminWindow => self.open_admin_window(),
+            Action::ClosePane => self.close_pane(session_id),
+            Action::ZoomPane => self.toggle_zoom(session_id),
+            Action::CharSelect => {
+                // Open where 0.57.4 opened: on the recents when there are
+                // any, and on the smileys when nothing was ever picked.
+                let recents = crate::charselect::recent_choices();
+                self.charselect_group = crate::charselect::starting_group(&recents);
+                let entries = self.character_entries("");
+                self.window.palette = Some(crate::palette::Palette::characters(entries));
+                self.window.drawn_revision = None;
+            }
+            Action::Settings => self.open_settings(),
+            Action::TreeSidebar => self.toggle_tree(),
+            Action::FleetLaunch => {
+                let entries = self.fleet_entries();
+                self.open_fleet(entries);
+            }
+            Action::ClearScrollback => self.clear_scrollback(session_id, false),
+            Action::ClearScreen => self.clear_scrollback(session_id, true),
+            Action::SelectPane => self.open_pane_select(crate::paneselect::Mode::Activate),
+            Action::SwapPane => self.open_pane_select(crate::paneselect::Mode::Swap),
+            Action::FocusPane(direction) => self.focus_pane_toward(direction),
+            Action::ResizePane(direction) => self.resize_pane_toward(direction),
+            Action::MoveTab(step) => self.move_tab(step),
+            Action::PreviousPrompt | Action::NextPrompt => {
+                let amount = if action == Action::PreviousPrompt {
+                    -1
+                } else {
+                    1
+                };
+                let _ = self.engine.scroll_viewport_to_prompt(session_id, amount);
+                self.window.drawn_revision = None;
+            }
+            Action::SelectTab(number) => self.select_tab(number),
+            Action::IncreaseFontSize => self.change_font_size(1.0),
+            Action::DecreaseFontSize => self.change_font_size(-1.0),
+            Action::ResetFontSize => self.set_font_size(self.configured_font_points),
+            Action::ToggleFullScreen => self.toggle_full_screen(),
+            Action::ScrollPageUp | Action::ScrollPageDown => {
+                let rows = self
+                    .engine
+                    .read_styled_screen(session_id)
+                    .map(|snapshot| snapshot.rows)
+                    .unwrap_or(24);
+                let page = crate::scroll::lines_for_page(rows);
+                let delta = if action == Action::ScrollPageUp {
+                    -page
+                } else {
+                    page
+                };
+                let _ = self.engine.scroll_viewport_by(session_id, delta);
+            }
+        }
+    }
+
+    /// Another terminal, as its own process.
+    ///
+    /// Unterm's windows are separate processes -- that is what makes
+    /// `instance.list` able to name them and an agent able to drive one
+    /// without touching another -- so a new window is a new instance, started
+    /// where this one is looking.
+    /// Open another window -- in this process.
+    ///
+    /// It used to spawn a second copy of the executable, which is why every
+    /// window cost a fresh GPU: choosing an adapter is ~200 ms and a new
+    /// process has to choose again. Windows Terminal opens its second window
+    /// in 172 ms for exactly this reason. Here the work is deferred to
+    /// `about_to_wait`, which is where winit hands out the event loop a
+    /// window has to be created from.
+    fn new_window(&mut self) {
+        // The same queue an MCP call uses, so a window opened by a keystroke
+        // and one opened by an agent get their ids from the same place. Two
+        // allocators would eventually give two windows one number.
+        unterm_engine::request_window();
+    }
+
+    /// Park the window being shown and start a fresh one beside it.
+    /// Open another window, under the id already promised to whoever asked.
+    ///
+    /// The id is a parameter rather than taken here because an MCP caller was
+    /// told the number before this ran -- a window can only be built where
+    /// winit hands out an `ActiveEventLoop`, and no agent can wait for one.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop, request: unterm_engine::WindowRequest) {
+        let id = request.id;
+        let Some(parked_id) = self.active_window_id() else {
+            return;
+        };
+        let font = match TerminalFont::open_named(
+            self.font_family.as_deref(),
+            crate::terminal::pixels_for_points(self.configured_pixel_size as f32, 1.0),
+            &self.font_fallbacks,
+            self.window.font_shape,
+        ) {
+            Ok(font) => font,
+            Err(err) => {
+                log::warn!("could not open a font for the new window: {err:#}");
+                return;
+            }
+        };
+        let chrome_font = match crate::chrome_font::open(&self.font_fallbacks, 1.0) {
+            Ok(font) => font,
+            Err(err) => {
+                log::warn!("could not open the chrome font for the new window: {err:#}");
+                return;
+            }
+        };
+        let picture = crate::background::configured(&self.config);
+        let fresh = WindowState::fresh(
+            id,
+            &self.config,
+            self.configured_pixel_size,
+            self.window.font_shape,
+            font,
+            chrome_font,
+            picture,
+        );
+        // A new window is a new shell. Adopting is for the first window of a
+        // process, which has to show what the Core was already running.
+        let previous = std::mem::replace(&mut self.window, fresh);
+        self.parked.push(ParkedWindow {
+            id: parked_id,
+            state: previous,
+        });
+        let explicit = std::mem::replace(&mut self.explicit_launch, true);
+        // `start` reads these for the shell it is about to make. Swapped
+        // around the call rather than assigned, the way `explicit_launch` is:
+        // they describe the *first* shell of a window, and a path left behind
+        // in `start_directory` would open every later tab there too.
+        let directory = request
+            .cwd
+            .is_some()
+            .then(|| std::mem::replace(&mut self.start_directory, request.cwd.clone()));
+        let command = request.command.first().map(|program| {
+            let mut builder = portable_pty::CommandBuilder::new(program);
+            builder.args(request.command.iter().skip(1));
+            std::mem::replace(&mut self.shell, Some(builder))
+        });
+        let started = self.start(event_loop);
+        if let Some(previous) = directory {
+            self.start_directory = previous;
+        }
+        if let Some(previous) = command {
+            self.shell = previous;
+        }
+        self.explicit_launch = explicit;
+        match started {
+            Ok(live) => {
+                live.window.request_redraw();
+                self.window.state = Some(live);
+                self.sync_frame();
+                self.draw();
+                if let Some(live) = self.window.state.as_ref() {
+                    crate::win_chrome::set_startup_cloak(&live.window, false);
+                }
+            }
+            Err(err) => {
+                log::warn!("could not open another window: {err:#}");
+                // Put the one that was working back in front.
+                if let Some(parked) = self.parked.pop() {
+                    self.window = parked.state;
+                }
+            }
+        }
+    }
+
+    /// Where a new window should start: where the focused pane is.
+    fn current_directory(&self) -> Option<std::path::PathBuf> {
+        let live = self.window.state.as_ref()?;
+        unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .ok()
+            .into_iter()
+            .flatten()
+            .find(|session| session.id == live.session_id)
+            .and_then(|session| session.shell.cwd)
+            .map(std::path::PathBuf::from)
+            .or_else(|| self.start_directory.clone())
+    }
+
+    /// Close one pane, leaving the rest of the tab alone.
+    ///
+    /// Distinct from closing the tab: with a split open, the pane is what the
+    /// key is aimed at. When it was the last one the tab goes with it, which
+    /// is what makes this safe to reach for.
+    fn close_pane(&mut self, session_id: usize) {
+        let _slow = SlowGuard::new("close_pane");
+        let Some(tab_id) = self.window.tabs.tab_of_pane(session_id) else {
+            return;
+        };
+        if self.window.tabs.pane_ids(tab_id).len() < 2 {
+            self.close_tab();
+            return;
+        }
+        crate::statsbar::forget(session_id);
+        unterm_services::ghost_text::forget(session_id as u64);
+        let _ = self.engine.destroy_session(session_id);
+        self.window.tabs.close_pane(session_id);
+        if let Some(pane) = self.window.tabs.active_pane(tab_id) {
+            self.focus_session(pane);
+        }
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    /// One pane fills the tab, or gives the space back.
+    fn toggle_zoom(&mut self, session_id: usize) {
+        let Some(tab_id) = self.window.tabs.tab_of_pane(session_id) else {
+            return;
+        };
+        let zoomed = self.window.tabs.zoomed_pane(tab_id) == Some(session_id);
+        self.window.tabs.set_zoomed(session_id, !zoomed);
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    /// Move focus to the nearest pane in a direction.
+    ///
+    /// Nearest by edge rather than by tree position: with three panes the tree
+    /// has a shape the screen does not show, and someone pressing Alt+Right
+    /// means the pane to the right of this one.
+    /// Move focus to the nearest pane in a direction.
+    fn focus_pane_toward(&mut self, direction: crate::keys::Direction) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let placements = self.placements();
+        let target =
+            crate::panes::pane_toward(&placements, live.session_id, direction, self.window.font.metrics());
+        if let Some(pane) = target {
+            self.window.tabs.set_active_pane(pane);
+            self.focus_session(pane);
+            self.window.drawn_revision = None;
+        }
+    }
+
+    fn resize_pane_toward(&mut self, direction: crate::keys::Direction) {
+        use crate::keys::Direction;
+        use unterm_engine::next_core::layout::SplitAxis;
+
+        let pane = self.focused_session();
+        let (axis, delta) = match direction {
+            Direction::Left => (SplitAxis::Horizontal, -0.05),
+            Direction::Right => (SplitAxis::Horizontal, 0.05),
+            Direction::Up => (SplitAxis::Vertical, -0.05),
+            Direction::Down => (SplitAxis::Vertical, 0.05),
+        };
+        let Some(change) = self.window.tabs.adjust_split_ratio(pane, axis, delta) else {
+            return;
+        };
+        // Tell the engine where the divider went. The split tree lives in
+        // this window, but the arrangement has to outlive it: without this
+        // the pane comes back from a restart at the size it was created at,
+        // however long the user spent settling on another one.
+        if let Err(err) = self
+            .engine
+            .set_split_ratio(change.owner_pane_id, change.first_ratio)
+        {
+            log::debug!(
+                "could not record the split ratio for pane {}: {err:#}",
+                change.owner_pane_id
+            );
+        }
+        self.resize_panes();
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    /// Go to a tab by its number, counting from one as the keys are labelled.
+    ///
+    /// Nine means the last one however many there are, which is what every
+    /// browser does and what people reach for.
+    /// Show the tab at `index` in the strip, whatever number it would be.
+    ///
+    /// Not `select_tab`: that one takes a *number key*, where nine and above
+    /// mean "the last tab" -- right for a keyboard with nine keys, and wrong
+    /// for a strip whose ninth row is the ninth tab. Routing the strip
+    /// through it sent every click past the eighth row to the end instead,
+    /// which reads as a tab that will not switch.
+    fn select_tab_at(&mut self, index: usize) {
+        let Some(tab_id) = self.window.tabs.tab_ids().get(index).copied() else {
+            #[cfg(target_os = "macos")]
+            crate::macos_open::trace(&format!("select_tab_at {index}: no tab there"));
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        crate::macos_open::trace(&format!(
+            "select_tab_at {index} -> tab {tab_id} pane {:?}",
+            self.window.tabs.active_pane(tab_id)
+        ));
+        self.activate_tab(tab_id);
+    }
+
+    fn select_tab(&mut self, number: u8) {
+        let ids = self.window.tabs.tab_ids();
+        let Some(tab_id) = crate::topbar::tab_for_number(number, ids.len())
+            .and_then(|index| ids.get(index).copied())
+        else {
+            #[cfg(target_os = "macos")]
+            crate::macos_open::trace(&format!(
+                "select_tab {number}: no tab for it among {} ids",
+                ids.len()
+            ));
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        crate::macos_open::trace(&format!(
+            "select_tab {number} -> tab {tab_id} pane {:?}",
+            self.window.tabs.active_pane(tab_id)
+        ));
+        self.window.tabs.set_active_tab(tab_id);
+        self.window.tab_id = Some(tab_id);
+        if let Some(pane) = self.window.tabs.active_pane(tab_id) {
+            self.focus_session(pane);
+        }
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    fn change_font_size(&mut self, steps: f32) {
+        self.set_font_size(self.window.font_points + steps);
+    }
+
+    /// Redraw everything at a new size.
+    ///
+    /// The atlas is thrown away rather than added to: it is keyed by pixel
+    /// size, so keeping it would only hold glyphs nothing will ask for again.
+    /// The panes are told their new grid afterwards -- a shell that still
+    /// thinks it has eighty columns wraps its output in the wrong place.
+    fn set_font_size(&mut self, points: f32) {
+        let points = points.clamp(6.0, 72.0);
+        if (points - self.window.font_points).abs() < f32::EPSILON {
+            return;
+        }
+        self.reopen_font(points, self.window.scale);
+    }
+
+    /// Open the font at a size in points, for a display at `scale`.
+    fn reopen_font(&mut self, points: f32, scale: f32) {
+        let pixels = crate::terminal::pixels_for_points(points, Self::font_scale_for(scale));
+        let Ok(font) = TerminalFont::open_named(
+            self.font_family.as_deref(),
+            pixels,
+            &self.font_fallbacks,
+            self.window.font_shape,
+        ) else {
+            log::warn!("no font at {pixels} pixels; keeping {}", self.window.font_points);
+            return;
+        };
+        self.window.font = font;
+        // The chrome follows the display's scale but not the terminal's font
+        // size: making the tab labels bigger because somebody zoomed the
+        // terminal is not what zooming the terminal means.
+        if let Ok(chrome) =
+            crate::chrome_font::open(&self.font_fallbacks, Self::font_scale_for(scale))
+        {
+            self.window.chrome_font = chrome;
+        }
+        self.window.font_points = points;
+        self.window.scale = scale;
+        self.window.atlas = GlyphAtlas::new(1024, 1024);
+        if let Some(live) = self.window.state.as_mut() {
+            live.atlas_uploaded_glyphs = usize::MAX;
+        }
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    fn toggle_full_screen(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let full = live.window.fullscreen().is_some();
+        live.window.set_fullscreen(if full {
+            None
+        } else {
+            // Borderless on whichever monitor the window is on: an exclusive
+            // mode would change the display's resolution, which is not what
+            // a terminal going full screen should do to the rest of a desktop.
+            Some(winit::window::Fullscreen::Borderless(None))
+        });
+        self.window.drawn_revision = None;
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.window.selected.clone() else {
+            return;
+        };
+        self.copy_text(&text);
+    }
+
+    /// Send the clipboard to the shell.
+    ///
+    /// Through the engine's paste rather than as typed input, because the
+    /// engine knows whether the program asked for bracketed paste. Without the
+    /// brackets a multi-line paste is executed a line at a time -- paste a
+    /// script and you have run it.
+    fn paste_clipboard(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let session_id = live.session_id;
+        let tx = self.clipboard_tx.clone();
+        crate::clipboard::run(tx, move || {
+            let result = arboard::Clipboard::new()
+                .map_err(|err| err.to_string())
+                .and_then(|mut board| match board.get_text() {
+                    Ok(text) if !text.is_empty() => Ok(text),
+                    // No text — a system screenshot or a browser's "copy
+                    // image" leaves an image alone on the clipboard, and a
+                    // paste that silently does nothing reads as broken. In
+                    // a terminal the useful form of an image is a path to
+                    // it, so it becomes a file in the captures folder.
+                    _ => match board.get_image() {
+                        Ok(picture) => clipboard_image_to_file(&picture)
+                            .map(|path| format!("{} ", shell_quoted_path(&path)))
+                            .map_err(|err| err.to_string()),
+                        Err(err) => Err(err.to_string()),
+                    },
+                });
+            ClipboardResult::Read {
+                pane_id: session_id,
+                result,
+            }
+        });
+    }
+
+    /// The pane keys and pastes go to.
+    fn focused_session(&self) -> usize {
+        self.window.tab_id
+            .and_then(|tab_id| self.window.tabs.active_pane(tab_id))
+            .or_else(|| self.window.state.as_ref().map(|live| live.session_id))
+            .unwrap_or(0)
+    }
+
+    /// Draw the focused pane's pending command prediction at its live cursor.
+    fn append_ghost_text(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        // The input method owns this position while it is composing text.
+        if !self.window.preedit.is_empty() {
+            return;
+        }
+        let pane = self.focused_session();
+        if !crate::ghost::pane_takes_predictions(pane as u64) {
+            return;
+        }
+        let Some((_input, ghost)) = unterm_services::ghost_text::current_ghost(pane as u64) else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(pane) else {
+            return;
+        };
+        if !snapshot.cursor.visible {
+            return;
+        }
+        let Ok(row) = usize::try_from(snapshot.cursor.y) else {
+            return;
+        };
+        if row >= snapshot.rows || snapshot.cursor.x >= snapshot.cols {
+            return;
+        }
+        let placement = self
+            .placements()
+            .into_iter()
+            .find(|placement| placement.session_id == pane);
+        let (pane_origin, pane_cols) = match placement {
+            Some(placement) => (placement.origin, placement.cols),
+            None => ((self.terminal_left(), self.terminal_top()), snapshot.cols),
+        };
+        let available = pane_cols.saturating_sub(snapshot.cursor.x);
+        let ghost = crate::ghost::truncate_to_columns(&ghost, available);
+        if ghost.is_empty() {
+            return;
+        }
+        let metrics = self.window.font.metrics();
+        let origin = (
+            pane_origin.0 + snapshot.cursor.x as f32 * metrics.width,
+            pane_origin.1 + row as f32 * metrics.height,
+        );
+        crate::terminal::append_text(
+            &ghost,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            crate::ghost::color(self.window.colors.foreground, self.window.colors.background),
+            origin,
+            quads,
+        );
+    }
+
+    /// Split the focused pane, inheriting its working directory.
+    fn split(&mut self, axis: unterm_engine::next_core::layout::SplitAxis) {
+        let dir = self.focused_directory();
+        self.split_in(axis, dir);
+    }
+
+    /// Split the focused pane in an explicit directory (if provided).
+    fn split_in(
+        &mut self,
+        axis: unterm_engine::next_core::layout::SplitAxis,
+        command_dir: Option<String>,
+    ) {
+        let (Some(tab_id), Some(live)) = (self.window.tab_id, self.window.state.as_ref()) else {
+            return;
+        };
+        let focused = self.window.tabs.active_pane(tab_id).unwrap_or(live.session_id);
+
+        // Through the engine's own split, not a bare create: the
+        // engine then records what this arrangement is, and a window
+        // opening later -- this one after a restart, or another one
+        // onto the same Core -- can rebuild it instead of guessing at
+        // horizontal-and-half. It also puts this path and the MCP
+        // surface's `session.split` on the same road.
+        let env = launch_env_for_new_pane();
+        let session = match self.engine.split_session(unterm_engine::SplitSessionRequest {
+            source_pane_id: focused,
+            direction: match axis {
+                unterm_engine::next_core::layout::SplitAxis::Horizontal => {
+                    unterm_engine::SplitDirection::Right
+                }
+                unterm_engine::next_core::layout::SplitAxis::Vertical => {
+                    unterm_engine::SplitDirection::Down
+                }
+            },
+            size_percent: 50,
+            command_dir,
+            command: prepare_shell(self.shell.clone()),
+            env,
+            launch_policy: LaunchPolicySnapshot::default(),
+        }) {
+            Ok(session) => session,
+            Err(err) => {
+                log::warn!("could not open a pane: {err:#}");
+                return;
+            }
+        };
+
+        // Right and down, as this window's own split command asks for
+        // above, put the new pane after the source.
+        if let Err(err) = self.window.tabs.split(
+            focused,
+            session.id,
+            axis,
+            0.5,
+            unterm_engine::next_core::layout::SplitSide::Second,
+        ) {
+            log::warn!("could not split: {err:#}");
+            crate::statsbar::forget(session.id);
+            unterm_services::ghost_text::forget(session.id as u64);
+            let _ = self.engine.destroy_session(session.id);
+            return;
+        }
+        self.window.tabs.set_active_pane(session.id);
+        self.resize_panes();
+        self.show_notice(unterm_services::i18n::t("interaction.split"));
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        self.window.drawn_revision = None;
+    }
+
+    /// Put text a program asked for onto the system clipboard.
+    ///
+    /// `OSC 52`, which is the only way anything running over ssh can copy.
+    /// Taken once: the engine reports the last request, and without
+    /// remembering what was already honoured every frame would set the
+    /// clipboard again and stamp on whatever the user copied since.
+    fn take_clipboard_request(&mut self, request: Option<String>) {
+        let Some(text) = request else {
+            return;
+        };
+        if self.window.clipboard_honoured.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.window.clipboard_honoured = Some(text.clone());
+        self.copy_text(&text);
+    }
+
+    /// Tell a pane the terminal gained or lost focus, if it asked.
+    ///
+    /// `CSI I` and `CSI O`, and only when the program turned reporting on:
+    /// sending them unasked puts stray characters into anything that did not
+    /// negotiate it, which is what the mode exists to prevent.
+    fn report_focus(&mut self, focused: bool) {
+        let Ok(sessions) = unterm_engine::SessionEngine::list_sessions(&self.engine) else {
+            return;
+        };
+        let sequence = if focused { "[I" } else { "[O" };
+        for session in sessions {
+            let asked = self
+                .engine
+                .read_styled_screen(session.id)
+                .map(|snapshot| snapshot.focus_reporting)
+                .unwrap_or(false);
+            if asked {
+                let _ = self.engine.write_input(session.id, sequence);
+            }
+        }
+    }
+
+    /// Interrupt whatever the pane is running.
+    ///
+    /// The byte has already gone to the shell, which is enough on a pty with
+    /// a line discipline. Windows has none: the byte only reaches the shell's
+    /// line editor, so a running program -- which is the thing you press
+    /// Ctrl+C at -- never hears it without a console control event.
+    fn interrupt(&self, pane_id: usize) {
+        let process = unterm_engine::SessionEngine::activity(&self.engine, pane_id)
+            .ok()
+            .and_then(|activity| activity.process);
+        let Some(shell) = process.as_ref().and_then(|p| p.root_pid) else {
+            return;
+        };
+        let foreground = process.as_ref().and_then(|p| p.foreground_pid);
+        if let Err(err) = unterm_services::interrupt::stop_foreground(shell, foreground) {
+            // Worth a line: an interrupt that quietly did nothing is what
+            // this exists to remove.
+            log::warn!("could not interrupt pane {pane_id}: {err}");
+        }
+    }
+
+    /// Where the first shell starts, as the command line asked.
+    pub fn set_start_directory(&mut self, directory: Option<std::path::PathBuf>) {
+        if directory.is_some() {
+            self.explicit_launch = true;
+        }
+        self.start_directory = directory;
+    }
+
+    /// Reopen where the last window closed: its size, and a tab per saved
+    /// directory.
+    pub fn set_restore(&mut self, saved: crate::session_restore::LastSession) {
+        self.restore = Some(saved);
+    }
+
+    /// Override the configured shell for the first pane when `unterm start`
+    /// supplied an explicit program after `--`.
+    pub fn set_start_command(&mut self, argv: Vec<String>) {
+        let Some(program) = argv.first() else {
+            return;
+        };
+        self.explicit_launch = true;
+        let mut command = portable_pty::CommandBuilder::new(program);
+        command.args(argv.iter().skip(1));
+        self.shell = Some(command);
+    }
+
+    /// Feed the cockpit what the panes are showing.
+    ///
+    /// The tracker watches screen tails and titles to work out whether an
+    /// agent is waiting on a person. Nothing else in this front end calls it,
+    /// so without this the inbox is always empty and looks broken rather than
+    /// idle.
+    fn feed_cockpit(&mut self) {
+        if self.cockpit_fed_at.elapsed() < COCKPIT_POLL
+            || crate::statsbar::user_typing_recently()
+        {
+            return;
+        }
+        self.cockpit_fed_at = std::time::Instant::now();
+        // Lists every session and reads every pane: the heaviest thing the
+        // idle loop does, and the one that talks to the Core -- whose client
+        // has no read timeout, so an answer that never comes stops this
+        // thread for good rather than for a while.
+        let _slow = SlowGuard::new("feed_cockpit");
+
+        let Ok(sessions) = unterm_engine::SessionEngine::list_sessions(&self.engine) else {
+            return;
+        };
+        let active_pane = self.focused_session();
+        let pane_ids: Vec<u64> = sessions.iter().map(|session| session.id as u64).collect();
+        let mut announcements: Vec<(u64, String)> = Vec::new();
+        for session in &sessions {
+            // Schedule process/manifest detection for the focused pane at normal
+            // cadence and background panes at a gentler 10s cadence.
+            if session.id == active_pane {
+                let _ = crate::statsbar::facts_for(session.id);
+            } else {
+                let _ = crate::statsbar::facts_for_background(session.id);
+            }
+            // The pulse, not the screen. This loop runs over every pane
+            // more than twice a second; asking each one for 4800 styled cells and
+            // keeping only the characters cost 3.8 s at forty panes — nine
+            // times the poll's own budget, which is a window that never
+            // finishes a frame.
+            let since = self
+                .window.pane_notices
+                .get(&session.id)
+                .map(|notice| notice.revision)
+                .filter(|revision| *revision != 0);
+            let Ok(pulse) =
+                self.engine
+                    .read_pane_pulse(session.id, since, COCKPIT_TAIL_ROWS)
+            else {
+                continue;
+            };
+            let notice = self.window.pane_notices.entry(session.id).or_default();
+            if pulse.unchanged {
+                // Nothing has been written to this pane since the last poll,
+                // so every conclusion below would be the one already drawn.
+                // Notifications still count: a bell is not a screen change.
+                if pulse.notifications != notice.notifications_seen {
+                    let fresh = pulse.notifications > notice.notifications_seen;
+                    notice.notifications_seen = pulse.notifications;
+                    if fresh {
+                        if session.id != active_pane {
+                            notice.unread = true;
+                        }
+                        if let Some(text) = pulse.last_notification.clone() {
+                            announcements.push((session.id as u64, text));
+                        }
+                    }
+                }
+                if session.id == active_pane {
+                    notice.unread = false;
+                }
+                continue;
+            }
+            let tail = pulse.tail.clone();
+            if notice.revision != 0
+                && notice.revision != pulse.revision
+                && session.id != active_pane
+            {
+                notice.unread = true;
+            }
+            // With the shell's integration on, a command says how it ended:
+            // a non-zero exit is an error and a clean one is not, whatever
+            // the output looked like. Reading the screen for "error:" stays
+            // for what runs without marks -- and for a long-running command,
+            // an agent among them, while it runs.
+            let marks = pulse.commands;
+            if marks.running && notice.command_started_at.is_none() {
+                notice.command_started_at = Some(std::time::Instant::now());
+            }
+            let command_just_finished = marks.finished != notice.commands_seen;
+            let command_elapsed = if command_just_finished {
+                notice.last_exit_code = marks.last_exit;
+                notice.command_started_at.take().map(|t| t.elapsed())
+            } else {
+                None
+            };
+            let failed = command_just_finished
+                && matches!(marks.last_exit, Some(code) if code != 0);
+            notice.commands_seen = marks.finished;
+            if command_just_finished {
+                if let Some(elapsed) = command_elapsed {
+                    let is_background = !self.window.focused || session.id != active_pane;
+                    if elapsed >= std::time::Duration::from_secs(10) && is_background {
+                        let secs = elapsed.as_secs();
+                        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+                        let exit_code = marks.last_exit.unwrap_or(0);
+                        let msg = if exit_code == 0 {
+                            if is_zh {
+                                format!("后台长任务已完成 (窗格 {} · 耗时 {}s)", session.id, secs)
+                            } else {
+                                format!("Background command finished (pane {} · {}s)", session.id, secs)
+                            }
+                        } else if is_zh {
+                            format!(
+                                "后台命令执行失败 (窗格 {} · 退出码 {} · 耗时 {}s)",
+                                session.id, exit_code, secs
+                            )
+                        } else {
+                            format!(
+                                "Background command failed (pane {} · exit {} · {}s)",
+                                session.id, exit_code, secs
+                            )
+                        };
+                        announcements.push((session.id as u64, msg));
+                    }
+                }
+            }
+            let guessed = (!marks.integrated || marks.running)
+                && crate::sidebar::output_looks_like_error(&tail);
+            let error = session.is_dead || failed || guessed;
+            if error {
+                notice.error = true;
+            } else if session.id == active_pane {
+                notice.error = false;
+            }
+            if session.id == active_pane {
+                notice.unread = false;
+            }
+            // A program that asked for the user's eye gets it: the pane
+            // marks itself unread, the Cockpit learns, and the bar says so.
+            if pulse.notifications != notice.notifications_seen {
+                let fresh = pulse.notifications > notice.notifications_seen;
+                notice.notifications_seen = pulse.notifications;
+                if fresh {
+                    if session.id != active_pane {
+                        notice.unread = true;
+                    }
+                    if let Some(text) = pulse.last_notification.clone() {
+                        announcements.push((session.id as u64, text));
+                    }
+                }
+            }
+            notice.revision = pulse.revision;
+            notice.progress = pulse.progress;
+            unterm_services::cockpit::status::on_screen_tail(session.id as u64, &tail);
+            unterm_services::cockpit::status::on_title_change(session.id as u64, &session.title);
+        }
+        for (pane, text) in announcements {
+            unterm_services::cockpit::status::on_notification(pane, None, &text);
+            // The window says so where the eye is; when the eye is elsewhere,
+            // the system's own notification carries it.
+            if !self.window.focused {
+                let _ = unterm_services::toast::notify("Unterm", &text);
+            }
+            self.show_notice(format!("\u{1F514} {text}"));
+        }
+
+        unterm_services::cockpit::status::poll(&pane_ids, |pane_id| {
+            crate::statsbar::known_facts(pane_id as usize).agent_id
+        });
+        let live: std::collections::HashSet<u64> = pane_ids.iter().copied().collect();
+        unterm_services::cockpit::status::retain_panes(&live);
+
+        let statuses = unterm_services::cockpit::status::snapshot();
+        for session in &sessions {
+            if let Some(target) =
+                Self::extract_ssh_target(&session.shell.process_name, &session.title)
+            {
+                self.window.ssh_targets.insert(session.id, target);
+            }
+        }
+        let focused_pane = self.focused_session() as u64;
+        for status in &statuses {
+            let prev = self
+                .window
+                .last_agent_states
+                .insert(status.pane_id, status.state);
+            if prev.is_some() && prev != Some(status.state) {
+                let background_or_other_pane =
+                    !self.window.focused || status.pane_id != focused_pane;
+                if background_or_other_pane {
+                    use unterm_services::cockpit::status::AgentState;
+                    let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+                    let msg = match status.state {
+                        AgentState::WaitingForUser => Some(if is_zh {
+                            format!(
+                                "{} (窗格 {}) 正在等待您的指令或确认",
+                                status.agent, status.pane_id
+                            )
+                        } else {
+                            format!("{} (pane {}) needs your attention", status.agent, status.pane_id)
+                        }),
+                        AgentState::Done if prev == Some(AgentState::Working) => Some(if is_zh {
+                            format!("{} (窗格 {}) 已完成当前任务", status.agent, status.pane_id)
+                        } else {
+                            format!("{} (pane {}) finished its task", status.agent, status.pane_id)
+                        }),
+                        _ => None,
+                    };
+                    if let Some(text) = msg {
+                        if !self.window.focused {
+                            let _ = unterm_services::toast::notify("Unterm", &text);
+                            crate::updates::notify(text.clone());
+                            if let Some(live) = self.window.state.as_ref() {
+                                live.window.request_user_attention(Some(
+                                    winit::window::UserAttentionType::Informational,
+                                ));
+                            }
+                        }
+                        self.show_notice(format!("\u{1F514} {text}"));
+                    }
+                }
+            }
+        }
+        self.window
+            .last_agent_states
+            .retain(|pane_id, _| live.contains(pane_id));
+        let titles: std::collections::HashMap<u64, String> = sessions
+            .iter()
+            .map(|session| (session.id as u64, session.title.clone()))
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let agents: Vec<unterm_services::server_info::InstanceAgentInfo> = statuses
+            .iter()
+            .map(|status| unterm_services::server_info::InstanceAgentInfo {
+                pane_id: status.pane_id,
+                tab_id: self
+                    .window.tabs
+                    .tab_of_pane(status.pane_id as usize)
+                    .map(|id| id as u64),
+                window_id: Some(0),
+                pane_title: titles.get(&status.pane_id).cloned(),
+                agent: status.agent.clone(),
+                state: status.state.as_str().to_string(),
+                since_unix_ms:
+                    now.saturating_sub(
+                        status.since.elapsed().as_millis().min(i64::MAX as u128) as i64
+                    ),
+                task_hint: status.task_hint.clone(),
+            })
+            .collect();
+        let _ = std::thread::Builder::new()
+            .name("cockpit-instance-publish".to_string())
+            .spawn(move || {
+                if let Err(err) = unterm_services::server_info::set_agents(agents) {
+                    log::debug!("could not publish cockpit snapshot: {err:#}");
+                }
+            });
+
+        let current_instance =
+            unterm_services::server_info::current_instance_id().unwrap_or_default();
+        crate::cockpit::refresh_peer_statuses(current_instance);
+
+        let checkpoint_panes = unterm_services::cockpit::status::take_checkpoint_requests();
+        if !checkpoint_panes.is_empty() {
+            let _ = std::thread::Builder::new()
+                .name("cockpit-checkpoint".to_string())
+                .spawn(move || {
+                    let engine = unterm_engine::host_engine();
+                    for pane_id in checkpoint_panes {
+                        let Some(status) =
+                            unterm_services::cockpit::status::status_for_pane(pane_id)
+                        else {
+                            continue;
+                        };
+                        let activity =
+                            unterm_engine::SessionEngine::activity(&*engine, pane_id as usize)
+                                .ok();
+                        let cwd = activity
+                            .as_ref()
+                            .and_then(|activity| activity.process.as_ref())
+                            .and_then(|process| {
+                                process
+                                    .foreground_cwd
+                                    .clone()
+                                    .or_else(|| process.root_cwd.clone())
+                            })
+                            .or_else(|| {
+                                unterm_engine::SessionEngine::shell(&*engine, pane_id as usize)
+                                    .ok()
+                                    .and_then(|shell| shell.cwd)
+                            });
+                        if let Some(cwd) = cwd {
+                            if let Err(err) =
+                                unterm_services::cockpit::review::record_auto_checkpoint(
+                                    std::path::Path::new(&cwd),
+                                    &status.agent,
+                                    pane_id,
+                                )
+                            {
+                                log::debug!("automatic cockpit checkpoint skipped: {err:#}");
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    /// The agent inbox, over the terminal.
+    fn inbox_rows(&self) -> Vec<crate::cockpit::Row> {
+        let statuses = unterm_services::cockpit::status::snapshot();
+        let instance_id = unterm_services::server_info::current_instance_id().unwrap_or_default();
+        let window_title = self
+            .window.window_title
+            .clone()
+            .unwrap_or_else(|| instance_id.clone());
+        let mut located: Vec<crate::cockpit::LocatedStatus> = statuses
+            .into_iter()
+            .map(|status| crate::cockpit::LocatedStatus {
+                pane_id: status.pane_id,
+                instance_id: instance_id.clone(),
+                window_title: window_title.clone(),
+                tab_id: self
+                    .window.tabs
+                    .tab_of_pane(status.pane_id as usize)
+                    .map(|id| id as u64),
+                agent: status.agent,
+                state: status.state,
+                age_seconds: status.since.elapsed().as_secs(),
+                task_hint: status.task_hint,
+            })
+            .collect();
+        // An agent that names no task in its signals usually names it in its
+        // title -- the same place the strip reads it from.
+        if let Ok(sessions) = unterm_engine::SessionEngine::list_sessions(&self.engine) {
+            for status in located.iter_mut().filter(|status| status.task_hint.is_none()) {
+                status.task_hint = sessions
+                    .iter()
+                    .find(|session| session.id as u64 == status.pane_id)
+                    .and_then(|session| {
+                        crate::sidebar::task_from_title(&session.title, Some(&status.agent), &status.agent)
+                    });
+            }
+            for session in &sessions {
+                if located.iter().any(|status| status.pane_id == session.id as u64) {
+                    continue;
+                }
+                let known_agent = crate::statsbar::known_facts(session.id).agent_id;
+                let running_prog = !session.shell.process_name.is_empty()
+                    && !is_a_shell(&session.shell.process_name);
+                if let Some(agent) = known_agent.or_else(|| {
+                    running_prog.then(|| crate::statusbar::shell_label(&session.shell.process_name))
+                }) {
+                    let task_hint = crate::sidebar::task_from_title(&session.title, Some(&agent), &agent)
+                        .or_else(|| {
+                            session
+                                .shell
+                                .cwd
+                                .as_deref()
+                                .map(crate::sidebar::project_name)
+                                .filter(|name| !name.is_empty())
+                        });
+                    located.push(crate::cockpit::LocatedStatus {
+                        pane_id: session.id as u64,
+                        instance_id: instance_id.clone(),
+                        window_title: window_title.clone(),
+                        tab_id: self
+                            .window
+                            .tabs
+                            .tab_of_pane(session.id)
+                            .map(|id| id as u64),
+                        agent,
+                        state: unterm_services::cockpit::status::AgentState::Working,
+                        age_seconds: 0,
+                        task_hint,
+                    });
+                }
+            }
+        }
+        located.extend(crate::cockpit::peer_statuses());
+        crate::cockpit::located_rows(&located)
+    }
+
+    /// Move through the inbox or jump directly to the selected pane.
+    ///
+    /// The inbox is modal while open: keys it does not use are swallowed so
+    /// typing while choosing an agent cannot leak into the shell underneath.
+    fn handle_inbox_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key as WinitKey, NamedKey};
+
+        if !self.window.inbox_open {
+            return false;
+        }
+        let rows = self.inbox_rows();
+        let count = rows.len().min(MAX_INBOX_ROWS);
+        if count == 0 {
+            self.window.inbox_selected = 0;
+        } else {
+            self.window.inbox_selected = self.window.inbox_selected.min(count - 1);
+        }
+
+        match &event.logical_key {
+            WinitKey::Named(NamedKey::Escape) => self.window.inbox_open = false,
+            WinitKey::Character(ch) if ch.eq_ignore_ascii_case("c") => {
+                self.window.inbox_open = false;
+                self.open_console();
+            }
+            WinitKey::Character(ch) if ch.eq_ignore_ascii_case("a") => {
+                self.window.inbox_open = false;
+                self.open_autonomy_selector();
+            }
+            WinitKey::Character(ch) if ch.eq_ignore_ascii_case("r") => {
+                self.window.inbox_open = false;
+                self.open_checkpoints();
+            }
+            WinitKey::Character(ch) if ch.eq_ignore_ascii_case("h") => {
+                self.window.inbox_open = false;
+                self.open_agent_handoff();
+            }
+            WinitKey::Character(ch)
+                if (ch.eq_ignore_ascii_case("y") || ch.eq_ignore_ascii_case("n")) && count > 0 =>
+            {
+                let approve = ch.eq_ignore_ascii_case("y");
+                if let Some(req) = unterm_services::agent_session::pending_requests()
+                    .into_iter()
+                    .next()
+                {
+                    if let (Some(sid), Some(rid)) = (
+                        req.get("session_id").and_then(|v| v.as_str()),
+                        req.get("approval")
+                            .and_then(|a| a.get("request_id"))
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        let _ = unterm_services::agent_session::decide(
+                            sid, rid, approve, None, !approve,
+                        );
+                    }
+                }
+                let selected = rows[self.window.inbox_selected].clone();
+                let pane_id = selected.pane_id as usize;
+                let current_instance =
+                    unterm_services::server_info::current_instance_id().unwrap_or_default();
+                if selected.instance_id.is_empty() || selected.instance_id == current_instance {
+                    let payload = if approve { "y\r" } else { "n\r" };
+                    let verb = if approve { "Approved" } else { "Rejected" };
+                    crate::engine_backend::mcp_state::audit_gui_write(
+                        if approve {
+                            "inbox.quick_approve"
+                        } else {
+                            "inbox.quick_reject"
+                        },
+                        pane_id as u64,
+                        verb,
+                    );
+                    let _ = self.engine.write_input(pane_id, payload);
+                    self.show_notice(format!(
+                        "\u{2713} {verb} \u{00b7} pane {pane_id}"
+                    ));
+                }
+            }
+            WinitKey::Named(NamedKey::ArrowUp) if count > 0 => {
+                self.window.inbox_selected =
+                    crate::cockpit::step_selection(self.window.inbox_selected, count, false);
+            }
+            WinitKey::Named(NamedKey::ArrowDown) if count > 0 => {
+                self.window.inbox_selected =
+                    crate::cockpit::step_selection(self.window.inbox_selected, count, true);
+            }
+            WinitKey::Named(NamedKey::Enter) if count > 0 => {
+                let selected = rows[self.window.inbox_selected].clone();
+                let pane_id = selected.pane_id as usize;
+                let current_instance =
+                    unterm_services::server_info::current_instance_id().unwrap_or_default();
+                if selected.instance_id.is_empty() || selected.instance_id == current_instance {
+                    if self.window.tabs.tab_of_pane(pane_id).is_none() {
+                        self.show_notice(format!("pane {pane_id} is no longer available"));
+                        return true;
+                    }
+                    self.window.inbox_open = false;
+                    self.focus_session(pane_id);
+                } else {
+                    self.window.inbox_open = false;
+                    let instance_id = selected.instance_id.clone();
+                    let target_pane = selected.pane_id;
+                    self.show_notice(format!("focusing {instance_id} / pane {target_pane}"));
+                    let _ = std::thread::Builder::new()
+                        .name("cockpit-peer-focus".to_string())
+                        .spawn(move || {
+                            let peer = unterm_services::server_info::list_live_instances()
+                                .into_iter()
+                                .find(|instance| instance.id == instance_id);
+                            match peer {
+                                Some(peer) => {
+                                    if let Err(err) =
+                                        unterm_services::peer_mcp::focus_pane(&peer, target_pane)
+                                    {
+                                        log::warn!(
+                                            "could not focus {instance_id} pane {target_pane}: {err:#}"
+                                        );
+                                    }
+                                }
+                                None => log::warn!(
+                                    "could not focus {instance_id} pane {target_pane}: instance is gone"
+                                ),
+                            }
+                        });
+                }
+            }
+            _ => {}
+        }
+
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    /// Type into the composer. Returns true when the key was the composer's.
+    fn handle_composer_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key as WinitKey, NamedKey};
+
+        let shift = self.window.shift_held;
+        let ctrl = self.window.ctrl_held;
+        let Some(composer) = self.window.composer.as_mut() else {
+            return false;
+        };
+        let mut send = None;
+        match &event.logical_key {
+            WinitKey::Named(NamedKey::Enter) if shift => composer.typing.push('\n'),
+            WinitKey::Named(NamedKey::Enter) if ctrl => send = composer.take_selected(),
+            WinitKey::Named(NamedKey::Enter) => composer.commit(),
+            WinitKey::Named(NamedKey::Backspace) => {
+                composer.typing.pop();
+            }
+            WinitKey::Named(NamedKey::Delete) => {
+                composer.remove_selected();
+            }
+            WinitKey::Named(NamedKey::ArrowUp) => composer.select_by(-1),
+            WinitKey::Named(NamedKey::ArrowDown) => composer.select_by(1),
+            WinitKey::Named(NamedKey::Tab) => composer.cycle_mode(),
+            WinitKey::Named(NamedKey::Escape) => {
+                // The queue first, the panel second. A batch someone has just
+                // written is not something one keystroke should throw away
+                // without saying so -- and the panel emptying is it saying so.
+                if composer.is_empty() {
+                    self.window.composer = None;
+                } else {
+                    composer.clear();
+                    composer.typing.clear();
+                }
+            }
+            WinitKey::Named(NamedKey::Space) => composer.typing.push(' '),
+            WinitKey::Character(text) => composer.typing.push_str(text),
+            // Everything else belongs to the shell behind this: a queue is
+            // being written, not a program driven.
+            _ => return false,
+        }
+        if let Some(prompt) = send {
+            let pane = self.focused_session();
+            let _ = self.engine.write_input(pane, &format!("{prompt}\r"));
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// The oldest pending MCP suggestion owns only its explicit decision keys.
+    fn handle_suggestion_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key as WinitKey, NamedKey};
+        let pane = self.focused_session();
+        let Some(suggestion) = crate::engine_backend::mcp_state::pending_suggestions_for_pane(pane as u64)
+            .into_iter()
+            .next()
+        else {
+            return false;
+        };
+        let run = self.window.alt_held && matches!(event.logical_key, WinitKey::Named(NamedKey::Enter));
+        if matches!(event.logical_key, WinitKey::Named(NamedKey::Tab)) || run {
+            match crate::engine_backend::mcp_state::accept_suggestion(&suggestion.id, run) {
+                Ok(mut text) => {
+                    if run {
+                        text.push('\r');
+                    }
+                    if let Err(err) = self.engine.write_input(pane, &text) {
+                        log::warn!("could not accept suggestion: {err:#}");
+                    }
+                }
+                Err(err) => log::warn!("could not accept suggestion: {err}"),
+            }
+        } else if matches!(event.logical_key, WinitKey::Named(NamedKey::Escape)) {
+            if let Err(err) = crate::engine_backend::mcp_state::dismiss_suggestion(&suggestion.id) {
+                log::warn!("could not dismiss suggestion: {err}");
+            }
+        } else {
+            return false;
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// Send the next queued prompt if the pane is ready for one.
+    ///
+    /// Called from the frame loop rather than on a timer, because the thing it
+    /// waits on -- the pane going idle -- is something the frame loop already
+    /// knows about.
+    fn drain_composer(&mut self) {
+        let (true, Some(live)) = (self.window.composer.is_some(), self.window.state.as_ref()) else {
+            return;
+        };
+        let session_id = live.session_id;
+        let idle = unterm_engine::SessionEngine::activity(&self.engine, session_id)
+            .map(|activity| activity.idle)
+            .unwrap_or(false);
+
+        // An agent asking permission to carry on looks exactly like an agent
+        // that has finished, and a queue that cannot tell them apart sends its
+        // next prompt as the answer to the question. So the question is
+        // answered first, and only the narrow shape of question that offers a
+        // yes as the obvious answer -- anything that mentions deleting,
+        // removing, overwriting or forcing waits for a person.
+        let auto_approve = self
+            .window.composer
+            .as_ref()
+            .is_some_and(|composer| composer.mode() == crate::composer::ExecutionMode::AutoApprove);
+        if auto_approve && idle && self.pane_is_asking_permission(session_id) {
+            crate::engine_backend::mcp_state::audit_gui_write(
+                "composer.auto_approve",
+                session_id as u64,
+                "accepted narrow affirmative confirmation",
+            );
+            let _ = self.engine.write_input(session_id, "y\r");
+            self.window.drawn_revision = None;
+            return;
+        }
+
+        let Some(prompt) = self
+            .window.composer
+            .as_mut()
+            .and_then(|composer| composer.take_next(idle))
+        else {
+            return;
+        };
+        let _ = self.engine.write_input(session_id, &format!("{prompt}\r"));
+        self.window.drawn_revision = None;
+    }
+
+    /// Whether the pane's last line is a question the composer may answer.
+    fn pane_is_asking_permission(&self, session_id: usize) -> bool {
+        let Ok(screen) = self.engine.read_screen(session_id) else {
+            return false;
+        };
+        screen
+            .lines
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| crate::composer::is_confirmation(line))
+            .unwrap_or(false)
+    }
+
+    /// The queue, and the line being written.
+    fn append_composer(&mut self, window_width: f32, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(composer) = self.window.composer.clone() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let width = (window_width * 0.6)
+            .max(metrics.width * 30.0)
+            .min(window_width);
+        let left = ((window_width - width) / 2.0).max(0.0);
+        let queued = composer.queued();
+        let shown = queued.len().min(MAX_COMPOSER_ROWS);
+        let rows = shown + 2;
+        let top = metrics.height * 2.0;
+        let foreground = self.window.colors.foreground;
+
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left,
+            top,
+            width,
+            metrics.height * rows as f32,
+            self.corner_radius(),
+            mix(self.window.colors.background, foreground, 0.10),
+        ));
+
+        let title = unterm_services::i18n::t("composer.title");
+        let mode = composer.mode().label();
+        let heading = if queued.is_empty() {
+            format!(
+                "{title}  [{mode}]  ({})",
+                unterm_services::i18n::t("composer.hint")
+            )
+        } else {
+            format!(
+                "{title}  [{mode}]  ({})",
+                unterm_services::i18n::t_args(
+                    "composer.waiting",
+                    &[("n", &queued.len().to_string())]
+                )
+            )
+        };
+        let mut lines = vec![heading];
+        lines.extend(
+            queued
+                .iter()
+                .take(shown)
+                .enumerate()
+                .map(|(index, prompt)| {
+                    let marker = if index == composer.selected() {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    format!("{marker} {}. {}", index + 1, prompt.replace('\n', " ↵ "))
+                }),
+        );
+        // The line being written, with a cursor after it so it is obviously
+        // the one accepting keys.
+        lines.push(format!("> {}_", composer.typing.replace('\n', " ↵ ")));
+
+        for (index, line) in lines.iter().enumerate() {
+            crate::terminal::append_text(
+                line,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                foreground,
+                (left + metrics.width, top + metrics.height * index as f32),
+                quads,
+            );
+        }
+    }
+
+    fn append_suggestion(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let pending =
+            crate::engine_backend::mcp_state::pending_suggestions_for_pane(self.focused_session() as u64);
+        let Some(suggestion) = pending.first() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let width = (window_width * 0.64)
+            .max(metrics.width * 36.0)
+            .min(window_width);
+        let left = ((window_width - width) / 2.0).max(0.0);
+        let top = metrics.height * 2.0;
+        let foreground = self.window.colors.foreground;
+        let source = if suggestion.posted_by_agent.trim().is_empty() {
+            "agent"
+        } else {
+            suggestion.posted_by_agent.as_str()
+        };
+        let mut lines = vec![
+            format!("Suggestion from {source}  (1/{})", pending.len()),
+            suggestion.text.replace('\n', " ↵ "),
+        ];
+        if let Some(reason) = suggestion
+            .rationale
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            lines.push(format!("Why: {}", reason.replace('\n', " ")));
+        }
+        lines.push("Tab accept  Alt+Enter accept & run  Esc dismiss".to_string());
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left,
+            top,
+            width,
+            metrics.height * lines.len() as f32,
+            self.corner_radius(),
+            mix(self.window.colors.background, foreground, 0.12),
+        ));
+        for (index, line) in lines.iter().enumerate() {
+            crate::terminal::append_text(
+                line,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                foreground,
+                (left + metrics.width, top + metrics.height * index as f32),
+                quads,
+            );
+        }
+    }
+
+    fn toggle_git_panel(&mut self) {
+        self.window.git_panel = match self.window.git_panel {
+            Some(_) => None,
+            None => {
+                let cwd = self
+                    .current_directory()
+                    .or_else(dirs_next::home_dir)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                Some(GitDock {
+                    panel: crate::git::read(&cwd),
+                    cwd,
+                })
+            }
+        };
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    fn git_panel_width(&self) -> f32 {
+        self.git_panel_width_for(self.window_width())
+    }
+
+    fn git_panel_width_for(&self, window_width: f32) -> f32 {
+        if self.window.git_panel.is_none() {
+            return 0.0;
+        }
+        let pt = self.chrome_pt();
+        let max = (window_width * crate::ui_tokens::GIT_PANEL_MAX_RATIO)
+            .max(crate::ui_tokens::GIT_PANEL_MIN_WIDTH * pt);
+        (crate::ui_tokens::GIT_PANEL_WIDTH * pt)
+            .clamp(crate::ui_tokens::GIT_PANEL_MIN_WIDTH * pt, max)
+            .round()
+    }
+
+    /// What git says about where this pane is.
+    fn append_git_panel(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let Some(cwd) = self.current_directory() else {
+            return;
+        };
+        if let Some(dock) = self.window.git_panel.as_mut() {
+            if dock.cwd != cwd {
+                dock.cwd = cwd.clone();
+                dock.panel = crate::git::read(&cwd);
+            }
+        }
+        let Some(status) = self.window.git_panel.as_ref().map(|dock| dock.panel.clone()) else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let width = self.git_panel_width().min(window_width);
+        // A repository inspector is a dock, not a modal: keep the terminal
+        // visible beside it and anchor it to the right edge.
+        let left = (window_width - width).max(0.0);
+        let top = self.terminal_top();
+        let foreground = self.window.colors.foreground;
+
+        let heading = status.heading();
+        let lines: Vec<String> = status
+            .entries()
+            .iter()
+            .take(MAX_GIT_ROWS)
+            .map(|entry| format!("{:<3}{}", entry.code, entry.path))
+            .collect();
+        let height = self.terminal_height();
+
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left,
+            top,
+            width,
+            height,
+            self.corner_radius(),
+            mix(self.window.colors.background, foreground, 0.10),
+        ));
+        crate::terminal::append_text(
+            &heading,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            foreground,
+            (left + metrics.width, top),
+            quads,
+        );
+        for (index, line) in lines.iter().enumerate() {
+            crate::terminal::append_text(
+                line,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                foreground,
+                (
+                    left + metrics.width,
+                    top + metrics.height * (index + 1) as f32,
+                ),
+                quads,
+            );
+        }
+    }
+
+    fn append_inbox(&mut self, window_width: f32, quads: &mut unterm_render::quads::FrameQuads) {
+        if !self.window.inbox_open {
+            return;
+        }
+        let rows = self.inbox_rows();
+        let here = unterm_services::server_info::current_instance_id().unwrap_or_default();
+
+        let metrics = self.window.font.metrics();
+        let shown = rows.len().min(MAX_INBOX_ROWS);
+        if shown == 0 {
+            self.window.inbox_selected = 0;
+        } else {
+            self.window.inbox_selected = self.window.inbox_selected.min(shown - 1);
+        }
+        // One row per agent: its mark, what it is doing, then -- quieter --
+        // who it is, its state and for how long. Where it is only when that
+        // is another window; a location for a row in this one is noise.
+        let lines: Vec<(Option<crate::cockpit::Badge>, String, String)> = rows
+            .iter()
+            .take(shown)
+            .map(|row| {
+                let task = if row.hint.trim().is_empty() {
+                    row.label.split(" \u{00B7} ").next().unwrap_or_default().to_string()
+                } else {
+                    row.hint.trim().to_string()
+                };
+                let mut detail = row.label.clone();
+                if !row.instance_id.is_empty() && row.instance_id != here {
+                    let window = if row.window_title.is_empty() {
+                        row.instance_id.clone()
+                    } else {
+                        row.window_title.clone()
+                    };
+                    detail = format!("{detail} \u{00B7} {window}");
+                }
+                (crate::cockpit::badge(row.state), task, detail)
+            })
+            .collect();
+        let selected_tail: Vec<String> = rows
+            .get(self.window.inbox_selected)
+            .filter(|row| row.instance_id.is_empty() || row.instance_id == here)
+            .and_then(|row| self.engine.read_styled_screen(row.pane_id as usize).ok())
+            .map(|snapshot| {
+                let mut tail: Vec<String> = snapshot
+                    .lines
+                    .iter()
+                    .rev()
+                    .filter_map(|line| {
+                        let s: String = line
+                            .cells
+                            .iter()
+                            .filter(|cell| cell.width > 0)
+                            .map(|cell| cell.ch)
+                            .collect();
+                        let trimmed = s.trim_end().to_string();
+                        (!trimmed.trim().is_empty()).then_some(trimmed)
+                    })
+                    .take(3)
+                    .collect();
+                tail.reverse();
+                tail
+            })
+            .unwrap_or_default();
+        let footer = unterm_services::i18n::t("cockpit.inbox_footer");
+        let widest = lines
+            .iter()
+            .map(|(_, task, detail)| crate::sidebar::columns(task) + crate::sidebar::columns(detail) + 6)
+            .chain(selected_tail.iter().map(|line| crate::sidebar::columns(line) + 4))
+            .chain(std::iter::once(crate::sidebar::columns(&footer) + 4))
+            .max()
+            .unwrap_or(0)
+            .max(46) as f32;
+        // Over the terminal, not the whole window: a card straddling the
+        // strip's edge reads as misplaced.
+        let area_left = self.terminal_left();
+        let area = self.terminal_width().min(window_width).max(1.0);
+        let width = (metrics.width * (widest + 2.0))
+            .min(area - metrics.width * 2.0)
+            .max(metrics.width * 20.0)
+            .min(window_width);
+        let left = (area_left + (area - width) / 2.0).max(0.0);
+        let row_height = (metrics.height * 1.5).round();
+        let preview_rows = if selected_tail.is_empty() {
+            0.0
+        } else {
+            selected_tail.len() as f32 + 0.6
+        };
+        let top = self.terminal_top() + metrics.height;
+        let height =
+            row_height * (shown.max(1) + 2) as f32 + metrics.height * (0.5 + preview_rows * 1.15);
+        let foreground = self.window.colors.foreground;
+        let quiet = self.chrome().dim_text;
+        self.append_flyout(
+            left,
+            top,
+            width,
+            height,
+            mix(self.window.colors.background, foreground, 0.10),
+            quads,
+        );
+
+        let pad = metrics.width * 1.5;
+        let text_nudge = (row_height - metrics.height) / 2.0;
+        let waiting = rows.iter().filter(|row| row.needs_you).count();
+        let heading = unterm_services::i18n::t("cockpit.inbox_title");
+        let count = if rows.is_empty() {
+            String::new()
+        } else {
+            unterm_services::i18n::t_args("composer.waiting", &[("n", &waiting.to_string())])
+        };
+        crate::terminal::append_text(
+            &heading,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            foreground,
+            (left + pad, top + text_nudge + metrics.height * 0.25),
+            quads,
+        );
+        crate::terminal::append_text(
+            &count,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            quiet,
+            (
+                left + pad + metrics.width * (crate::sidebar::columns(&heading) as f32 + 2.0),
+                top + text_nudge + metrics.height * 0.25,
+            ),
+            quads,
+        );
+        let columns = (((width - pad * 2.0) / metrics.width.max(1.0)) as usize).saturating_sub(3);
+        let first = top + row_height + metrics.height * 0.25;
+        let radius = self.corner_radius();
+        for (index, (badge, task, detail)) in lines.iter().enumerate() {
+            let row_top = first + row_height * index as f32;
+            if index == self.window.inbox_selected {
+                let row_left = left + metrics.width * 0.5;
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    row_left,
+                    row_top,
+                    width - metrics.width,
+                    row_height,
+                    radius,
+                    mix(self.window.colors.background, foreground, 0.18),
+                ));
+                self.append_selection_pill(row_left, row_top, row_height, quads);
+            }
+            let text_top = row_top + text_nudge;
+            if let Some(badge) = badge {
+                crate::terminal::append_text(
+                    badge.glyph(0),
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    badge.color(),
+                    (left + pad, text_top),
+                    quads,
+                );
+            }
+            let detail_cols = crate::sidebar::columns(detail).min(columns / 2);
+            let task_room = columns.saturating_sub(detail_cols + 3).max(8);
+            let task = crate::sidebar::fit(task, task_room);
+            let task_left = left + pad + metrics.width * 3.0;
+            crate::terminal::append_text(
+                &task,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                foreground,
+                (task_left, text_top),
+                quads,
+            );
+            let used = crate::sidebar::columns(&task) + 2;
+            let fitted_detail = crate::sidebar::fit(detail, columns.saturating_sub(used).max(4));
+            let fitted_detail_cols = crate::sidebar::columns(&fitted_detail) as f32;
+            let detail_left = (left + width - pad - metrics.width * fitted_detail_cols)
+                .max(task_left + metrics.width * used as f32);
+            crate::terminal::append_text(
+                &fitted_detail,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                quiet,
+                (detail_left, text_top),
+                quads,
+            );
+        }
+        let mut footer_base = first + row_height * shown.max(1) as f32;
+        if !selected_tail.is_empty() {
+            let preview_left = left + metrics.width;
+            let preview_top = footer_base + metrics.height * 0.25;
+            let preview_line_h = (metrics.height * 1.15).round();
+            let preview_height =
+                preview_line_h * selected_tail.len() as f32 + metrics.height * 0.4;
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                preview_left,
+                preview_top,
+                width - metrics.width * 2.0,
+                preview_height,
+                radius,
+                mix(self.window.colors.background, foreground, 0.05),
+            ));
+            for (idx, line) in selected_tail.iter().enumerate() {
+                let fitted = crate::sidebar::fit(line, columns.saturating_sub(2).max(12));
+                crate::terminal::append_text(
+                    &fitted,
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    quiet,
+                    (
+                        preview_left + metrics.width,
+                        preview_top + metrics.height * 0.2 + preview_line_h * idx as f32,
+                    ),
+                    quads,
+                );
+            }
+            footer_base = preview_top + preview_height + metrics.height * 0.15;
+        }
+        let footer_top = footer_base + text_nudge;
+        let fitted_footer = crate::sidebar::fit(&footer, columns.max(20));
+        crate::terminal::append_text(
+            &fitted_footer,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            quiet,
+            (left + pad, footer_top),
+            quads,
+        );
+    }
+
+    /// Start quick select, if there is anything worth labelling.
+    ///
+    /// Nothing worth labelling means nothing to do: an overlay with no labels
+    /// in it looks like a broken feature rather than an empty screen.
+    fn open_quick_select(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(live.session_id) else {
+            return;
+        };
+        let found = crate::copy_mode::labelled(&snapshot.lines);
+        if found.is_empty() {
+            return;
+        }
+        self.window.quick_select = Some((found, String::new()));
+        self.window.drawn_revision = None;
+    }
+
+    /// Type a label. Returns true when the key was quick select's.
+    fn handle_quick_select_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::Key as WinitKey;
+        let Some((found, mut typed)) = self.window.quick_select.take() else {
+            return false;
+        };
+        match &event.logical_key {
+            WinitKey::Named(winit::keyboard::NamedKey::Escape) => {}
+            WinitKey::Character(text) => {
+                typed.push_str(text);
+                // Labels are lowercase, but typing one with shift held is a
+                // different request -- 0.57.4's "and type it into the pane".
+                // Matching has to fold the case, or the shifted spelling
+                // could never hit anything.
+                let wants_paste = typed.chars().any(|ch| ch.is_uppercase());
+                let lowered = typed.to_lowercase();
+                if let Some(hit) = found.iter().find(|item| item.label == lowered) {
+                    let text = hit.text.clone();
+                    self.copy_text(&text);
+                    if wants_paste {
+                        let pane = self.focused_session();
+                        let _ = self.engine.paste_input(pane, &text);
+                    }
+                } else if found.iter().any(|item| item.label.starts_with(&lowered)) {
+                    // A prefix of a longer label: wait for the rest.
+                    self.window.quick_select = Some((found, typed));
+                }
+            }
+            _ => self.window.quick_select = Some((found, typed)),
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    /// Move and select with the keyboard. Returns true when handled.
+    fn handle_copy_mode_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::Key as WinitKey;
+        let Some(mut mode) = self.window.copy_mode else {
+            return false;
+        };
+        let named = match &event.logical_key {
+            WinitKey::Named(named) => Some(format!("{named:?}")),
+            _ => None,
+        };
+        let character = match &event.logical_key {
+            WinitKey::Character(text) => Some(text.to_string()),
+            _ => None,
+        };
+
+        // An armed `f`/`t` owns the next character: it is the target to jump
+        // to, not a motion -- without this, `ft` could never find a literal
+        // `t`. Escape disarms; anything that is not a character is neither a
+        // target nor a reason to give up waiting for one.
+        if let Some((forward, till)) = mode.pending_find {
+            if named.as_deref() == Some("Escape") {
+                mode.pending_find = None;
+            } else if let Some(target) = character.as_deref().and_then(|text| {
+                let mut chars = text.chars();
+                let first = chars.next()?;
+                chars.next().is_none().then_some(first)
+            }) {
+                mode.pending_find = None;
+                let line = self.line_text(mode.row);
+                mode.apply_find(target, forward, till, &line);
+            }
+            self.window.copy_mode = Some(mode);
+            self.window.drawn_revision = None;
+            if let Some(live) = self.window.state.as_ref() {
+                live.window.request_redraw();
+            }
+            return true;
+        }
+
+        let Some(motion) =
+            crate::copy_mode::motion_for(named.as_deref(), character.as_deref(), self.window.ctrl_held)
+        else {
+            // Nothing reaches the shell: a stray keystroke running a command
+            // in the pane behind is the worst thing a mode can do.
+            self.window.copy_mode = Some(mode);
+            return true;
+        };
+
+        match motion {
+            crate::copy_mode::Motion::Leave => self.window.copy_mode = None,
+            crate::copy_mode::Motion::Yank => {
+                if let Some(text) = self.copy_mode_selection(&mode) {
+                    self.copy_text(&text);
+                }
+                self.window.copy_mode = None;
+            }
+            crate::copy_mode::Motion::Find { forward, till } => {
+                mode.pending_find = Some((forward, till));
+                self.window.copy_mode = Some(mode);
+            }
+            crate::copy_mode::Motion::RepeatFind(same_direction) => {
+                if let Some((target, forward, till)) = mode.last_find {
+                    let direction = if same_direction { forward } else { !forward };
+                    let line = self.line_text(mode.row);
+                    mode.apply_find(target, direction, till, &line);
+                    // `,` mirrors this one jump, not the remembered find:
+                    // `;` afterwards must still go the way the `f` did.
+                    mode.last_find = Some((target, forward, till));
+                }
+                self.window.copy_mode = Some(mode);
+            }
+            motion @ (crate::copy_mode::Motion::WordLeft | crate::copy_mode::Motion::WordRight) => {
+                let rows = self.screen_shape().0;
+                let lines: Vec<String> = self
+                    .window.state
+                    .as_ref()
+                    .and_then(|live| self.engine.read_styled_screen(live.session_id).ok())
+                    .map(|snapshot| {
+                        snapshot
+                            .lines
+                            .iter()
+                            .map(|line| line.cells.iter().map(|cell| cell.ch).collect())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                mode.apply_word(motion, rows, |row| {
+                    lines.get(row).cloned().unwrap_or_default()
+                });
+                self.window.copy_mode = Some(mode);
+            }
+            motion => {
+                let (rows, widths) = self.screen_shape();
+                mode.apply(motion, rows, |row| widths.get(row).copied().unwrap_or(0));
+                self.window.copy_mode = Some(mode);
+            }
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    /// One row of the screen as plain text, for the motions that need to see
+    /// characters rather than widths.
+    fn line_text(&self, row: usize) -> String {
+        self.window.state
+            .as_ref()
+            .and_then(|live| self.engine.read_styled_screen(live.session_id).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .lines
+                    .get(row)
+                    .map(|line| line.cells.iter().map(|cell| cell.ch).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many rows the screen has, and how wide each one's text is.
+    fn screen_shape(&self) -> (usize, Vec<usize>) {
+        let Some(live) = self.window.state.as_ref() else {
+            return (0, Vec::new());
+        };
+        let Ok(snapshot) = self.engine.read_styled_screen(live.session_id) else {
+            return (0, Vec::new());
+        };
+        let widths = snapshot
+            .lines
+            .iter()
+            .map(|line| {
+                // Trailing blanks are padding, not text: end-of-line should
+                // land on the last character someone wrote.
+                line.cells
+                    .iter()
+                    .rposition(|cell| cell.ch != ' ' && cell.ch != '\0')
+                    .map(|last| last + 1)
+                    .unwrap_or(0)
+            })
+            .collect();
+        (snapshot.lines.len(), widths)
+    }
+
+    /// The text copy mode has selected.
+    fn copy_mode_selection(&self, mode: &crate::copy_mode::CopyMode) -> Option<String> {
+        let live = self.window.state.as_ref()?;
+        let snapshot = self.engine.read_styled_screen(live.session_id).ok()?;
+        let ((start_row, start_col), (end_row, end_col)) = mode.selection()?;
+        let last = snapshot.lines.len().saturating_sub(1);
+
+        let mut out = String::new();
+        for row in start_row..=end_row.min(last) {
+            let text = selection_row_text(&snapshot.lines[row].cells);
+            // The shape decides the columns: whole rows for `V`, the same
+            // column band on every row for `Ctrl+v`, and the vim sweep
+            // otherwise.
+            let (from, to) = match mode.kind {
+                crate::copy_mode::SelectKind::Line => (0, text.chars().count()),
+                crate::copy_mode::SelectKind::Block => (
+                    start_col.min(end_col),
+                    (start_col.max(end_col) + 1).min(text.chars().count()),
+                ),
+                crate::copy_mode::SelectKind::Cell => (
+                    if row == start_row { start_col } else { 0 },
+                    if row == end_row {
+                        (end_col + 1).min(text.chars().count())
+                    } else {
+                        text.chars().count()
+                    },
+                ),
+            };
+            if from < to {
+                out.extend(text.chars().skip(from).take(to - from));
+            }
+            if row < end_row {
+                out.push('\n');
+            }
+        }
+        Some(strip_spacer_marks(out.trim_end().to_string()))
+    }
+
+    /// Put text on the clipboard, and say so.
+    ///
+    /// A copy that does nothing visible is one the user repeats, and then
+    /// goes hunting through a clipboard manager for.
+    fn copy_text(&mut self, text: &str) {
+        let tx = self.clipboard_tx.clone();
+        let text = text.to_string();
+        crate::clipboard::run(tx, move || {
+            let result = arboard::Clipboard::new()
+                .and_then(|mut board| board.set_text(text))
+                .map_err(|err| err.to_string());
+            ClipboardResult::Written(result)
+        });
+    }
+
+    fn collect_clipboard_results(&mut self) {
+        while let Ok(result) = self.clipboard_rx.try_recv() {
+            match result {
+                ClipboardResult::Read { pane_id, result } => match result {
+                    Ok(text) if !text.is_empty() => {
+                        if let Some(reason) = Self::should_guard_paste(&text) {
+                            self.open_safe_paste_confirm(pane_id, text, reason);
+                        } else {
+                            self.perform_paste_input(pane_id, &text);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("could not read the clipboard: {err}");
+                        self.show_notice(unterm_services::i18n::t("interaction.paste_failed"));
+                    }
+                },
+                ClipboardResult::Written(Ok(())) => {
+                    self.show_notice(unterm_services::i18n::t("interaction.copied"));
+                }
+                ClipboardResult::Written(Err(err)) => {
+                    log::warn!("could not copy to the clipboard: {err}");
+                    self.show_notice(unterm_services::i18n::t("interaction.paste_failed"));
+                }
+                ClipboardResult::DirectoryPicked { then, result } => match result {
+                    Ok(Some(path)) => {
+                        let path = path.display().to_string();
+                        match then {
+                            crate::palette::BrowseThen::ChangeDirectory => {
+                                self.change_directory(&path)
+                            }
+                            crate::palette::BrowseThen::NewTab => self.new_tab_in(&path),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::warn!("could not open the system folder picker: {err}");
+                        // The cause rides along: a notice that only says
+                        // "could not open" is a notice the user can only
+                        // report back as "it errored".
+                        self.show_notice(format!(
+                            "{} — {err}",
+                            unterm_services::i18n::t("dirjump.picker_failed")
+                        ));
+                    }
+                },
+                ClipboardResult::ScreenshotFinished { mode, result } => {
+                    self.capture_started_at = None;
+                    self.window.occluded = false;
+                    self.set_all_windows_capture_cloak(false);
+                    #[cfg(windows)]
+                    if let Some(live) = self.window.state.as_ref() {
+                        crate::win_chrome::bring_to_front(&live.window);
+                        live.window.focus_window();
+                    }
+                    let pane = self.focused_session();
+                    let _ = self.engine.scroll_viewport_to(pane, isize::MAX);
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                    match result {
+                        Ok(path) => self.show_notice(unterm_services::i18n::t_args(
+                            "screenshot.saved",
+                            &[("mode", &mode), ("path", &path.display().to_string())],
+                        )),
+                        Err(err) => self.show_notice(unterm_services::i18n::t_args(
+                            "screenshot.failed",
+                            &[("mode", &mode), ("err", &err)],
+                        )),
+                    }
+                }
+                ClipboardResult::ExportFinished(result) => match result {
+                    Ok(path) => self.show_notice(unterm_services::i18n::t_args(
+                        "recording.exported",
+                        &[("path", &path.display().to_string())],
+                    )),
+                    Err(err) => self.show_notice(unterm_services::i18n::t_args(
+                        "recording.export_failed",
+                        &[("err", &err)],
+                    )),
+                },
+                ClipboardResult::ScrollbackCaptured(result) => {
+                    let pane = self.focused_session();
+                    let _ = self.engine.scroll_viewport_to(pane, isize::MAX);
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                    match result {
+                        Ok(path) => self.show_notice(format!("✓ {}", path.display())),
+                        Err(err) => self.show_notice(unterm_services::i18n::t_args(
+                            "scrollshot.failed",
+                            &[("err", &err)],
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    fn click_git_panel(&self) -> bool {
+        let Some(live) = self.window.state.as_ref() else {
+            return false;
+        };
+        let width = self.git_panel_width();
+        width > 0.0
+            && self.window.pointer.0 >= live.width as f32 - width
+            && self.window.pointer.1 >= self.terminal_top()
+            && self.window.pointer.1 < live.height as f32 - self.status_bar_height()
+    }
+
+    /// Open the native directory chooser away from winit's event thread.
+    fn open_system_directory_picker(&mut self, then: crate::palette::BrowseThen) {
+        let start = self.current_directory();
+        let title = unterm_services::i18n::t("dirjump.picker_title");
+        let tx = self.clipboard_tx.clone();
+        crate::clipboard::run(tx, move || ClipboardResult::DirectoryPicked {
+            then,
+            result: crate::directory::pick_directory(start.as_deref(), &title)
+                .map_err(|err| err.to_string()),
+        });
+    }
+
+    /// Open the palette on a set of rows.
+
+    /// Take the focused pane to a directory, by typing it there.
+    ///
+    /// Through the shell rather than behind its back: a shell that is told to
+    /// `cd` updates its own prompt, its history and its OSC 7 report, and the
+    /// terminal learns the new directory the same way it learns every other
+    /// one. Moving the pty's directory underneath it would leave the shell
+    /// convinced it was somewhere else.
+    fn change_directory(&mut self, path: &str) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let command = format!("cd {}\r", shell_quoted_path(path));
+        let _ = self.engine.write_input(live.session_id, &command);
+    }
+
+    /// Open a tab whose shell starts in a directory.
+    ///
+    /// The directory travels with the session request rather than through
+    /// `start_directory`: that field is where the *first* shell starts, read
+    /// once at startup, and parking a path there opened every later tab in
+    /// the default directory instead.
+    fn new_tab_in(&mut self, path: &str) {
+        let shell = self.shell.clone();
+        self.open_tab_with(shell, Some(path.to_string()));
+    }
+
+    /// Reopen a saved workspace, a tab per saved directory.
+    ///
+    /// Next-core has no live workspaces to switch between -- a workspace is
+    /// a snapshot shared with the MCP `workspace.*` tools -- so 0.57.4's
+    /// "switch to workspace" becomes "open its tabs here".
+    fn restore_workspace(&mut self, name: &str) {
+        let cwds = crate::workspaces::cwds(name);
+        if cwds.is_empty() {
+            self.show_notice(format!("workspace `{name}` has no directories to open"));
+            return;
+        }
+        let count = cwds.len();
+        for cwd in cwds {
+            self.new_tab_in(&cwd);
+        }
+        self.show_notice(format!("workspace `{name}` opened · {count} tabs"));
+    }
+
+    /// Ask for a workspace name on the palette line. Enter saves the open
+    /// tabs under it, Esc changes nothing.
+    fn open_workspace_save(&mut self) {
+        self.window.palette = Some(crate::palette::Palette::writing(vec![
+            crate::palette::Entry {
+                label: "Save Workspace".to_string(),
+                hint: "type a name · Enter saves · Esc cancels".to_string(),
+                command: crate::palette::Command::SaveWorkspace,
+            },
+        ]));
+        self.window.drawn_revision = None;
+    }
+
+    /// Write the open tabs down under a name: one entry per tab, where its
+    /// pane is now. The same file `workspace.save` writes, so the palette and
+    /// an agent see one list.
+    fn save_workspace(&mut self, name: &str) {
+        let sessions =
+            unterm_engine::SessionEngine::list_sessions(&self.engine).unwrap_or_default();
+        let mut tabs = Vec::new();
+        for tab in self.window.tabs.tab_ids() {
+            let Some(pane) = self.window.tabs.active_pane(tab) else {
+                continue;
+            };
+            let Some(session) = sessions.iter().find(|session| session.id == pane) else {
+                continue;
+            };
+            let Some(cwd) = session.shell.cwd.clone() else {
+                continue;
+            };
+            let title = self
+                .window.tab_titles
+                .get(&tab)
+                .cloned()
+                .unwrap_or_else(|| session.title.clone());
+            tabs.push((title, cwd));
+        }
+        match crate::workspaces::save(name, &tabs) {
+            Ok(count) => self.show_notice(format!("workspace `{name}` saved · {count} tabs")),
+            Err(err) => self.show_notice(format!("could not save the workspace: {err}")),
+        }
+    }
+
+    /// Start recording the focused pane, or stop and say where it went.
+    fn toggle_recording(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let pane = live.session_id;
+        let recording = unterm_engine::RecordingEngine::recording_status(&self.engine, pane)
+            .map(|status| status.enabled)
+            .unwrap_or(false);
+        let outcome = if recording {
+            unterm_engine::RecordingEngine::stop_recording(&self.engine, pane)
+                .map(|stopped| format!("recording saved to {}", stopped.md_path))
+        } else {
+            unterm_engine::RecordingEngine::start_recording(&self.engine, pane)
+                .map(|started| format!("recording to {}", started.md_path))
+        };
+        match outcome {
+            Ok(message) => log::info!("{message}"),
+            Err(err) => log::warn!("recording: {err}"),
+        }
+        self.window.drawn_revision = None;
+    }
+
+    fn export_session(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let pane = live.session_id;
+        let tx = self.clipboard_tx.clone();
+        crate::clipboard::run(tx, move || {
+            let result = unterm_engine::RecordingEngine::export_markdown(
+                &*unterm_engine::host_engine(),
+                pane,
+                None,
+            )
+            .map(|exported| std::path::PathBuf::from(exported.path))
+            .map_err(|err| err.to_string())
+            .and_then(|path| {
+                arboard::Clipboard::new()
+                    .and_then(|mut board| board.set_text(path.display().to_string()))
+                    .map_err(|err| err.to_string())?;
+                Ok(path)
+            });
+            ClipboardResult::ExportFinished(result)
+        });
+        self.show_notice(unterm_services::i18n::t("recording.exporting"));
+    }
+
+    /// Settings live in a browser, not in a cell grid.
+    /// Somebody asked for this window to go.
+    ///
+    /// Every way of asking, in one function, because the two that existed
+    /// disagreed. The cross this window paints called `request_close`
+    /// directly; the system's own close, Cmd-W and Alt-F4 went through
+    /// `close_this_view` first and only fell through to `request_close` when
+    /// this was the last window. With a second window open that difference
+    /// was the whole outcome: `close_needs_confirmation` says no with another
+    /// window behind -- there is nothing to decide, a view is going away --
+    /// so the painted cross went straight on to end every session this window
+    /// held and take the process with it. One window closed, the whole of
+    /// Unterm gone.
+    ///
+    /// The comment on the system path had claimed the two were routed through
+    /// the same function "so the two cannot disagree about whether the shells
+    /// survive". They were not, and they did. Now they are.
+    fn close_pressed(&mut self) {
+        // Another window behind this one means this is a view going away,
+        // not the front end. Nothing to ask, and nothing to end.
+        if !self.window.close_confirmed && self.close_this_view() {
+            return;
+        }
+        self.request_close();
+    }
+
+    /// Close once it is safe or once it is confirmed. Nothing running and a
+    /// single tab close immediately; anything else opens one confirmation on
+    /// the palette line, and Enter there closes for real.
+    fn request_close(&mut self) {
+        if self.window.close_confirmed || !self.close_needs_confirmation() {
+            // Nothing was at stake, so nothing is left behind either: no
+            // prompt was shown, no indicator will appear, and a shell that
+            // outlived the window nobody was asked about is exactly the
+            // invisible state the prompt exists to avoid.
+            self.perform_close(CloseOutcome::EndSessions, Leaving::Process);
+            return;
+        }
+        self.open_close_prompt();
+    }
+
+    /// Cmd+Q, the Dock's Quit, an AppleScript `quit`: the application is
+    /// leaving, not this window.
+    ///
+    /// So unlike a close, other windows being open is no reason to skip the
+    /// question -- quitting takes their shells too. Nothing running anywhere
+    /// leaves at once, as Cmd+Q always has.
+    #[cfg(target_os = "macos")]
+    fn quit_pressed(&mut self) {
+        if self.window.state.is_none() {
+            // Parked or windowless: there is no window to ask in, and the
+            // only ways to send Cmd+Q here are the Dock and AppleScript.
+            // Leave the way `unterm-cli quit` does.
+            self.window.tray = None;
+            self.window.close_confirmed = true;
+            let outcome = match &self.engine {
+                crate::engine_backend::AppEngine::Local(_) => CloseOutcome::EndSessions,
+                crate::engine_backend::AppEngine::Core { .. } => CloseOutcome::KeepSessions,
+            };
+            self.perform_close(outcome, Leaving::Process);
+            return;
+        }
+        if self.window.close_confirmed || !self.quit_needs_confirmation() {
+            self.window.close_confirmed = true;
+            self.perform_close(CloseOutcome::EndSessions, Leaving::Process);
+            return;
+        }
+        self.open_close_prompt();
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    /// The question asked before leaving: what becomes of the sessions.
+    fn open_close_prompt(&mut self) {
+        use unterm_services::i18n::t;
+        // What is actually at stake, counted rather than implied: "2
+        // agents waiting, 3 sessions running" is a sentence someone
+        // can act on; "programs are running" is one they dismiss.
+        let sessions = unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        let waiting = crate::cockpit::attention_count(
+            &unterm_services::cockpit::status::snapshot(),
+        );
+        let subject = if waiting > 0 {
+            unterm_services::i18n::t_args(
+                "close.title_waiting",
+                &[
+                    ("waiting", &waiting.to_string()),
+                    ("sessions", &sessions.to_string()),
+                ],
+            )
+        } else {
+            unterm_services::i18n::t_args(
+                "close.title",
+                &[("sessions", &sessions.to_string())],
+            )
+        };
+
+        let entry = |label: &str, hint: &str, command: crate::palette::Command| {
+            crate::palette::Entry {
+                label: t(label),
+                hint: t(hint),
+                command,
+            }
+        };
+        // Three outcomes when a Core holds the sessions, two when this
+        // process does: offering to keep shells running in the
+        // background while they live and die with this window would be
+        // a promise the Local engine cannot keep. The recoverable
+        // answer is first, so the default action is the safe one.
+        let entries = if self.engine.sessions_outlive_this_window() {
+            vec![
+                entry(
+                    "close.background",
+                    "close.background.hint",
+                    crate::palette::Command::KeepRunningInBackground,
+                ),
+                entry(
+                    "close.drain",
+                    "close.drain.hint",
+                    crate::palette::Command::DrainThenExit,
+                ),
+                entry(
+                    "close.cancel_exit",
+                    "close.cancel_exit.hint",
+                    crate::palette::Command::CancelAndExit,
+                ),
+            ]
+        } else {
+            vec![entry(
+                "close.exit_now",
+                "close.exit_now.hint",
+                crate::palette::Command::ConfirmCloseWindow,
+            )]
+        };
+        self.window.palette = Some(crate::palette::Palette::confirm(entries, subject));
+        self.window.drawn_revision = None;
+    }
+
+    /// Whether closing now would take something down with it: several tabs,
+    /// or any pane whose foreground program is not just its own idle shell.
+    fn close_needs_confirmation(&self) -> bool {
+        // With another window still open, closing this one closes a view.
+        // Nothing has to be decided about the sessions behind it, because
+        // this process is not going anywhere and neither are they -- so the
+        // prompt would be asking a question that has no consequences.
+        if self.window_count() > 1 {
+            return false;
+        }
+        self.quit_needs_confirmation()
+    }
+
+    /// Whether ending the whole application now would take something down
+    /// with it, in any window: several sessions, or one running a program.
+    fn quit_needs_confirmation(&self) -> bool {
+        if !self.close_prompts {
+            return false;
+        }
+        let sessions =
+            unterm_engine::SessionEngine::list_sessions(&self.engine).unwrap_or_default();
+        if sessions.len() > 1 {
+            return true;
+        }
+        sessions.iter().any(|session| {
+            let facts = crate::statsbar::known_facts(session.id);
+            if !facts.agent.is_empty() {
+                return true;
+            }
+            let foreground = facts.title.trim_start_matches('\u{25B6}').trim();
+            // The stats line names Windows shells on purpose; a shell being
+            // itself is not a reason to ask before closing.
+            !foreground.is_empty()
+                && !crate::sidebar::same_program(foreground, &session.shell.process_name)
+        })
+    }
+
+    /// Fill the desktop work area instead of asking the OS to maximise: a
+    /// borderless window the OS maximises hangs eight pixels off every edge,
+    /// which is the black band that read as a deformed bar.
+    fn toggle_maximize(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        // A session restored by winit, a Win+Up gesture and a title-bar
+        // double-click use the OS maximized state rather than our work-area
+        // rectangle. The caption button must restore those immediately.
+        if live.window.is_maximized() {
+            live.window.set_maximized(false);
+            return;
+        }
+        if let Some((position, size)) = self.window.unmaximized_rect.take() {
+            live.window.set_outer_position(position);
+            let _ = live.window.request_inner_size(size);
+            return;
+        }
+        let Some((left, top, width, height)) =
+            crate::win_chrome::work_area(&live.window).or_else(unterm_services::work_area)
+        else {
+            live.window.set_maximized(!live.window.is_maximized());
+            return;
+        };
+        let position = live
+            .window
+            .outer_position()
+            .unwrap_or(winit::dpi::PhysicalPosition::new(0, 0));
+        self.window.unmaximized_rect = Some((position, live.window.inner_size()));
+        live.window
+            .set_outer_position(winit::dpi::PhysicalPosition::new(left, top));
+        let _ = live
+            .window
+            .request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+    }
+
+    /// Close the window, and end the sessions or leave them running.
+    ///
+    /// Both halves of that decision used to be spread across two paths that
+    /// disagreed: the title bar's own close button left every session alive,
+    /// while the same click on the system frame destroyed them all. One
+    /// function, one argument, so "did my shells survive?" has one answer.
+    /// Whether closing the last window should end this process.
+    ///
+    /// D3 of the multi-window design: the platforms disagree and both are
+    /// right. On Windows and Linux an application is its windows, so the last
+    /// one closing ends it -- unless the user chose to keep the sessions
+    /// running, which is what the tray is for. On macOS an application can
+    /// outlive its windows in the Dock.
+    ///
+    /// Only one close takes that branch on macOS: "keep running in the
+    /// background" with no menu-bar icon to park behind. Closing the last
+    /// window with nothing running still quits there too -- decided after
+    /// D3 was written, on the machine, 2026-10-08 -- and Cmd+Q asks first.
+    fn last_window_close_ends_process() -> bool {
+        !cfg!(target_os = "macos")
+    }
+
+    /// Close this window when it is not the last one.
+    ///
+    /// D1 of the multi-window design: closing a window closes a view. The
+    /// sessions live in the Core and another window of this process is still
+    /// showing something, so nothing here may end a shell -- including the
+    /// shells this window was showing, which the user can still reach from
+    /// the other window. Returns false when this *is* the last window, which
+    /// is the case that has to be asked about.
+    fn close_this_view(&mut self) -> bool {
+        // The same rule the prompt uses, asked the same way. Two spellings of
+        // "is this the last window" are two things to keep in step, and the
+        // one place they must agree is here: the prompt decides whether to
+        // ask, this decides whether the answer matters.
+        if self.window_count() == 1 {
+            return false;
+        }
+        self.window.close_confirmed = false;
+        self.save_last_session();
+        // Drop the window itself first: its surface must go before the one
+        // taking its place is drawn into.
+        if let Some(live) = self.window.state.take() {
+            live.window.set_visible(false);
+        }
+        // Before the handle goes: an `instance.focus` naming this window must
+        // fail rather than raise whichever window replaced it.
+        crate::mcp_host::forget_window(self.window.id);
+        let next = self.parked.pop().expect("a parked window");
+        self.window = next.state;
+        crate::mcp_host::set_focused_window(self.window.id);
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        // A window that was behind has had its tabs settled without anyone
+        // resizing its panes: `resize_panes` only ever describes the window
+        // in front. Coming forward is when that debt is paid.
+        self.resize_panes();
+        self.window.drawn_revision = None;
+        true
+    }
+
+    fn perform_close(&mut self, outcome: CloseOutcome, leaving: Leaving) {
+        let _slow = SlowGuard::new("perform_close");
+        self.save_last_session();
+        if outcome == CloseOutcome::EndSessions {
+            // Every session *this window* holds, not every session there is.
+            //
+            // Asking the engine for the list gives the Core's, which is every
+            // window's: two windows open, close one, and the other is left
+            // running with no panes at all. Verified on the machine before
+            // this line changed. The tab registry is this window's own, and
+            // "the shells I was showing" is what closing a window ends.
+            let mine: Vec<usize> = self
+                .window.tabs
+                .tab_ids()
+                .into_iter()
+                .flat_map(|tab| self.window.tabs.pane_ids(tab))
+                .collect();
+            for pane in mine {
+                crate::statsbar::forget(pane);
+                unterm_services::ghost_text::forget(pane as u64);
+                let _ = self.engine.destroy_session(pane);
+            }
+        }
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.set_visible(false);
+        }
+        // macOS can keep the application when its last window goes: it
+        // stays in the Dock, and clicking it there brings a window back
+        // through the wake latch. Only "keep running" without a menu-bar
+        // icon comes here asking for that; everything else goes on to exit.
+        if close_leaves_process_running(
+            leaving,
+            outcome,
+            Self::last_window_close_ends_process(),
+        ) {
+            self.window.state = None;
+            self.window.close_confirmed = false;
+            return;
+        }
+        self.window.closing = true;
+        // Take the Core with us. It is spawned detached so that closing a
+        // window does not end the shells behind it, which is right for a
+        // window and wrong for the application leaving: nothing else ever
+        // stops it, so every quit left one running. They pile up unseen on
+        // macOS, and on Windows one holds unterm-core.exe open against the
+        // next installer -- which is why installing used to ask the user to
+        // close a program that has no window.
+        //
+        // Here rather than after the event loop returns: the fuse below ends
+        // this process with `exit`, which does not unwind, so nothing after
+        // `run_app` runs on any platform. The sessions this window owned are
+        // already gone by now.
+        crate::engine_backend::stop_core_if_ours();
+        // The fuse. Whatever a teardown thread is joining, whatever lock a
+        // worker still wants: the user chose to leave, the state is saved,
+        // and needing Force Quit to make that stick is the one outcome this
+        // function is not allowed to produce.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::process::exit(0);
+        });
+    }
+
+    /// What the indicator has to report right now.
+    fn background_status(&self) -> crate::tray::Status {
+        crate::tray::Status {
+            sessions: unterm_engine::SessionEngine::list_sessions(&self.engine)
+                .map(|sessions| sessions.len())
+                .unwrap_or(0),
+            waiting: crate::cockpit::attention_count(
+                &unterm_services::cockpit::status::snapshot(),
+            ),
+        }
+    }
+
+    /// Put the window away and leave the sessions running behind an indicator.
+    ///
+    /// The window's GPU surface, its adopted panes and its Dock tile all go;
+    /// the process stays alive for one reason only, which is to be the thing
+    /// on screen that says the shells are still there and hands them back.
+    ///
+    /// Returns false when this desktop has no tray to put an indicator in. The
+    /// caller then closes the ordinary way rather than parking sessions where
+    /// nothing announces them -- the Core still holds them and `unterm` still
+    /// finds them, but nobody is left believing an icon exists.
+    fn enter_background(&mut self) -> bool {
+        let _slow = SlowGuard::new("enter_background");
+        self.save_last_session();
+        let status = self.background_status();
+        let Some(tray) = crate::tray::Tray::show(status) else {
+            return false;
+        };
+        self.window.tray = Some(tray);
+        self.window.tray_refreshed = std::time::Instant::now();
+        // A focus request made while the window was still up has been served
+        // already; leaving it pending would reopen the window the moment it
+        // finished closing.
+        crate::tray::clear_wake();
+        // The window handle goes -- an `instance.focus` arriving on the MCP
+        // thread must not raise a dead one. The Core's channel *stays*: a
+        // parked front end can still do everything except paint, and the two
+        // requests that do need a screen -- focus and confirmation -- are
+        // exactly the two that should bring the window back rather than fail.
+        // Detaching here would make an agent's "look at this" an error for as
+        // long as the user had Unterm in the background, which is precisely
+        // when an agent has something worth looking at.
+        // Every window, not one: parking destroys them all, and a stale
+        // entry here is an `Arc` keeping a dead window alive for the next
+        // `instance.focus` to raise.
+        crate::mcp_host::forget_all_windows();
+        if let Some(live) = self.window.state.take() {
+            live.window.set_visible(false);
+            drop(live);
+        }
+        // Closing a window only reaches the prompt as the last one, but
+        // Cmd+Q reaches it with others still up. They go too: their sessions
+        // stay with the Core, and the window that comes back adopts them.
+        for mut parked in self.parked.drain(..) {
+            if let Some(live) = parked.state.state.take() {
+                live.window.set_visible(false);
+            }
+        }
+        crate::tray::set_dock_visible(false);
+        log::info!(
+            "parked in the background: {} session(s), {} waiting",
+            status.sessions,
+            status.waiting
+        );
+        true
+    }
+
+    /// Come back from the tray: build the window again and let it adopt the
+    /// sessions the Core kept. `start` already does the adopting -- it is the
+    /// same path a cold launch onto a populated Core takes.
+    fn leave_background(&mut self, event_loop: &ActiveEventLoop) {
+        let _slow = SlowGuard::new("leave_background");
+        // The Dock tile first: a window created while the process is still an
+        // accessory opens behind every other app.
+        crate::tray::set_dock_visible(true);
+        match self.start(event_loop) {
+            Ok(live) => {
+                self.window.state = Some(live);
+                // The prompt was answered by the window that just came back,
+                // not by this one. Until parking existed the latch could
+                // never outlive its answer -- the process died moments after
+                // -- so nothing cleared it; now it does outlive it, and a
+                // stale `true` sends the *next* close straight past the
+                // prompt and into "end every session". Which is how a second
+                // Cmd-W killed two shells the user was never asked about.
+                self.window.close_confirmed = false;
+                self.window.restore_extra_tabs_pending = true;
+                self.window.drawn_revision = None;
+                self.sync_frame();
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.set_visible(true);
+                    live.window.focus_window();
+                    live.window.request_redraw();
+                }
+                // The indicator's whole subject is back on screen; leaving it
+                // up would be a second, stale copy of the same report.
+                self.window.tray = None;
+                self.draw();
+                if let Some(live) = self.window.state.as_ref() {
+                    crate::win_chrome::set_startup_cloak(&live.window, false);
+                }
+            }
+            Err(err) => {
+                // Keep the indicator: it is the only way back, and the
+                // sessions it counts are still there to come back to.
+                //
+                // Only when there is one. Coming back from a *closed* window
+                // rather than a parked one, the Dock tile is the way back,
+                // and hiding it here would leave no window, no indicator and
+                // no icon -- the very state this path exists to end.
+                if self.window.tray.is_some() {
+                    crate::tray::set_dock_visible(false);
+                }
+                log::error!("could not reopen the window from the tray: {err:#}");
+                // A window asked for while there was none is what woke us, and
+                // `about_to_wait` keeps waking for as long as one is queued.
+                // Left there after a failure, it would retry the build five
+                // times a second for as long as the process lives. Drop it:
+                // the ask can be made again, a spinning loop cannot be stopped.
+                let dropped = unterm_engine::take_window_requests();
+                if !dropped.is_empty() {
+                    log::error!(
+                        "dropped {} window request(s) with no window to open them from",
+                        dropped.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rest of the tabs and split layouts the last window had.
+    fn restore_extra_tabs(&mut self) {
+        // A Core that kept the sessions has already restored them --
+        // `sync_tabs` adopts every one. Opening the saved directories
+        // on top would spawn a second shell for each, and the count
+        // would grow with every restart. The saved list is for a cold
+        // start, where nothing is running to adopt.
+        let adopted = unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        let Some(saved) = self.restore.clone() else {
+            return;
+        };
+        if adopted > 1 {
+            // Even when warm-reconnecting to `unterm-core`, restore custom tab titles.
+            let tab_ids = self.window.tabs.tab_ids();
+            for (idx, saved_tab) in saved.tabs.iter().enumerate() {
+                if let (Some(&tab_id), Some(title)) = (tab_ids.get(idx), saved_tab.title.as_ref()) {
+                    if !title.trim().is_empty() {
+                        self.window.tab_titles.insert(tab_id, title.clone());
+                    }
+                }
+            }
+            return;
+        }
+        if !saved.tabs.is_empty() {
+            // Restore tab 0's custom title and any split panes it had.
+            if let Some(first_tab) = saved.tabs.first() {
+                if let (Some(tab_id), Some(title)) = (self.window.tab_id, first_tab.title.as_ref()) {
+                    if !title.trim().is_empty() {
+                        self.window.tab_titles.insert(tab_id, title.clone());
+                    }
+                }
+                for pane in first_tab.panes.iter().skip(1) {
+                    let axis = match pane.split_axis.as_deref() {
+                        Some("vertical") => unterm_engine::next_core::layout::SplitAxis::Vertical,
+                        _ => unterm_engine::next_core::layout::SplitAxis::Horizontal,
+                    };
+                    let dir = (!pane.cwd.is_empty()).then(|| pane.cwd.clone());
+                    self.split_in(axis, dir);
+                }
+            }
+            // Restore extra tabs (1..N) along with their custom titles and split panes.
+            for saved_tab in saved.tabs.iter().skip(1) {
+                let first_cwd = saved_tab
+                    .panes
+                    .first()
+                    .map(|p| p.cwd.as_str())
+                    .unwrap_or("");
+                self.new_tab_in(first_cwd);
+                if let (Some(tab_id), Some(title)) = (self.window.tab_id, saved_tab.title.as_ref()) {
+                    if !title.trim().is_empty() {
+                        self.window.tab_titles.insert(tab_id, title.clone());
+                    }
+                }
+                for pane in saved_tab.panes.iter().skip(1) {
+                    let axis = match pane.split_axis.as_deref() {
+                        Some("vertical") => unterm_engine::next_core::layout::SplitAxis::Vertical,
+                        _ => unterm_engine::next_core::layout::SplitAxis::Horizontal,
+                    };
+                    let dir = (!pane.cwd.is_empty()).then(|| pane.cwd.clone());
+                    self.split_in(axis, dir);
+                }
+            }
+            let target_tab_ids = self.window.tabs.tab_ids();
+            if let Some(&target_id) = target_tab_ids.get(saved.active_tab).or_else(|| target_tab_ids.first()) {
+                self.activate_tab(target_id);
+            }
+            return;
+        }
+        let extra: Vec<String> = saved.cwds.iter().skip(1).cloned().collect();
+        if extra.is_empty() {
+            return;
+        }
+        for cwd in extra {
+            self.new_tab_in(&cwd);
+        }
+        self.select_tab(1);
+    }
+
+    /// Write down what this window looked like, for the next plain launch.
+    fn save_last_session(&mut self) {
+        if let Some(state) = self.current_last_session() {
+            crate::session_restore::save(&state);
+            self.last_session_written = Some(state);
+        }
+    }
+
+    /// Keep `last_session.json` true while the window is up, not only when
+    /// it closes.
+    ///
+    /// It used to be written on the way out and nowhere else, so any exit
+    /// that skipped the close path -- a SIGTERM, a crash, Force Quit, a
+    /// logout that did not wait -- reopened the tabs of whenever the window
+    /// last closed properly. Replacing a running Unterm brought back one tab
+    /// out of three that way. Checked every few seconds and written only
+    /// when something changed, so an idle window writes nothing.
+    fn keep_last_session_current(&mut self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+        if self.last_session_checked.elapsed() < EVERY {
+            return;
+        }
+        self.last_session_checked = std::time::Instant::now();
+        // Mid-restore the strip holds only the tabs reopened so far; writing
+        // that down would make a crash now forget the rest for good.
+        if self.window.restore_extra_tabs_pending {
+            return;
+        }
+        let Some(state) = self.current_last_session() else {
+            return;
+        };
+        if self.last_session_written.as_ref() != Some(&state) {
+            crate::session_restore::save(&state);
+            self.last_session_written = Some(state);
+        }
+    }
+
+    /// What `last_session.json` should say about the window in front.
+    fn current_last_session(&self) -> Option<crate::session_restore::LastSession> {
+        let live = self.window.state.as_ref()?;
+        let size = self
+            .window
+            .unmaximized_rect
+            .map(|(_, size)| size)
+            .unwrap_or_else(|| live.window.inner_size());
+        let mut cwds = Vec::new();
+        let mut tabs = Vec::new();
+        let sessions =
+            unterm_engine::SessionEngine::list_sessions(&self.engine).unwrap_or_default();
+        let fallback_cwd = self
+            .start_directory
+            .as_ref()
+            .or(self.config_default_cwd.as_ref())
+            .map(|p| p.display().to_string())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_default();
+        let tab_ids = self.window.tabs.tab_ids();
+        let active_tab = self
+            .window
+            .tab_id
+            .and_then(|active| tab_ids.iter().position(|&id| id == active))
+            .unwrap_or(0);
+        for &tab in &tab_ids {
+            let pane_ids = self.window.tabs.pane_ids(tab);
+            let mut saved_panes = Vec::new();
+            for (pane_idx, &pane) in pane_ids.iter().enumerate() {
+                let session = sessions.iter().find(|s| s.id == pane);
+                let cwd = session
+                    .and_then(|s| s.shell.cwd.clone().filter(|c| !c.is_empty()))
+                    .unwrap_or_else(|| fallback_cwd.clone());
+                if pane_idx == 0 && !cwd.is_empty() {
+                    cwds.push(cwd.clone());
+                }
+                let split_axis = if pane_idx == 0 {
+                    None
+                } else {
+                    Some(match session.and_then(|s| s.split_axis) {
+                        Some(unterm_engine::next_core::layout::SplitAxis::Vertical) => {
+                            "vertical".to_string()
+                        }
+                        _ => "horizontal".to_string(),
+                    })
+                };
+                saved_panes.push(crate::session_restore::SavedPane {
+                    cwd,
+                    split_axis,
+                    screen_tail: Vec::new(),
+                });
+            }
+            if !saved_panes.is_empty() {
+                tabs.push(crate::session_restore::SavedTab {
+                    title: self.window.tab_titles.get(&tab).cloned(),
+                    panes: saved_panes,
+                });
+            }
+        }
+        Some(crate::session_restore::LastSession {
+            width: size.width,
+            height: size.height,
+            maximized: live.window.is_maximized() || self.window.unmaximized_rect.is_some(),
+            cwds,
+            active_tab,
+            tabs,
+        })
+    }
+
+    /// The chip under the pointer, when the pointer is in the bottom bar.
+    /// The same laying-out the painter does, so a press lands on what the
+    /// eye sees.
+    fn status_bar_segment_at_pointer(&mut self) -> Option<crate::statusbar::SegmentKind> {
+        let (width, height) = {
+            let live = self.window.state.as_ref()?;
+            (live.width as f32, live.height as f32)
+        };
+        if self.window.pointer.1 < height - self.status_bar_height() {
+            return None;
+        }
+        let metrics = self.window.font.metrics();
+        let columns = (width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+        let status = self.status();
+        let segments = crate::statusbar::segments(&status, columns);
+        let pt = self.chrome_pt();
+        let gap = self.mono_width(crate::statusbar::GAP);
+        let mut pen = (crate::ui_tokens::CHROME_PANEL_INSET * pt).round();
+        for segment in &segments {
+            let wide = self.mono_width(&segment.text);
+            if pen + wide > width {
+                break;
+            }
+            if self.window.pointer.0 >= pen && self.window.pointer.0 < pen + wide {
+                return Some(segment.kind);
+            }
+            pen += wide + gap;
+        }
+        None
+    }
+
+    /// A press on the confirmation banner strip when a prompt is waiting.
+    /// Returns true whenever the press landed on the strip so it never leaks
+    /// into the terminal underneath; clicking one of the three action labels
+    /// resolves the confirmation immediately.
+    fn click_confirmation_banner(&mut self) -> bool {
+        let Some(view) = unterm_mcp::handler::pending_confirmation_view() else {
+            return false;
+        };
+        let Some(live) = self.window.state.as_ref() else {
+            return false;
+        };
+        let window_width = live.width as f32;
+        let height = live.height as f32;
+        let metrics = self.window.font.metrics();
+        let pt = self.chrome_pt();
+        let pad = (crate::ui_tokens::STATUS_BAR_VERTICAL_PADDING * pt)
+            .round()
+            .max(2.0);
+        let bar_height = (metrics.height + pad * 2.0).round().max(1.0);
+        let top = height - bar_height - self.status_bar_height();
+        let left = self.dock_width(metrics);
+        if self.window.pointer.0 < left
+            || self.window.pointer.1 < top
+            || self.window.pointer.1 >= top + bar_height
+        {
+            return false;
+        }
+        let strip_width = (window_width - left).max(0.0);
+        let columns = (strip_width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+        let line = crate::confirm::status_line(
+            &view.agent,
+            &view.method,
+            &view.input_preview,
+            columns.saturating_sub(3),
+        );
+        let pen = left + (crate::ui_tokens::CHROME_PANEL_INSET * pt).round();
+        let col = ((self.window.pointer.0 - pen) / metrics.width.max(1.0))
+            .floor()
+            .max(0.0) as usize;
+        if let Some(decision) = crate::confirm::decision_at_column(&line, col) {
+            unterm_mcp::handler::resolve_confirmation(view.id, decision);
+            if let Some(live) = self.window.state.as_ref() {
+                live.window.request_redraw();
+            }
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// A press on the bottom bar. True whenever it landed in the bar, so a
+    /// missed chip is swallowed rather than falling through to the terminal
+    /// as a stray selection; each chip does what 0.57.4's did.
+    fn click_status_bar(&mut self) -> bool {
+        let Some(live) = self.window.state.as_ref() else {
+            return false;
+        };
+        let session_id = live.session_id;
+        let height = live.height as f32;
+        if self.window.pointer.1 < height - self.status_bar_height() {
+            return false;
+        }
+        let hit = self.status_bar_segment_at_pointer();
+        match hit {
+            Some(crate::statusbar::SegmentKind::Cwd) => {
+                // A click on the path copies it, ready to paste anywhere.
+                let directory = self.status().directory;
+                self.copy_text(&directory);
+                self.show_notice(format!("\u{2713} {directory}"));
+            }
+            Some(crate::statusbar::SegmentKind::Project) => {
+                self.run_key_action(crate::keys::Action::DirJump, session_id);
+            }
+            Some(crate::statusbar::SegmentKind::CaptureInclude) => self.start_system_capture(false),
+            Some(crate::statusbar::SegmentKind::CaptureExclude) => self.start_system_capture(true),
+            Some(crate::statusbar::SegmentKind::Theme) => {
+                self.run_key_action(crate::keys::Action::ThemePicker, session_id);
+            }
+            Some(crate::statusbar::SegmentKind::Mcp) => {
+                // The chip's click exports what the bar can only count: the
+                // recent audit entries, ready to paste into a report.
+                let snapshot = crate::engine_backend::mcp_state::insights_mcp_snapshot(200);
+                let mut text = format!(
+                    "mcp inputs: {} (agents seen: {})\n",
+                    snapshot.input_count, snapshot.agents_seen
+                );
+                for entry in &snapshot.recent_audit {
+                    text.push_str(entry);
+                    text.push('\n');
+                }
+                self.copy_text(&text);
+                self.show_notice("\u{2713} MCP activity copied".to_string());
+            }
+            // The chip is the switch, as 0.57.4's was; the settings page is a
+            // right press away.
+            Some(crate::statusbar::SegmentKind::Proxy) => self.toggle_proxy(),
+            Some(crate::statusbar::SegmentKind::Profile) => self.open_settings(),
+            // The chip says the arrangement is wrong; the press says why. The
+            // reason is the handshake's own words -- which name the offending
+            // Core and its version -- because "unavailable" alone leaves the
+            // user with nothing to act on.
+            Some(crate::statusbar::SegmentKind::Core) => {
+                if let Some(reason) = crate::engine_backend::core_fallback_reason() {
+                    self.show_notice(reason.to_string());
+                }
+            }
+            _ => {}
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// The proxy chip: flip whether new sessions get Unterm's proxy env vars.
+    ///
+    /// Switching on is gated on a probe — a proxy URL injected into a shell
+    /// with nothing behind it turns every command there into a connection
+    /// failure, so when nothing answers, the toggle stays off and the chip
+    /// says so for a moment instead. Off needs no probe: it only stops the
+    /// injection. Nothing here goes near the OS's own proxy settings, on any
+    /// path — the toggle is Unterm's alone.
+    fn toggle_proxy(&mut self) {
+        if unterm_services::launch_env::unterm_proxy_enabled() {
+            if let Err(err) = unterm_services::launch_env::set_unterm_proxy_enabled(false) {
+                log::warn!("could not switch the proxy off: {err:#}");
+                return;
+            }
+            self.show_notice(unterm_services::i18n::t("proxy.disabled_for_new_shells"));
+            return;
+        }
+        match unterm_services::launch_env::probe_unterm_proxy() {
+            Some(url) => {
+                if let Err(err) = unterm_services::launch_env::set_unterm_proxy_enabled(true) {
+                    log::warn!("could not switch the proxy on: {err:#}");
+                    return;
+                }
+                // The notice names what answered, so "on" is checkable at a
+                // glance rather than an act of faith.
+                self.show_notice(format!(
+                    "{} ({})",
+                    unterm_services::i18n::t("proxy.enabled_for_new_shells"),
+                    crate::statusbar::short_proxy(&url)
+                ));
+            }
+            None => {
+                // The same moment a notice gets, on the chip itself: a notice
+                // would cover the chip whose state it is explaining.
+                const SHOWN_FOR: std::time::Duration = std::time::Duration::from_millis(2400);
+                self.window.proxy_error_until = Some(std::time::Instant::now() + SHOWN_FOR);
+            }
+        }
+    }
+
+    /// A right press on the chrome. True when the chrome takes it -- before
+    /// this, a right-click aimed at a tab fell through to the terminal's
+    /// paste gesture, which is the worst possible answer to asking for a
+    /// menu.
+    fn chrome_right_click(&mut self) -> bool {
+        if self.window.pointer.1 < self.top_bar_height() {
+            // The chevron answers either button with its menu, as before;
+            // right-clicking the Proxy pill opens proxy settings.
+            match self.hovered_top_bar_item() {
+                Some(crate::topbar::Item::Menu) => self.open_quick_menu(),
+                Some(crate::topbar::Item::Proxy) => self.open_proxy_settings(),
+                _ => {}
+            }
+            return true;
+        }
+        if let Some(live) = self.window.state.as_ref() {
+            if self.window.pointer.1 >= live.height as f32 - self.status_bar_height() {
+                // The proxy chip answers a right press with the settings page,
+                // as 0.57.4's did; the rest of the bar swallows it.
+                if self.status_bar_segment_at_pointer()
+                    == Some(crate::statusbar::SegmentKind::Proxy)
+                {
+                    self.open_settings();
+                }
+                return true;
+            }
+        }
+        if self.window.sidebar_open {
+            if let Some((left, top, width, height, _row_height)) = self.sidebar_dock() {
+                let inside = self.window.pointer.0 >= left
+                    && self.window.pointer.0 < left + width
+                    && self.window.pointer.1 >= top
+                    && self.window.pointer.1 < top + height;
+                if inside {
+                    // The "+" answers a right press with the shell list, as
+                    // 0.57.4's did; a right press on a tab row opens its menu.
+                    if self.sidebar_footer_action_at(self.window.pointer.0, self.window.pointer.1) == Some(0) {
+                        self.open_shell_selector();
+                    } else if let Some(at) = self.sidebar_row_at(self.window.pointer.0, self.window.pointer.1) {
+                        if let Some(crate::sidebar::Row::Tab { index, .. }) =
+                            self.sidebar_rows().get(at).cloned()
+                        {
+                            self.select_tab_at(index);
+                            self.open_tab_menu(index);
+                        }
+                    }
+                    self.window.drawn_revision = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The tab's own menu, on the palette: 0.57.4's context-menu verbs.
+    fn open_tab_menu(&mut self, index: usize) {
+        use unterm_services::i18n::t;
+        let action = |label: String, action: crate::keys::Action| crate::palette::Entry {
+            label,
+            hint: crate::keys::chord_hint(action).unwrap_or_default(),
+            command: crate::palette::Command::Action(action),
+        };
+        self.window.palette = Some(crate::palette::Palette::new(vec![
+            action(t("menu.new_tab"), crate::keys::Action::NewTab),
+            action(
+                t("settings.menu.split_right"),
+                crate::keys::Action::SplitRight,
+            ),
+            crate::palette::Entry {
+                label: t("tab.rename"),
+                hint: String::new(),
+                command: crate::palette::Command::OpenTabRename { index },
+            },
+            action(t("tab.move_left"), crate::keys::Action::MoveTab(-1)),
+            action(t("tab.move_right"), crate::keys::Action::MoveTab(1)),
+            action(t("tab.close_pane"), crate::keys::Action::ClosePane),
+            action(t("tab.close"), crate::keys::Action::CloseTab),
+        ]));
+        self.window.drawn_revision = None;
+    }
+
+    /// The quick menu's long screenshot: the focused pane's entire history to
+    /// one tall PNG under `~/.unterm/captures/`, with the path shown where
+    /// the eye already is.
+    fn capture_scrollback(&mut self) {
+        let pane = self.focused_session();
+        let dir = unterm_protocol::state_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".").join(".unterm"))
+            .join("captures");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.show_notice(format!("capture failed: {err}"));
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|at| at.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("scrollshot-{stamp}.png"));
+        let tx = self.clipboard_tx.clone();
+        crate::clipboard::run(tx, move || {
+            let result = crate::mcp_host::scrollback_png(pane, &path)
+                .map(|image| {
+                    if let Ok(mut board) = arboard::Clipboard::new() {
+                        let _ = board.set_image(arboard::ImageData {
+                            width: image.width() as usize,
+                            height: image.height() as usize,
+                            bytes: std::borrow::Cow::Owned(image.into_raw()),
+                        });
+                    }
+                    path
+                })
+                .map_err(|err| format!("{err:#}"));
+            ClipboardResult::ScrollbackCaptured(result)
+        });
+        self.show_notice(unterm_services::i18n::t("scrollshot.started"));
+    }
+
+    fn resolve_settings_http_port() -> u16 {
+        let current = unterm_services::server_info::read_current();
+        if current.http_port != 0 {
+            return current.http_port;
+        }
+        let active = unterm_services::server_info::read();
+        if active.http_port != 0 {
+            return active.http_port;
+        }
+        unterm_core::read_discovery()
+            .ok()
+            .flatten()
+            .and_then(|core| core.http_port)
+            .unwrap_or(0)
+    }
+
+    /// Open Settings (`http://127.0.0.1:{port}`), falling back to the in-window
+    /// settings palette if the local HTTP server has not started yet.
+    fn open_settings(&mut self) {
+        let port = Self::resolve_settings_http_port();
+        if port == 0 {
+            self.open_native_settings();
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}");
+        match crate::links::open(&url) {
+            Ok(()) => self.show_notice(format!("Settings \u{00b7} {url}")),
+            Err(err) => {
+                log::warn!("could not open {url}: {err}");
+                self.open_native_settings();
+            }
+        }
+    }
+
+    /// Instant in-window Native Settings Center: 100% of terminal, UI, AI MCP,
+    /// safety guardrails, checkpoints, and remote pairing preferences live in
+    /// one keyboard-first native menu, with 1-click access to the Web Dashboard.
+    fn open_native_settings(&mut self) {
+        let entries = self.native_settings_entries();
+        let title = unterm_services::i18n::t("command.settings");
+        self.window.palette = Some(crate::palette::Palette::new(entries).titled(title));
+        self.window.drawn_revision = None;
+    }
+
+    fn native_settings_entries(&self) -> Vec<crate::palette::Entry> {
+        use unterm_services::i18n::t;
+        let current_theme = self
+            .theme_id
+            .as_deref()
+            .and_then(crate::theme::by_id)
+            .map(|theme| theme.name.to_string())
+            .unwrap_or_else(|| "Default".to_string());
+        let font_pt = format!("{:.0} pt", self.window.font_points);
+        let locale = unterm_services::i18n::current_locale();
+        let is_zh = locale.starts_with("zh");
+        let locale_name = unterm_services::i18n::available_locales()
+            .iter()
+            .find(|(code, _)| code.eq_ignore_ascii_case(locale))
+            .map(|(_, native_name)| (*native_name).to_string())
+            .unwrap_or_else(|| locale.to_string());
+        let cursor_desc = match (self.cursor_style.shape, self.cursor_style.blinking) {
+            (crate::terminal::CursorShape::Block, true) => {
+                if is_zh { "闪烁方块 (Blinking Block)" } else { "Blinking Block" }
+            }
+            (crate::terminal::CursorShape::Block, false) => {
+                if is_zh { "常亮方块 (Steady Block)" } else { "Steady Block" }
+            }
+            (crate::terminal::CursorShape::Bar, true) => {
+                if is_zh { "闪烁竖线 (Blinking Bar)" } else { "Blinking Bar" }
+            }
+            (crate::terminal::CursorShape::Bar, false) => {
+                if is_zh { "常亮竖线 (Steady Bar)" } else { "Steady Bar" }
+            }
+            (crate::terminal::CursorShape::Underline, true) => {
+                if is_zh { "闪烁下划线 (Blinking Underline)" } else { "Blinking Underline" }
+            }
+            (crate::terminal::CursorShape::Underline, false) => {
+                if is_zh { "常亮下划线 (Steady Underline)" } else { "Steady Underline" }
+            }
+        };
+        let scrollback_lines = Self::current_scrollback_lines();
+        let cli_path = Self::unterm_cli_path();
+        let clients_val = unterm_settings::clients::status(Some(&cli_path));
+        let clients_arr = clients_val.as_array().cloned().unwrap_or_default();
+        let connected_clients = clients_arr
+            .iter()
+            .filter(|c| c.get("terminal").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+        let total_clients = clients_arr.len();
+        let autonomy = unterm_settings::run_settings().autonomy;
+        let paired_devices = unterm_settings::remote::list_devices().len();
+        let proxy_on = unterm_services::launch_env::unterm_proxy_enabled();
+        let proxy_hint = if proxy_on {
+            match unterm_services::launch_env::probe_unterm_proxy() {
+                Some(url) => format!("ON \u{00b7} {}", crate::statusbar::short_proxy(&url)),
+                None => "ON \u{00b7} unreachable".to_string(),
+            }
+        } else {
+            "OFF".to_string()
+        };
+        let port = Self::resolve_settings_http_port();
+        let web_hint = if port != 0 {
+            format!("http://127.0.0.1:{port}")
+        } else {
+            t("settings.menu.web_settings.hint")
+        };
+
+        let mut entries = vec![
+            crate::palette::Entry {
+                label: if is_zh {
+                    "网络代理与 Clash 节点设置 (Proxy & Clash)".to_string()
+                } else {
+                    "Network Proxy & Clash Node Settings".to_string()
+                },
+                hint: proxy_hint,
+                command: crate::palette::Command::OpenProxySettings,
+            },
+            crate::palette::Entry {
+                label: t("settings.menu.web_settings"),
+                hint: web_hint,
+                command: crate::palette::Command::OpenSettings,
+            },
+            crate::palette::Entry {
+                label: t("command.theme"),
+                hint: format!(
+                    "{current_theme}  {}",
+                    crate::keys::chord_hint(crate::keys::Action::ThemePicker).unwrap_or_default()
+                )
+                .trim()
+                .to_string(),
+                command: crate::palette::Command::Action(crate::keys::Action::ThemePicker),
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "界面语言 (UI Language)".to_string()
+                } else {
+                    "UI Language".to_string()
+                },
+                hint: locale_name,
+                command: crate::palette::Command::OpenLanguageSelector,
+            },
+            crate::palette::Entry {
+                label: t("command.font_bigger"),
+                hint: format!(
+                    "{font_pt}  {}",
+                    crate::keys::chord_hint(crate::keys::Action::IncreaseFontSize)
+                        .unwrap_or_default()
+                )
+                .trim()
+                .to_string(),
+                command: crate::palette::Command::Action(crate::keys::Action::IncreaseFontSize),
+            },
+            crate::palette::Entry {
+                label: t("command.font_smaller"),
+                hint: format!(
+                    "{font_pt}  {}",
+                    crate::keys::chord_hint(crate::keys::Action::DecreaseFontSize)
+                        .unwrap_or_default()
+                )
+                .trim()
+                .to_string(),
+                command: crate::palette::Command::Action(crate::keys::Action::DecreaseFontSize),
+            },
+            crate::palette::Entry {
+                label: t("command.font_reset"),
+                hint: crate::keys::chord_hint(crate::keys::Action::ResetFontSize)
+                    .unwrap_or_default(),
+                command: crate::palette::Command::Action(crate::keys::Action::ResetFontSize),
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "光标形状与闪烁 (Cursor Style)".to_string()
+                } else {
+                    "Cursor Style & Blink".to_string()
+                },
+                hint: cursor_desc.to_string(),
+                command: crate::palette::Command::OpenCursorSelector,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "历史回滚行数 (Scrollback Limit)".to_string()
+                } else {
+                    "Scrollback History Limit".to_string()
+                },
+                hint: format!("{scrollback_lines} lines"),
+                command: crate::palette::Command::OpenScrollbackSelector,
+            },
+            crate::palette::Entry {
+                label: t("menu.select_shell"),
+                hint: self.status().shell,
+                command: crate::palette::Command::OpenShellSelector,
+            },
+            crate::palette::Entry {
+                label: t("command.left_tab_bar"),
+                hint: crate::keys::chord_hint(crate::keys::Action::LeftTabBar).unwrap_or_default(),
+                command: crate::palette::Command::Action(crate::keys::Action::LeftTabBar),
+            },
+            crate::palette::Entry {
+                label: t("command.file_tree"),
+                hint: crate::keys::chord_hint(crate::keys::Action::TreeSidebar).unwrap_or_default(),
+                command: crate::palette::Command::Action(crate::keys::Action::TreeSidebar),
+            },
+            crate::palette::Entry {
+                label: t("menu.git_panel"),
+                hint: crate::keys::chord_hint(crate::keys::Action::GitPanel).unwrap_or_default(),
+                command: crate::palette::Command::Action(crate::keys::Action::GitPanel),
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "AI 助手 MCP 接入管理 (逐项开关)".to_string()
+                } else {
+                    "AI Clients MCP Manager (Per-Client)".to_string()
+                },
+                hint: format!("{connected_clients}/{total_clients} connected"),
+                command: crate::palette::Command::OpenMcpClients,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "一键配置全部本机 AI 助手 (Auto-Setup All)".to_string()
+                } else {
+                    "Auto-Configure All AI Agents (MCP)".to_string()
+                },
+                hint: "Claude \u{00b7} Codex \u{00b7} Gemini \u{00b7} Agy \u{00b7} Cursor".to_string(),
+                command: crate::palette::Command::SetupAiAgents,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "AI 自主权与安全审批级别 (Autonomy)".to_string()
+                } else {
+                    "AI Autonomy & Safety Guardrail".to_string()
+                },
+                hint: autonomy.label().to_string(),
+                command: crate::palette::Command::OpenAutonomySelector,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "Git 自动检查点与一键回滚 (Checkpoints)".to_string()
+                } else {
+                    "Git Checkpoints & 1-Click Rollback".to_string()
+                },
+                hint: "git stash / rollback".to_string(),
+                command: crate::palette::Command::OpenCheckpoints,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "跨 Agent 接力当前窗格 (Context Handoff)".to_string()
+                } else {
+                    "Cross-Agent Context Handoff".to_string()
+                },
+                hint: "Claude \u{2194} Codex \u{2194} Gemini".to_string(),
+                command: crate::palette::Command::OpenAgentHandoff,
+            },
+            crate::palette::Entry {
+                label: t("command.agent_inbox"),
+                hint: crate::keys::chord_hint(crate::keys::Action::CockpitInbox)
+                    .unwrap_or_default(),
+                command: crate::palette::Command::Action(crate::keys::Action::CockpitInbox),
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "手机扫码远程查看与审批 (Pocket Unterm QR)".to_string()
+                } else {
+                    "Mobile Remote Pairing QR (Pocket Unterm)".to_string()
+                },
+                hint: "QR + PIN".to_string(),
+                command: crate::palette::Command::OpenPocketQr,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "已配对手机设备管理 (Paired Devices)".to_string()
+                } else {
+                    "Paired Mobile Devices".to_string()
+                },
+                hint: format!("{paired_devices} paired"),
+                command: crate::palette::Command::OpenPairedDevices,
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "编辑配置文件 (unterm.conf)".to_string()
+                } else {
+                    "Edit Configuration File (unterm.conf)".to_string()
+                },
+                hint: "unterm.conf".to_string(),
+                command: crate::palette::Command::OpenConfigFile,
+            },
+        ];
+        if let Some(target) = self.window.ssh_targets.get(&self.focused_session()) {
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    format!("一键重连 / 克隆当前 SSH ({target})")
+                } else {
+                    format!("Reconnect / Clone SSH ({target})")
+                },
+                hint: "ssh".to_string(),
+                command: crate::palette::Command::ReconnectSsh {
+                    pane_id: self.focused_session(),
+                },
+            });
+        }
+        if unterm_settings::console_dir().is_some() {
+            entries.push(crate::palette::Entry {
+                label: t("settings.menu.console"),
+                hint: t("settings.menu.console.hint"),
+                command: crate::palette::Command::OpenConsole,
+            });
+        }
+        entries
+    }
+
+    fn setup_ai_agents(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        self.show_notice(if is_zh {
+            "正在配置 AI Agent MCP 接入…".to_string()
+        } else {
+            "Configuring AI Agent MCP integrations…".to_string()
+        });
+        let _ = std::thread::Builder::new()
+            .name("setup-ai-agents".to_string())
+            .spawn(move || {
+                let cli = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("unterm-cli")))
+                    .filter(|path| path.is_file())
+                    .unwrap_or_else(|| std::path::PathBuf::from("unterm-cli"));
+                match std::process::Command::new(&cli).arg("setup-ai").output() {
+                    Ok(out) if out.status.success() => {
+                        crate::updates::notify(if is_zh {
+                            "\u{2713} AI Agent MCP 自动配置已完成".to_string()
+                        } else {
+                            "\u{2713} AI Agent MCP configured".to_string()
+                        });
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        crate::updates::notify(format!("setup-ai failed: {err}"));
+                    }
+                    Err(err) => {
+                        crate::updates::notify(format!("setup-ai error: {err}"));
+                    }
+                }
+            });
+    }
+
+    /// Open the Unzoo One console. Same HTTP server as the settings page,
+    /// off `/console/`.
+    fn open_console(&mut self) {
+        let port = Self::resolve_settings_http_port();
+        if port == 0 {
+            log::warn!("the settings server has not started yet");
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}/console/");
+        match crate::links::open(&url) {
+            Ok(()) => self.show_notice(format!("Console \u{00b7} {url}")),
+            Err(err) => log::warn!("could not open {url}: {err}"),
+        }
+    }
+
+    fn unterm_cli_path() -> String {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("unterm-cli")))
+            .filter(|path| path.is_file())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "unterm-cli".to_string())
+    }
+
+    fn open_language_selector(&mut self) {
+        let current = unterm_services::i18n::current_locale();
+        let is_zh = current.starts_with("zh");
+        let entries: Vec<crate::palette::Entry> = unterm_services::i18n::available_locales()
+            .iter()
+            .map(|&(code, native_name)| {
+                let active = code.eq_ignore_ascii_case(current);
+                let mark = if active { "\u{2713} " } else { "  " };
+                crate::palette::Entry {
+                    label: format!("{mark}{native_name}"),
+                    hint: code.to_string(),
+                    command: crate::palette::Command::SetLanguage {
+                        code: code.to_string(),
+                    },
+                }
+            })
+            .collect();
+        let title = if is_zh {
+            "界面语言 (UI Language)".to_string()
+        } else {
+            "UI Language".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn set_language(&mut self, code: &str) {
+        unterm_services::i18n::set_locale(code);
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        self.show_notice(if is_zh {
+            format!("\u{2713} 界面语言已切换为 {code}")
+        } else {
+            format!("\u{2713} UI language set to {code}")
+        });
+        self.window.drawn_revision = None;
+    }
+
+    fn open_cursor_selector(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let options = [
+            (
+                "SteadyBlock",
+                crate::terminal::CursorShape::Block,
+                false,
+                if is_zh { "常亮方块 (Steady Block)" } else { "Steady Block" },
+            ),
+            (
+                "BlinkingBlock",
+                crate::terminal::CursorShape::Block,
+                true,
+                if is_zh { "闪烁方块 (Blinking Block)" } else { "Blinking Block" },
+            ),
+            (
+                "SteadyBar",
+                crate::terminal::CursorShape::Bar,
+                false,
+                if is_zh { "常亮竖线 (Steady Bar)" } else { "Steady Bar" },
+            ),
+            (
+                "BlinkingBar",
+                crate::terminal::CursorShape::Bar,
+                true,
+                if is_zh { "闪烁竖线 (Blinking Bar)" } else { "Blinking Bar" },
+            ),
+            (
+                "SteadyUnderline",
+                crate::terminal::CursorShape::Underline,
+                false,
+                if is_zh { "常亮下划线 (Steady Underline)" } else { "Steady Underline" },
+            ),
+            (
+                "BlinkingUnderline",
+                crate::terminal::CursorShape::Underline,
+                true,
+                if is_zh { "闪烁下划线 (Blinking Underline)" } else { "Blinking Underline" },
+            ),
+        ];
+        let entries = options
+            .into_iter()
+            .map(|(style, shape, blinking, label)| {
+                let active =
+                    self.cursor_style.shape == shape && self.cursor_style.blinking == blinking;
+                let mark = if active { "\u{2713} " } else { "  " };
+                crate::palette::Entry {
+                    label: format!("{mark}{label}"),
+                    hint: style.to_string(),
+                    command: crate::palette::Command::SetCursorStyle {
+                        style: style.to_string(),
+                    },
+                }
+            })
+            .collect();
+        let title = if is_zh {
+            "光标形状与闪烁 (Cursor Style)".to_string()
+        } else {
+            "Cursor Style & Blink".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn set_cursor_style(&mut self, style: &str) {
+        let (shape, blinking) = match style {
+            "SteadyBlock" => (crate::terminal::CursorShape::Block, false),
+            "BlinkingBlock" => (crate::terminal::CursorShape::Block, true),
+            "SteadyBar" => (crate::terminal::CursorShape::Bar, false),
+            "BlinkingBar" => (crate::terminal::CursorShape::Bar, true),
+            "SteadyUnderline" => (crate::terminal::CursorShape::Underline, false),
+            "BlinkingUnderline" => (crate::terminal::CursorShape::Underline, true),
+            _ => (crate::terminal::CursorShape::Block, true),
+        };
+        self.cursor_style = crate::terminal::CursorStyle { shape, blinking };
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        self.show_notice(if is_zh {
+            format!("\u{2713} 光标样式已切换为 {style}")
+        } else {
+            format!("\u{2713} Cursor style set to {style}")
+        });
+        self.window.drawn_revision = None;
+    }
+
+    fn current_scrollback_lines() -> usize {
+        if let Some(path) = unterm_protocol::state_path("scrollback.json") {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(n) = val
+                        .get("lines")
+                        .or_else(|| val.get("scrollback_lines"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        if n > 0 {
+                            return n as usize;
+                        }
+                    }
+                }
+            }
+        }
+        10_000
+    }
+
+    fn open_scrollback_selector(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let current = Self::current_scrollback_lines();
+        let presets: [usize; 5] = [5_000, 10_000, 50_000, 100_000, 500_000];
+        let entries = presets
+            .into_iter()
+            .map(|lines| {
+                let active = current == lines;
+                let mark = if active { "\u{2713} " } else { "  " };
+                crate::palette::Entry {
+                    label: format!("{mark}{lines} lines"),
+                    hint: if lines == 10_000 {
+                        "Default".to_string()
+                    } else {
+                        String::new()
+                    },
+                    command: crate::palette::Command::SetScrollbackLines { lines },
+                }
+            })
+            .collect();
+        let title = if is_zh {
+            "历史回滚行数上限 (Scrollback Limit)".to_string()
+        } else {
+            "Scrollback History Limit".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn set_scrollback_lines(&mut self, lines: usize) {
+        let clamped = lines.clamp(1_000, 1_000_000);
+        if let Some(path) = unterm_protocol::state_path("scrollback.json") {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let body = format!("{{\n  \"lines\": {clamped},\n  \"scrollback_lines\": {clamped}\n}}\n");
+            let _ = std::fs::write(path, body);
+        }
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        self.show_notice(if is_zh {
+            format!("\u{2713} 新会话回滚行数已设为 {clamped}")
+        } else {
+            format!("\u{2713} Scrollback limit set to {clamped} lines")
+        });
+        self.window.drawn_revision = None;
+    }
+
+    fn open_mcp_clients(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let cli = Self::unterm_cli_path();
+        let list = unterm_settings::clients::status(Some(&cli));
+        let clients = list.as_array().cloned().unwrap_or_default();
+        let mut entries = Vec::with_capacity(clients.len() + 1);
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "\u{2728} 一键开启全部已安装 AI 助手".to_string()
+            } else {
+                "\u{2728} Auto-Connect All Installed AI Clients".to_string()
+            },
+            hint: "setup-ai".to_string(),
+            command: crate::palette::Command::SetupAiAgents,
+        });
+        for client in clients {
+            let id = client.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = client.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+            let connected = client.get("terminal").and_then(|v| v.as_bool()).unwrap_or(false);
+            let detected = client.get("detected").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mark = if connected { "\u{2713} " } else { "  " };
+            let status_hint = match (connected, detected) {
+                (true, _) => {
+                    if is_zh { "已接入 · 回车断开" } else { "Connected · Enter to disconnect" }
+                }
+                (false, true) => {
+                    if is_zh { "已检测到 · 回车接入" } else { "Detected · Enter to connect" }
+                }
+                (false, false) => {
+                    if is_zh { "未安装 · 回车写入配置" } else { "Not detected · Enter to write config" }
+                }
+            };
+            entries.push(crate::palette::Entry {
+                label: format!("{mark}{name}"),
+                hint: status_hint.to_string(),
+                command: crate::palette::Command::ToggleMcpClient {
+                    id: id.to_string(),
+                    connect: !connected,
+                },
+            });
+        }
+        let title = if is_zh {
+            "AI 助手 MCP 接入管理 (Per-Client MCP)".to_string()
+        } else {
+            "AI Clients MCP Manager".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn toggle_mcp_client(&mut self, id: &str, connect: bool) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let cli = Self::unterm_cli_path();
+        match unterm_settings::clients::set(id, &cli, connect) {
+            Ok(_) => {
+                self.show_notice(if is_zh {
+                    if connect {
+                        format!("\u{2713} 已接入 {id} MCP")
+                    } else {
+                        format!("\u{2713} 已断开 {id} MCP")
+                    }
+                } else if connect {
+                    format!("\u{2713} Connected {id} MCP")
+                } else {
+                    format!("\u{2713} Disconnected {id} MCP")
+                });
+                self.open_mcp_clients();
+            }
+            Err(err) => {
+                self.show_notice(format!("MCP config error: {err}"));
+            }
+        }
+    }
+
+    fn open_paired_devices(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let devices = unterm_settings::remote::list_devices();
+        let mut entries = Vec::with_capacity(devices.len() + 1);
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "+ 扫码配对新手机 (Pocket Unterm QR)".to_string()
+            } else {
+                "+ Pair New Mobile Device (Pocket Unterm QR)".to_string()
+            },
+            hint: "QR + PIN".to_string(),
+            command: crate::palette::Command::OpenPocketQr,
+        });
+        for device in devices {
+            entries.push(crate::palette::Entry {
+                label: format!("\u{1F4F1} {}", device.device_name),
+                hint: if is_zh {
+                    format!("{} · 回车撤销授权", device.device_id)
+                } else {
+                    format!("{} · Enter to revoke", device.device_id)
+                },
+                command: crate::palette::Command::RevokePairedDevice {
+                    device_id: device.device_id,
+                },
+            });
+        }
+        let title = if is_zh {
+            "已配对手机设备管理 (Paired Mobile Devices)".to_string()
+        } else {
+            "Paired Mobile Devices".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn revoke_paired_device(&mut self, device_id: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        if unterm_settings::remote::revoke_device(device_id).unwrap_or(false) {
+            self.show_notice(if is_zh {
+                format!("\u{2713} 已撤销设备 {device_id}")
+            } else {
+                format!("\u{2713} Revoked device {device_id}")
+            });
+        }
+        self.open_paired_devices();
+    }
+
+    fn open_config_file(&mut self) {
+        let path = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".config")
+            .join("unterm")
+            .join("unterm.conf");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !path.exists() {
+            let default_conf = "# Unterm Configuration (unterm.conf)\n# Changes take effect automatically on save.\n\n# font_size = 14.0\n# default_cursor_style = \"BlinkingBlock\"\n";
+            let _ = std::fs::write(&path, default_conf);
+        }
+        let target = path.display().to_string();
+        if let Err(err) = crate::links::open_file_location(&target, None) {
+            log::warn!("could not open {target}: {err}");
+            self.show_notice(format!("unterm.conf: {target}"));
+        } else {
+            self.show_notice(format!("unterm.conf \u{00b7} {target}"));
+        }
+    }
+
+    fn read_proxy_json() -> serde_json::Value {
+        unterm_protocol::state_path("proxy.json")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({"enabled": false, "mode": "auto"}))
+    }
+
+    fn write_proxy_json(val: &serde_json::Value) -> anyhow::Result<()> {
+        let path = unterm_protocol::state_path("proxy.json")
+            .unwrap_or_else(|| std::path::PathBuf::from(".unterm").join("proxy.json"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(val)?;
+        std::fs::write(&path, body)?;
+        let enabled = val
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let _ = unterm_services::launch_env::set_unterm_proxy_enabled(enabled);
+        Ok(())
+    }
+
+    fn open_proxy_settings(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let cfg = Self::read_proxy_json();
+        let enabled = unterm_services::launch_env::unterm_proxy_enabled();
+        let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+        let probed = unterm_services::launch_env::probe_unterm_proxy();
+        let detected = unterm_services::system_proxy::detect();
+
+        let mut entries = Vec::new();
+
+        // 1. Master ON / OFF toggle for new shells
+        entries.push(crate::palette::Entry {
+            label: if enabled {
+                if is_zh {
+                    "\u{2713} 终端代理已开启 (点击关闭新标签页代理注入)".to_string()
+                } else {
+                    "\u{2713} Terminal Proxy ON (Enter to turn OFF for new shells)".to_string()
+                }
+            } else if is_zh {
+                "  开启终端代理 (为新开标签页自动注入 HTTP_PROXY / ALL_PROXY)".to_string()
+            } else {
+                "  Turn Terminal Proxy ON (Inject HTTP_PROXY / ALL_PROXY into new shells)"
+                    .to_string()
+            },
+            hint: match &probed {
+                Some(url) if enabled => format!("ON \u{00b7} {}", crate::statusbar::short_proxy(url)),
+                Some(url) => format!("OFF (ready: {})", crate::statusbar::short_proxy(url)),
+                None => "OFF (no reachable proxy)".to_string(),
+            },
+            command: crate::palette::Command::ToggleProxy,
+        });
+
+        // 2. Apply / Clear proxy immediately in the currently focused shell pane
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "\u{26A1} 立即在当前终端窗格生效 (export HTTP_PROXY / ALL_PROXY)".to_string()
+            } else {
+                "\u{26A1} Apply Proxy to Current Pane Now (export HTTP_PROXY / ALL_PROXY)"
+                    .to_string()
+            },
+            hint: format!("pane {}", self.focused_session()),
+            command: crate::palette::Command::ApplyProxyToCurrentPane { enable: true },
+        });
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "\u{2715} 清除当前终端窗格的代理环境变量 (unset HTTP_PROXY / ALL_PROXY)".to_string()
+            } else {
+                "\u{2715} Clear Proxy Env in Current Pane (unset HTTP_PROXY / ALL_PROXY)"
+                    .to_string()
+            },
+            hint: format!("pane {}", self.focused_session()),
+            command: crate::palette::Command::ApplyProxyToCurrentPane { enable: false },
+        });
+
+        // 3. Clash / Mihomo live node switcher (if Clash is running or configured)
+        if let Some(ep) = unterm_services::clash_api::discover_cached() {
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    "\u{1F310} Clash / Mihomo 策略组与节点切换 (Live Node Switcher)".to_string()
+                } else {
+                    "\u{1F310} Clash / Mihomo Node Switcher".to_string()
+                },
+                hint: ep.label(),
+                command: crate::palette::Command::OpenClashGroups,
+            });
+        } else {
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    "\u{1F310} Clash / Mihomo 节点切换 (未检测到运行中的 Clash 控制器)".to_string()
+                } else {
+                    "\u{1F310} Clash / Mihomo Node Switcher (Controller not detected)".to_string()
+                },
+                hint: "127.0.0.1:9090 / verge.sock".to_string(),
+                command: crate::palette::Command::OpenClashGroups,
+            });
+        }
+
+        // 4. Mode: Auto-Detect System / Local Proxy
+        let auto_mark = if mode != "manual" { "\u{2713} " } else { "  " };
+        let detected_hint = detected
+            .as_ref()
+            .and_then(|d| d.primary_http().or(d.socks.as_deref()).map(|u| format!("{u} ({})", d.source)))
+            .unwrap_or_else(|| "scutil / env / port scan".to_string());
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                format!("{auto_mark}自动跟随系统代理 / 自动扫描本地端口 (Auto Mode)")
+            } else {
+                format!("{auto_mark}Auto-Detect System & Local Proxy (Auto Mode)")
+            },
+            hint: detected_hint,
+            command: crate::palette::Command::SetProxyPreset {
+                mode: "auto".to_string(),
+                http_proxy: None,
+                socks_proxy: None,
+            },
+        });
+
+        // 5. Common Local Port Presets (Manual Mode)
+        let current_http = cfg
+            .get("http_proxy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let presets = [
+            (
+                "Clash Verge Rev (127.0.0.1:7897)",
+                "http://127.0.0.1:7897",
+                "socks5://127.0.0.1:7897",
+            ),
+            (
+                "Clash / ClashX / Mihomo (127.0.0.1:7890)",
+                "http://127.0.0.1:7890",
+                "socks5://127.0.0.1:7890",
+            ),
+            (
+                "V2RayU / MacV2Ray (127.0.0.1:1087 / 1080)",
+                "http://127.0.0.1:1087",
+                "socks5://127.0.0.1:1080",
+            ),
+            (
+                "Surge (127.0.0.1:6152 / 6153)",
+                "http://127.0.0.1:6152",
+                "socks5://127.0.0.1:6153",
+            ),
+        ];
+        for (title_str, http_url, socks_url) in presets {
+            let active = mode == "manual" && current_http == http_url;
+            let mark = if active { "\u{2713} " } else { "  " };
+            let reachable = unterm_services::launch_env::proxy_endpoint_reachable(http_url);
+            let status_tag = if reachable {
+                if is_zh { "在线" } else { "reachable" }
+            } else if is_zh {
+                "未监听"
+            } else {
+                "offline"
+            };
+            entries.push(crate::palette::Entry {
+                label: format!("{mark}{title_str}"),
+                hint: format!("{http_url} ({status_tag})"),
+                command: crate::palette::Command::SetProxyPreset {
+                    mode: "manual".to_string(),
+                    http_proxy: Some(http_url.to_string()),
+                    socks_proxy: Some(socks_url.to_string()),
+                },
+            });
+        }
+
+        // 6. Custom Proxy URL input & Edit proxy.json
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "  输入自定义代理地址与端口 (Custom Proxy URL…)" .to_string()
+            } else {
+                "  Enter Custom Proxy URL & Port…".to_string()
+            },
+            hint: if !current_http.is_empty() {
+                current_http.to_string()
+            } else {
+                "http://127.0.0.1:port".to_string()
+            },
+            command: crate::palette::Command::OpenCustomProxyInput,
+        });
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "  高级：在编辑器中打开 ~/.unterm/proxy.json (多节点轮换池)".to_string()
+            } else {
+                "  Advanced: Edit ~/.unterm/proxy.json in Editor".to_string()
+            },
+            hint: "proxy.json".to_string(),
+            command: crate::palette::Command::OpenProxyConfigFile,
+        });
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "\u{1F5A5} 打开设置 (主题 / 代理 / 会话 / 工作台)".to_string()
+            } else {
+                "\u{1F5A5} Open Settings (Themes / Proxy / Sessions)".to_string()
+            },
+            hint: {
+                let p = Self::resolve_settings_http_port();
+                if p != 0 {
+                    format!("http://127.0.0.1:{p}")
+                } else {
+                    "settings".to_string()
+                }
+            },
+            command: crate::palette::Command::OpenSettings,
+        });
+
+        let title = if is_zh {
+            "网络代理与 Clash 节点设置 (Network Proxy & Clash)".to_string()
+        } else {
+            "Network Proxy & Clash Settings".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn apply_proxy_to_current_pane(&mut self, enable: bool) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let pane_id = self.focused_session();
+        if !enable {
+            let cmd = "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy\r";
+            let _ = self.engine.write_input(pane_id, cmd);
+            let _ = unterm_services::launch_env::set_unterm_proxy_enabled(false);
+            self.show_notice(if is_zh {
+                "\u{2713} 已清除当前窗格代理并关闭新窗格代理注入".to_string()
+            } else {
+                "\u{2713} Cleared proxy env in current pane and disabled for new shells"
+                    .to_string()
+            });
+            return;
+        }
+        let _ = unterm_services::launch_env::set_unterm_proxy_enabled(true);
+        let Some(env_pairs) = unterm_services::launch_env::read_unterm_proxy_env() else {
+            self.show_notice(if is_zh {
+                "\u{26A0} 未检测到可用的本地代理端口，请先启动 Clash/代理软件或指定端口"
+                    .to_string()
+            } else {
+                "\u{26A0} No reachable proxy endpoint found".to_string()
+            });
+            return;
+        };
+        let mut exports = Vec::new();
+        for (k, v) in &env_pairs {
+            exports.push(format!("{k}={}", shell_quoted_path(v)));
+        }
+        let cmd = format!("export {}\r", exports.join(" "));
+        let _ = self.engine.write_input(pane_id, &cmd);
+        let summary = env_pairs
+            .iter()
+            .find(|(k, _)| k == "HTTP_PROXY" || k == "ALL_PROXY")
+            .map(|(_, v)| crate::statusbar::short_proxy(v))
+            .unwrap_or_else(|| "proxy".to_string());
+        self.show_notice(if is_zh {
+            format!("\u{2713} 已向当前窗格注入代理 ({summary})")
+        } else {
+            format!("\u{2713} Injected proxy ({summary}) into current pane")
+        });
+    }
+
+    fn set_proxy_preset(
+        &mut self,
+        mode: &str,
+        http_proxy: Option<&str>,
+        socks_proxy: Option<&str>,
+    ) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let mut cfg = Self::read_proxy_json();
+        if !cfg.is_object() {
+            cfg = serde_json::json!({});
+        }
+        cfg["enabled"] = serde_json::Value::Bool(true);
+        cfg["mode"] = serde_json::Value::String(mode.to_string());
+        if let Some(http) = http_proxy {
+            cfg["http_proxy"] = serde_json::Value::String(http.to_string());
+        }
+        if let Some(socks) = socks_proxy {
+            cfg["socks_proxy"] = serde_json::Value::String(socks.to_string());
+        }
+        if let Err(err) = Self::write_proxy_json(&cfg) {
+            self.show_notice(format!("Failed to save proxy.json: {err}"));
+            return;
+        }
+        let desc = http_proxy.unwrap_or("Auto");
+        self.show_notice(if is_zh {
+            format!("\u{2713} 代理模式已切换为: {desc} (已自动开启终端代理)")
+        } else {
+            format!("\u{2713} Proxy set to: {desc} (Enabled)")
+        });
+        self.open_proxy_settings();
+    }
+
+    fn open_custom_proxy_input(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let cfg = Self::read_proxy_json();
+        let current = cfg
+            .get("http_proxy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://127.0.0.1:7890")
+            .to_string();
+        let entries = vec![crate::palette::Entry {
+            label: if is_zh {
+                "按 Enter 保存上方输入的代理地址 (如 http://127.0.0.1:7890 或 :7897)".to_string()
+            } else {
+                "Press Enter to save the proxy URL typed above (e.g. http://127.0.0.1:7890)"
+                    .to_string()
+            },
+            hint: "Enter".to_string(),
+            command: crate::palette::Command::SaveCustomProxyUrl,
+        }];
+        let mut palette = crate::palette::Palette::writing(entries);
+        palette.query = current;
+        self.window.palette = Some(palette);
+        self.window.drawn_revision = None;
+    }
+
+    fn save_custom_proxy_url(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.open_proxy_settings();
+            return;
+        }
+        let url = if trimmed.starts_with(':') {
+            format!("http://127.0.0.1{trimmed}")
+        } else if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            format!("http://127.0.0.1:{trimmed}")
+        } else if !trimmed.contains("://") {
+            format!("http://{trimmed}")
+        } else {
+            trimmed.to_string()
+        };
+        let socks = if let Some(rest) = url.strip_prefix("http://") {
+            Some(format!("socks5://{rest}"))
+        } else {
+            None
+        };
+        self.set_proxy_preset("manual", Some(&url), socks.as_deref());
+    }
+
+    fn open_clash_groups(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(ep) = unterm_services::clash_api::discover_cached() else {
+            self.show_notice(if is_zh {
+                "未检测到运行中的 Clash / Mihomo 控制器 (127.0.0.1:9090 或 verge.sock)".to_string()
+            } else {
+                "No active Clash / Mihomo controller detected".to_string()
+            });
+            return;
+        };
+        let Ok(proxies_map) = unterm_services::clash_api::proxies(&ep) else {
+            self.show_notice("Failed to read /proxies from Clash controller".to_string());
+            return;
+        };
+        let Some(obj) = proxies_map.as_object() else {
+            return;
+        };
+        let mut groups: Vec<(String, String, usize)> = obj
+            .iter()
+            .filter_map(|(name, v)| {
+                let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if !kind.eq_ignore_ascii_case("Selector") {
+                    return None;
+                }
+                let now = v
+                    .get("now")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let count = v
+                    .get("all")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                Some((name.clone(), now, count))
+            })
+            .collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let entries = groups
+            .into_iter()
+            .map(|(group, now, count)| crate::palette::Entry {
+                label: format!("\u{1F310} {group}"),
+                hint: if is_zh {
+                    format!("当前: {now} ({count} 个节点)")
+                } else {
+                    format!("Current: {now} ({count} nodes)")
+                },
+                command: crate::palette::Command::OpenClashGroupNodes { group },
+            })
+            .collect();
+        let title = if is_zh {
+            format!("Clash 策略组选择 ({})", ep.label())
+        } else {
+            format!("Clash Selector Groups ({})", ep.label())
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn open_clash_group_nodes(&mut self, group: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(ep) = unterm_services::clash_api::discover_cached() else {
+            return;
+        };
+        let Ok(proxies_map) = unterm_services::clash_api::proxies(&ep) else {
+            return;
+        };
+        let Some(group_val) = proxies_map.get(group) else {
+            return;
+        };
+        let now = group_val
+            .get("now")
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        let all = group_val
+            .get("all")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let entries = all
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .map(|node| {
+                let active = node == now;
+                let mark = if active { "\u{2713} " } else { "  " };
+                let delay_hint = proxies_map
+                    .get(&node)
+                    .and_then(|n| n.get("history"))
+                    .and_then(|h| h.as_array())
+                    .and_then(|arr| arr.last())
+                    .and_then(|last| last.get("delay"))
+                    .and_then(|d| d.as_u64())
+                    .filter(|&d| d > 0)
+                    .map(|d| format!("{d} ms"))
+                    .unwrap_or_default();
+                crate::palette::Entry {
+                    label: format!("{mark}{node}"),
+                    hint: delay_hint,
+                    command: crate::palette::Command::SelectClashNode {
+                        group: group.to_string(),
+                        node,
+                    },
+                }
+            })
+            .collect();
+        let title = if is_zh {
+            format!("切换 Clash 节点 \u{00b7} {group}")
+        } else {
+            format!("Switch Clash Node \u{00b7} {group}")
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn select_clash_node(&mut self, group: &str, node: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(ep) = unterm_services::clash_api::discover_cached() else {
+            return;
+        };
+        match unterm_services::clash_api::select(&ep, group, node) {
+            Ok(()) => {
+                self.show_notice(if is_zh {
+                    format!("\u{2713} Clash [{group}] 已切换至: {node}")
+                } else {
+                    format!("\u{2713} Clash [{group}] switched to: {node}")
+                });
+                self.open_clash_groups();
+            }
+            Err(err) => {
+                self.show_notice(format!("Clash switch failed: {err}"));
+            }
+        }
+    }
+
+    fn open_proxy_config_file(&mut self) {
+        let path = unterm_protocol::state_path("proxy.json")
+            .unwrap_or_else(|| std::path::PathBuf::from(".unterm").join("proxy.json"));
+        if !path.exists() {
+            let _ = Self::write_proxy_json(&serde_json::json!({
+                "enabled": unterm_services::launch_env::unterm_proxy_enabled(),
+                "mode": "auto"
+            }));
+        }
+        let target = path.display().to_string();
+        let _ = crate::links::open_file_location(&target, None);
+        self.show_notice(format!("proxy.json \u{00b7} {target}"));
+    }
+
+    fn open_checkpoints(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(cwd) = self.current_directory() else {
+            self.show_notice(if is_zh {
+                "当前窗格没有工作目录".to_string()
+            } else {
+                "No working directory in the focused pane".to_string()
+            });
+            return;
+        };
+        let repo = unterm_services::cockpit::review::repo_root(&cwd).unwrap_or(cwd);
+        let repo_str = repo.display().to_string();
+        let all_checkpoints = unterm_services::cockpit::review::checkpoints();
+        let checkpoints = all_checkpoints.get(&repo_str).cloned().unwrap_or_default();
+        let mut entries = Vec::with_capacity(checkpoints.len() * 2 + 1);
+        entries.push(crate::palette::Entry {
+            label: if is_zh {
+                "+ 立即创建当前工作区 Git 检查点 (Snapshot)".to_string()
+            } else {
+                "+ Create Git Checkpoint Snapshot Now".to_string()
+            },
+            hint: repo_str.clone(),
+            command: crate::palette::Command::CreateCheckpoint,
+        });
+        for cp in checkpoints {
+            let short_sha: String = cp.sha.chars().take(8).collect();
+            let desc = format!("{} @ {}", cp.agent, cp.at);
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    format!("\u{21BA} 回滚到 {short_sha} ({desc})")
+                } else {
+                    format!("\u{21BA} Rollback to {short_sha} ({desc})")
+                },
+                hint: format!("restore {short_sha}"),
+                command: crate::palette::Command::RestoreCheckpoint {
+                    repo: repo_str.clone(),
+                    oid: cp.sha.clone(),
+                    label: desc,
+                },
+            });
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    format!("   查看变更对比 Diff \u{00b7} {short_sha}")
+                } else {
+                    format!("   Inspect Diff Since \u{00b7} {short_sha}")
+                },
+                hint: "git diff".to_string(),
+                command: crate::palette::Command::DiffCheckpoint {
+                    repo: repo_str.clone(),
+                    oid: cp.sha,
+                },
+            });
+        }
+        let title = if is_zh {
+            "Git 自动检查点与一键回滚 (Checkpoints)".to_string()
+        } else {
+            "Git Checkpoints & 1-Click Rollback".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn create_checkpoint(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(cwd) = self.current_directory() else {
+            return;
+        };
+        let repo = unterm_services::cockpit::review::repo_root(&cwd).unwrap_or(cwd);
+        let pane_id = self.focused_session() as u64;
+        let agent = crate::statsbar::known_facts(pane_id as usize)
+            .agent_id
+            .unwrap_or_else(|| "manual".to_string());
+        match unterm_services::cockpit::review::record_auto_checkpoint(&repo, &agent, pane_id) {
+            Ok(Some(sha)) => {
+                let short_sha: String = sha.chars().take(8).collect();
+                self.show_notice(if is_zh {
+                    format!("\u{2713} 已创建检查点 {short_sha}")
+                } else {
+                    format!("\u{2713} Created checkpoint {short_sha}")
+                });
+            }
+            Ok(None) => {
+                self.show_notice(if is_zh {
+                    "当前工作区无法创建检查点".to_string()
+                } else {
+                    "Could not create checkpoint in current directory".to_string()
+                });
+            }
+            Err(err) => {
+                self.show_notice(format!("checkpoint failed: {err}"));
+            }
+        }
+    }
+
+    fn restore_checkpoint(&mut self, repo: &str, oid: &str, label: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let path = std::path::Path::new(repo);
+        match unterm_services::cockpit::review::rollback(path, oid) {
+            Ok(()) => {
+                self.show_notice(if is_zh {
+                    format!("\u{2713} 已回滚至检查点: {label}")
+                } else {
+                    format!("\u{2713} Restored checkpoint: {label}")
+                });
+            }
+            Err(err) => {
+                self.show_notice(format!("restore failed: {err}"));
+            }
+        }
+    }
+
+    fn diff_checkpoint(&mut self, repo: &str, oid: &str) {
+        let path = std::path::Path::new(repo);
+        match unterm_services::cockpit::review::diff(path, oid) {
+            Ok(val) => {
+                let patch = val
+                    .get("patch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rows: Vec<crate::palette::Entry> = if patch.trim().is_empty() {
+                    vec![crate::palette::Entry {
+                        label: "(No differences since checkpoint)".to_string(),
+                        hint: String::new(),
+                        command: crate::palette::Command::Nothing,
+                    }]
+                } else {
+                    patch
+                        .lines()
+                        .take(120)
+                        .map(|line| crate::palette::Entry {
+                            label: line.to_string(),
+                            hint: String::new(),
+                            command: crate::palette::Command::Nothing,
+                        })
+                        .collect()
+                };
+                self.open_named_palette(rows, format!("Diff since {oid}"));
+            }
+            Err(err) => {
+                self.show_notice(format!("diff failed: {err}"));
+            }
+        }
+    }
+
+    fn open_autonomy_selector(&mut self) {
+        use unterm_services::tool_risk::Autonomy;
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let current = unterm_settings::run_settings().autonomy;
+        let item = |level: Autonomy, desc_zh: &str, desc_en: &str| {
+            let mark = if current == level { "\u{2713} " } else { "  " };
+            crate::palette::Entry {
+                label: format!("{mark}{}", level.label()),
+                hint: if is_zh {
+                    desc_zh.to_string()
+                } else {
+                    desc_en.to_string()
+                },
+                command: crate::palette::Command::SetAutonomy {
+                    level: level.as_str().to_string(),
+                },
+            }
+        };
+        let entries = vec![
+            item(
+                Autonomy::Cautious,
+                "保守模式 · 写操作与命令执行前均需审批",
+                "Ask before file writes and shell commands",
+            ),
+            item(
+                Autonomy::Balanced,
+                "平衡模式 (推荐) · 普通读写放行，高危破坏操作拦截",
+                "Recommended · Allow safe work, gate destructive actions",
+            ),
+            item(
+                Autonomy::Autonomous,
+                "全自主模式 · 自动放行，适合沙盒或无人值守任务",
+                "Auto-approve all tool calls for unattended runs",
+            ),
+        ];
+        let title = if is_zh {
+            "AI 自主权与安全防线级别 (Autonomy Level)".to_string()
+        } else {
+            "AI Autonomy & Safety Guardrail Level".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn set_autonomy(&mut self, level: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let Some(autonomy) = unterm_services::tool_risk::Autonomy::parse(level) else {
+            return;
+        };
+        let mut settings = unterm_settings::run_settings();
+        settings.autonomy = autonomy;
+        if let Err(err) = unterm_settings::set_run_settings(settings) {
+            self.show_notice(format!("Failed to save autonomy: {err}"));
+            return;
+        }
+        self.show_notice(if is_zh {
+            format!("\u{2713} AI 安全级别已切换为: {}", autonomy.label())
+        } else {
+            format!("\u{2713} AI Autonomy set to: {}", autonomy.label())
+        });
+    }
+
+    fn open_agent_handoff(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let source_pane = self.focused_session();
+        let installed = unterm_services::cockpit::fleet::installed_agents();
+        let candidates: Vec<(String, String)> = if installed.is_empty() {
+            vec![
+                ("Claude Code".to_string(), "claude".to_string()),
+                ("Codex".to_string(), "codex".to_string()),
+                ("Gemini CLI".to_string(), "gemini".to_string()),
+            ]
+        } else {
+            installed
+                .into_iter()
+                .map(|prog| (prog.to_string(), prog.to_string()))
+                .collect()
+        };
+        let entries = candidates
+            .into_iter()
+            .map(|(name, program)| crate::palette::Entry {
+                label: if is_zh {
+                    format!("\u{1F91D} 接力给 {name} (携带当前窗格上下文与 Git Diff)")
+                } else {
+                    format!("\u{1F91D} Handoff to {name} (with screen tail & git diff)")
+                },
+                hint: format!("pane {source_pane} \u{2192} {program}"),
+                command: crate::palette::Command::ExecuteAgentHandoff {
+                    source_pane,
+                    program,
+                },
+            })
+            .collect();
+        let title = if is_zh {
+            "跨 Agent 上下文无缝接力 (Cross-Agent Handoff)".to_string()
+        } else {
+            "Cross-Agent Context Handoff".to_string()
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn execute_agent_handoff(&mut self, source_pane: usize, program: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let screen_tail = self
+            .engine
+            .read_screen(source_pane)
+            .ok()
+            .map(|s| {
+                let len = s.lines.len();
+                s.lines
+                    .into_iter()
+                    .skip(len.saturating_sub(25))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let cwd = self.focused_directory();
+        let git_status = cwd
+            .as_deref()
+            .and_then(|dir| {
+                std::process::Command::new("git")
+                    .args(["status", "--short"])
+                    .current_dir(dir)
+                    .output()
+                    .ok()
+            })
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let handoff_dir = unterm_protocol::state_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".").join(".unterm"))
+            .join("handoffs");
+        let _ = std::fs::create_dir_all(&handoff_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let handoff_file = handoff_dir.join(format!("handoff-pane-{source_pane}-{stamp}.md"));
+        let doc = format!(
+            "# Unterm Cross-Agent Handoff (from pane {source_pane})\n\n## Working Directory\n`{}`\n\n## Git Status\n```\n{}\n```\n\n## Recent Terminal Context\n```\n{}\n```\n",
+            cwd.as_deref().unwrap_or("."),
+            if git_status.is_empty() { "(clean)" } else { &git_status },
+            screen_tail.trim()
+        );
+        let _ = std::fs::write(&handoff_file, &doc);
+
+        self.split(unterm_engine::next_core::layout::SplitAxis::Horizontal);
+        let new_pane = self.focused_session();
+        if new_pane != source_pane {
+            let prompt = format!(
+                "{} \"Please read {} and continue the task from pane {}.\"\r",
+                program,
+                handoff_file.display(),
+                source_pane
+            );
+            let _ = self.engine.write_input(new_pane, &prompt);
+            self.show_notice(if is_zh {
+                format!("\u{2713} 已在右侧分屏启动 {program} 并注入上下文")
+            } else {
+                format!("\u{2713} Handed off pane {source_pane} to {program}")
+            });
+        }
+    }
+
+    fn build_failure_report(&self, pane_id: usize) -> (String, Option<i32>) {
+        let exit_code = self
+            .window
+            .pane_notices
+            .get(&pane_id)
+            .and_then(|n| n.last_exit_code);
+        let screen_tail = self
+            .engine
+            .read_screen(pane_id)
+            .ok()
+            .map(|s| {
+                let non_empty: Vec<String> = s
+                    .lines
+                    .into_iter()
+                    .map(|l| l.trim_end().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let len = non_empty.len();
+                non_empty
+                    .into_iter()
+                    .skip(len.saturating_sub(40))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let cwd = self.focused_directory().unwrap_or_else(|| ".".to_string());
+        let git_status = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&cwd)
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        let report = format!(
+            "# Unterm Command Failure Diagnosis (Pane {pane_id})\n\n- **Working Directory**: `{cwd}`\n- **Last Exit Code**: `{}`\n\n## Git Status\n```\n{}\n```\n\n## Terminal Error Output (Last 40 Lines)\n```\n{}\n```\n",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            if git_status.is_empty() { "(clean)" } else { &git_status },
+            screen_tail.trim()
+        );
+        (report, exit_code)
+    }
+
+    fn open_failure_diagnosis(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let source_pane = self.focused_session();
+        let (_, exit_code) = self.build_failure_report(source_pane);
+        let installed = unterm_services::cockpit::fleet::installed_agents();
+        let candidates: Vec<(String, String)> = if installed.is_empty() {
+            vec![
+                ("Claude Code".to_string(), "claude".to_string()),
+                ("Codex".to_string(), "codex".to_string()),
+                ("Gemini CLI".to_string(), "gemini".to_string()),
+            ]
+        } else {
+            installed
+                .into_iter()
+                .map(|prog| (prog.to_string(), prog.to_string()))
+                .collect()
+        };
+        let mut entries = vec![crate::palette::Entry {
+            label: if is_zh {
+                "\u{1F4CB} 复制结构化报错诊断包到剪贴板 (Markdown)".to_string()
+            } else {
+                "\u{1F4CB} Copy Structured Error Report to Clipboard (Markdown)".to_string()
+            },
+            hint: exit_code
+                .map(|c| format!("exit {c}"))
+                .unwrap_or_else(|| "40 lines + git status".to_string()),
+            command: crate::palette::Command::CopyFailureContext,
+        }];
+        for (name, program) in candidates {
+            entries.push(crate::palette::Entry {
+                label: if is_zh {
+                    format!("\u{1FA7A} 在右侧分屏启动 {name} 自动诊断并修复报错")
+                } else {
+                    format!("\u{1FA7A} Diagnose & Fix in Split Pane with {name}")
+                },
+                hint: format!("pane {source_pane} \u{2192} {program}"),
+                command: crate::palette::Command::FixFailureWithAgent { agent: program },
+            });
+        }
+        let title = if is_zh {
+            match exit_code {
+                Some(code) if code != 0 => {
+                    format!("AI 报错诊断与一键修复 (窗格 {source_pane} · 退出码 {code})")
+                }
+                _ => format!("AI 报错诊断与一键修复 (窗格 {source_pane})"),
+            }
+        } else {
+            format!("AI Command Failure Diagnosis (Pane {source_pane})")
+        };
+        self.open_named_palette(entries, title);
+    }
+
+    fn copy_failure_context(&mut self) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let pane = self.focused_session();
+        let (report, _) = self.build_failure_report(pane);
+        self.copy_text(&report);
+        self.show_notice(if is_zh {
+            "\u{2713} 已复制报错上下文诊断包到剪贴板".to_string()
+        } else {
+            "\u{2713} Copied failure diagnosis report to clipboard".to_string()
+        });
+    }
+
+    fn fix_failure_with_agent(&mut self, program: &str) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let source_pane = self.focused_session();
+        let (report, _) = self.build_failure_report(source_pane);
+        let handoff_dir = unterm_protocol::state_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".").join(".unterm"))
+            .join("handoffs");
+        let _ = std::fs::create_dir_all(&handoff_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let diag_file = handoff_dir.join(format!("failure-pane-{source_pane}-{stamp}.md"));
+        let _ = std::fs::write(&diag_file, &report);
+
+        self.split(unterm_engine::next_core::layout::SplitAxis::Horizontal);
+        let new_pane = self.focused_session();
+        if new_pane != source_pane {
+            let prompt = format!(
+                "{} \"Please read the command failure report in {} from pane {}, diagnose the root cause, and fix it.\"\r",
+                program,
+                diag_file.display(),
+                source_pane
+            );
+            let _ = self.engine.write_input(new_pane, &prompt);
+            self.show_notice(if is_zh {
+                format!("\u{2713} 已在右侧分屏启动 {program} 诊断窗格 {source_pane} 报错")
+            } else {
+                format!("\u{2713} Launched {program} in split pane to diagnose pane {source_pane}")
+            });
+        }
+    }
+
+    fn should_guard_paste(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let high_risk_patterns = [
+            ("rm -rf /", "rm -rf /"),
+            ("rm -rf ~", "rm -rf ~"),
+            ("git reset --hard", "git reset --hard"),
+            ("git clean -fd", "git clean -fd"),
+            ("drop table", "DROP TABLE"),
+            ("drop database", "DROP DATABASE"),
+            ("mkfs.", "mkfs"),
+            ("dd if=", "dd if="),
+            ("chmod -r 777", "chmod -R 777"),
+            ("| sh", "pipe to sh"),
+            ("| bash", "pipe to bash"),
+            ("| zsh", "pipe to zsh"),
+        ];
+        for (pat, label) in high_risk_patterns {
+            if lower.contains(pat) {
+                return Some(format!("High-risk pattern detected: {label}"));
+            }
+        }
+        let newline_count = text.bytes().filter(|&b| b == b'\n' || b == b'\r').count();
+        if newline_count >= 5
+            || (newline_count >= 1
+                && (lower.contains("sudo ") || lower.contains("rm ") || lower.contains("curl ")))
+        {
+            return Some(format!(
+                "Multi-line command paste ({} lines)",
+                newline_count + 1
+            ));
+        }
+        None
+    }
+
+    fn open_safe_paste_confirm(&mut self, pane_id: usize, text: String, reason: String) {
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let first_line = text.lines().next().unwrap_or("").trim();
+        let preview: String = first_line.chars().take(48).collect();
+        let entries = vec![
+            crate::palette::Entry {
+                label: if is_zh {
+                    "\u{2713} 确认粘贴 (Paste Anyway)".to_string()
+                } else {
+                    "\u{2713} Paste Anyway".to_string()
+                },
+                hint: preview,
+                command: crate::palette::Command::ConfirmSafePaste { pane_id, text },
+            },
+            crate::palette::Entry {
+                label: if is_zh {
+                    "\u{2715} 取消粘贴 (Cancel)".to_string()
+                } else {
+                    "\u{2715} Cancel Paste".to_string()
+                },
+                hint: "Esc".to_string(),
+                command: crate::palette::Command::Nothing,
+            },
+        ];
+        let subject = if is_zh {
+            format!("\u{26A0} 安全粘贴拦截 · {reason}")
+        } else {
+            format!("\u{26A0} Safe Paste Guard · {reason}")
+        };
+        self.window.palette = Some(crate::palette::Palette::confirm(entries, subject));
+        self.window.drawn_revision = None;
+    }
+
+    fn perform_paste_input(&mut self, pane_id: usize, text: &str) {
+        let _ = self.engine.scroll_viewport_to(pane_id, isize::MAX);
+        match self.engine.paste_input(pane_id, text) {
+            Ok(_) => {
+                if crate::ghost::observe_paste(pane_id as u64, text) {
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                }
+                self.show_notice(unterm_services::i18n::t("interaction.pasted"));
+            }
+            Err(err) => {
+                log::warn!("could not paste: {err:#}");
+                self.show_notice(unterm_services::i18n::t("interaction.paste_failed"));
+            }
+        }
+    }
+
+    fn open_pocket_qr(&mut self) {
+        let _ = unterm_settings::remote::set_enabled(true, None);
+        match unterm_settings::remote::generate_pairing_code() {
+            Ok(bundle) => {
+                let target_url = if bundle.web_url.is_empty() {
+                    bundle.qr_uri.clone()
+                } else {
+                    bundle.web_url.clone()
+                };
+                let matrix = unterm_settings::qrcode_svg::render_matrix(&target_url);
+                self.window.pocket_qr = Some(PocketQrModal {
+                    url: target_url,
+                    pin: bundle.code,
+                    matrix,
+                });
+                self.window.drawn_revision = None;
+            }
+            Err(err) => {
+                self.show_notice(format!("Pocket QR error: {err}"));
+            }
+        }
+    }
+
+    fn append_pocket_qr(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let Some(modal) = self.window.pocket_qr.clone() else {
+            return;
+        };
+        if modal.matrix.is_empty() {
+            return;
+        }
+        let metrics = self.window.font.metrics();
+        let n = modal.matrix.len() as f32;
+        let quiet = 3.0;
+        let module_px = (metrics.height * 0.45).round().max(4.0);
+        let qr_box = (n + quiet * 2.0) * module_px;
+        let card_width = (qr_box + metrics.width * 10.0).max(metrics.width * 48.0);
+        let card_height = qr_box + metrics.height * 7.5;
+        let window_height = self.window_height();
+        let left = ((window_width - card_width) / 2.0).max(12.0);
+        let top = ((window_height - card_height) / 2.0).max(self.top_bar_height() + 8.0);
+
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: self.terminal_left(),
+            top: self.terminal_top(),
+            width: self.terminal_width(),
+            height: self.terminal_height(),
+            color: [0.02, 0.02, 0.02, 0.82],
+        });
+        let fill = mix(
+            self.window.colors.background,
+            self.window.colors.foreground,
+            0.10,
+        );
+        self.append_flyout(left, top, card_width, card_height, fill, quads);
+
+        let fg = self.window.colors.foreground;
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let title = if is_zh {
+            "\u{25C6} 手机扫码远程监控与审批 (Pocket Unterm)"
+        } else {
+            "\u{25C6} Pocket Unterm Mobile Remote"
+        };
+        crate::terminal::append_text(
+            title,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            [0.38, 0.69, 0.94, 1.0],
+            (left + metrics.width * 2.0, top + metrics.height * 0.8),
+            quads,
+        );
+        let pin_line = if is_zh {
+            format!("配对 PIN 码: {}   (同局域网手机扫码即用)", modal.pin)
+        } else {
+            format!("Pairing PIN: {}   (Scan on same Wi-Fi / LAN)", modal.pin)
+        };
+        crate::terminal::append_text(
+            &pin_line,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            fg,
+            (left + metrics.width * 2.0, top + metrics.height * 2.1),
+            quads,
+        );
+
+        let qr_left = (left + (card_width - qr_box) / 2.0).round();
+        let qr_top = (top + metrics.height * 3.6).round();
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            qr_left,
+            qr_top,
+            qr_box,
+            qr_box,
+            6.0,
+            [1.0, 1.0, 1.0, 1.0],
+        ));
+        for (r, row) in modal.matrix.iter().enumerate() {
+            for (c, &dark) in row.iter().enumerate() {
+                if dark {
+                    quads.backgrounds.push(unterm_render::quads::Quad {
+                        left: qr_left + (quiet + c as f32) * module_px,
+                        top: qr_top + (quiet + r as f32) * module_px,
+                        width: module_px,
+                        height: module_px,
+                        color: [0.06, 0.06, 0.08, 1.0],
+                    });
+                }
+            }
+        }
+
+        let footer_top = qr_top + qr_box + metrics.height * 0.7;
+        crate::terminal::append_text(
+            &modal.url,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            mix(fg, self.window.colors.background, 0.30),
+            (left + metrics.width * 2.0, footer_top),
+            quads,
+        );
+        let help = if is_zh {
+            "按 Enter 复制链接 · 按 O 在浏览器打开 · 按 Esc 关闭"
+        } else {
+            "Enter copy URL · O open in browser · Esc close"
+        };
+        crate::terminal::append_text(
+            help,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            mix(fg, self.window.colors.background, 0.45),
+            (left + metrics.width * 2.0, footer_top + metrics.height * 1.2),
+            quads,
+        );
+    }
+
+    fn handle_pocket_qr_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key as WinitKey, NamedKey};
+        let Some(modal) = self.window.pocket_qr.clone() else {
+            return false;
+        };
+        match &event.logical_key {
+            WinitKey::Named(NamedKey::Escape) | WinitKey::Character(_)
+                if matches!(&event.logical_key, WinitKey::Character(c) if c.eq_ignore_ascii_case("q")) =>
+            {
+                self.window.pocket_qr = None;
+            }
+            WinitKey::Named(NamedKey::Escape) => {
+                self.window.pocket_qr = None;
+            }
+            WinitKey::Named(NamedKey::Enter) => {
+                self.copy_text(&modal.url);
+                self.show_notice(format!("\u{2713} Copied {}", modal.url));
+                self.window.pocket_qr = None;
+            }
+            WinitKey::Character(ch) if ch.eq_ignore_ascii_case("o") => {
+                let _ = crate::links::open(&modal.url);
+                self.window.pocket_qr = None;
+            }
+            _ => {}
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    fn extract_ssh_target(process_name: &str, title: &str) -> Option<String> {
+        let stem = process_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(process_name)
+            .trim_end_matches(".exe");
+        let lower_title = title.trim();
+        if stem.eq_ignore_ascii_case("ssh") {
+            let arg = lower_title
+                .strip_prefix("ssh ")
+                .unwrap_or(lower_title)
+                .trim();
+            if !arg.is_empty() && !arg.eq_ignore_ascii_case("ssh") {
+                return Some(arg.to_string());
+            }
+        }
+        if let Some(rest) = lower_title.strip_prefix("ssh ") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        None
+    }
+
+    fn reconnect_ssh(&mut self, pane_id: usize) {
+        let Some(target) = self.window.ssh_targets.get(&pane_id).cloned() else {
+            self.show_notice("No active or previous SSH session recorded for this pane".to_string());
+            return;
+        };
+        let cmd = format!("ssh {target}\r");
+        let _ = self.engine.write_input(pane_id, &cmd);
+        self.show_notice(format!("\u{21BB} Reconnecting ssh {target}"));
+    }
+
+    fn open_terminal_link(&mut self, link: &crate::links::Link) {
+        let cwd_str = self
+            .current_directory()
+            .map(|p| p.to_string_lossy().to_string());
+        if let Err(err) = crate::links::open_link_in_cwd(link, cwd_str.as_deref()) {
+            log::warn!("could not open {}: {err}", link.uri);
+        }
+    }
+
+    /// The picker's rows: every theme the product ships.
+    fn theme_entries(&self) -> Vec<crate::palette::Entry> {
+        let current = self.theme_id.clone();
+        crate::theme::THEMES
+            .iter()
+            .map(|theme| crate::palette::Entry {
+                label: theme.name.to_string(),
+                hint: if current.as_deref() == Some(theme.id) {
+                    unterm_services::i18n::t_args("theme.current", &[("name", theme.name)])
+                } else {
+                    unterm_services::i18n::t(&format!("theme.preset.{}.desc", theme.id))
+                },
+                command: crate::palette::Command::ApplyTheme {
+                    id: theme.id.to_string(),
+                },
+            })
+            .collect()
+    }
+
+    /// Switch to a theme, and remember it for next time.
+    ///
+    /// The atlas goes with it: glyphs are rasterized as coverage and tinted
+    /// when drawn, so they survive -- but the frame's own colours are baked
+    /// into quads that have already been built, and the simplest way to be
+    /// sure none are stale is to draw the next frame from nothing.
+    fn apply_theme(&mut self, id: &str) {
+        let Some(theme) = crate::theme::by_id(id) else {
+            return;
+        };
+        let frame_colors = unterm_render::quads::FrameColors {
+            background: theme.background,
+            foreground: theme.foreground,
+            palette: &theme.ansi,
+        };
+        self.window.colors = frame_colors;
+        for parked in &mut self.parked {
+            parked.state.colors = frame_colors;
+            parked.state.drawn_revision = None;
+            parked.state.frame_sent = None;
+            if let Some(live) = parked.state.state.as_ref() {
+                live.window.request_redraw();
+            }
+        }
+        self.theme_id = Some(theme.id.to_string());
+        if let Err(err) = crate::theme::remember(theme.id) {
+            log::warn!("could not remember the theme: {err:#}");
+        }
+        self.theme_file_mtime = crate::theme::remembered_mtime();
+        self.window.frame_sent = None;
+        self.sync_frame();
+        self.report_terminal_colors();
+        self.show_notice(unterm_services::i18n::t_args(
+            "theme.switched_to",
+            &[("name", theme.name)],
+        ));
+        self.window.quiet_since = None;
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    /// The rows for jumping to a directory.
+    ///
+    /// Everything at once -- what is under here, what was open before, and the
+    /// machine's drives -- because the palette filters as you type and the
+    /// point of this picker is not knowing which of the three it is in.
+    /// The rows for the directory jump, for what has been typed so far.
+    fn dir_jump_entries(&self, query: &str) -> Vec<crate::palette::Entry> {
+        let here = self
+            .current_directory()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Where the pane already is, first, and only while nothing has been
+        // typed: once there is a query it is a row that matches nothing and
+        // sits above the rows that do.
+        let mut entries = Vec::new();
+        if query.is_empty() {
+            entries.push(crate::palette::Entry {
+                label: unterm_services::i18n::t("dirjump.system_picker"),
+                hint: "Ctrl+O".to_string(),
+                command: crate::palette::Command::OpenDirectoryPicker {
+                    then: crate::palette::BrowseThen::ChangeDirectory,
+                },
+            });
+            entries.push(crate::palette::Entry {
+                label: unterm_services::i18n::t("dirjump.here"),
+                hint: here.display().to_string(),
+                command: crate::palette::Command::ChangeDirectory {
+                    path: here.display().to_string(),
+                },
+            });
+        }
+        entries.extend(
+            crate::dir_jump::for_query(&here, query)
+                .into_iter()
+                .map(|entry| crate::palette::Entry {
+                    // The section it came from and the path it is. The section
+                    // is the grouping the picker used to show as headings; the
+                    // path is what tells two same-named directories apart.
+                    hint: format!("{}  {}", entry.section.heading(), entry.path.display()),
+                    label: entry.label,
+                    command: crate::palette::Command::ChangeDirectory {
+                        path: entry.path.display().to_string(),
+                    },
+                }),
+        );
+        entries
+    }
+
+    /// The rows behind the status bar's triangle.
+    fn quick_entries(&self) -> Vec<crate::palette::Entry> {
+        let recording = self
+            .window.state
+            .as_ref()
+            .and_then(|live| {
+                unterm_engine::RecordingEngine::recording_status(&self.engine, live.session_id).ok()
+            })
+            .map(|status| status.enabled)
+            .unwrap_or(false);
+
+        use unterm_services::i18n::t;
+
+        // 0.57.4's chevron menu, in its order: the window's verbs with their
+        // chords, then the palette, then the session's recording and capture
+        // family, then Settings, then who this is.
+        let chord =
+            |action: crate::keys::Action| crate::keys::chord_hint(action).unwrap_or_default();
+        let action = |label: String, action: crate::keys::Action| crate::palette::Entry {
+            label,
+            hint: chord(action),
+            command: crate::palette::Command::Action(action),
+        };
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let focused_pane = self.focused_session();
+        let pane_notice = self.window.pane_notices.get(&focused_pane).copied().unwrap_or_default();
+        let has_failure = pane_notice.error || pane_notice.last_exit_code.unwrap_or(0) != 0;
+        let diagnose_entry = crate::palette::Entry {
+            label: if is_zh {
+                if let Some(code) = pane_notice.last_exit_code.filter(|&c| c != 0) {
+                    format!("\u{1FA7A} AI 诊断当前窗格报错 (退出码 {code})…")
+                } else {
+                    "\u{1FA7A} AI 诊断当前窗格报错 / 一键修复…".to_string()
+                }
+            } else if let Some(code) = pane_notice.last_exit_code.filter(|&c| c != 0) {
+                format!("\u{1FA7A} Diagnose Last Command Failure (exit {code})…")
+            } else {
+                "\u{1FA7A} Diagnose Terminal Failure with AI…".to_string()
+            },
+            hint: if has_failure {
+                "Error detected".to_string()
+            } else {
+                "AI Fix".to_string()
+            },
+            command: crate::palette::Command::DiagnoseLastFailure,
+        };
+        let proxy_on = unterm_services::launch_env::unterm_proxy_enabled();
+        let proxy_entry = crate::palette::Entry {
+            label: if is_zh {
+                if proxy_on {
+                    "网络代理: 已启用 ● (点击切换节点/关闭)".to_string()
+                } else {
+                    "网络代理: 已关闭 (点击开启/配置节点)".to_string()
+                }
+            } else if proxy_on {
+                "Network Proxy: ON ● (Switch / Disable)".to_string()
+            } else {
+                "Network Proxy: OFF (Enable / Configure)".to_string()
+            },
+            hint: if proxy_on {
+                unterm_services::launch_env::probe_unterm_proxy()
+                    .map(|u| crate::statusbar::short_proxy(&u))
+                    .unwrap_or_else(|| "ON".to_string())
+            } else {
+                "OFF".to_string()
+            },
+            command: crate::palette::Command::OpenProxySettings,
+        };
+        let mut entries = vec![
+            action(t("menu.new_tab"), crate::keys::Action::NewTab),
+            action(
+                t("settings.menu.split_right"),
+                crate::keys::Action::SplitRight,
+            ),
+            diagnose_entry,
+            proxy_entry,
+            action(t("menu.dir_jump"), crate::keys::Action::DirJump),
+            action(t("menu.tree_sidebar"), crate::keys::Action::TreeSidebar),
+            action(t("menu.git_panel"), crate::keys::Action::GitPanel),
+            action(t("menu.left_tabs"), crate::keys::Action::LeftTabBar),
+            // The two controls the sidebar footer used to carry as its
+            // own glyphs. Still one click away — from here and from the
+            // new-session row's split — never dropped.
+            crate::palette::Entry {
+                label: t("menu.shell_selector"),
+                hint: String::new(),
+                command: crate::palette::Command::OpenShellSelector,
+            },
+            crate::palette::Entry {
+                label: t("menu.tab_navigator"),
+                hint: String::new(),
+                command: crate::palette::Command::OpenTabNavigator,
+            },
+            action(t("menu.find"), crate::keys::Action::Search),
+            action(
+                t("menu.command_palette"),
+                crate::keys::Action::CommandPalette,
+            ),
+            crate::palette::Entry {
+                label: if recording {
+                    t("settings.menu.recording_on")
+                } else {
+                    t("settings.menu.recording_off")
+                },
+                hint: t("settings.menu.recording.hint"),
+                command: crate::palette::Command::ToggleRecording,
+            },
+            crate::palette::Entry {
+                label: t("settings.menu.export_session"),
+                hint: t("settings.menu.export_session.hint"),
+                command: crate::palette::Command::ExportSession,
+            },
+            crate::palette::Entry {
+                label: t("menu.capture_region"),
+                hint: t("command.capture_region.hint"),
+                command: crate::palette::Command::SelectCaptureRegion,
+            },
+            crate::palette::Entry {
+                label: t("menu.capture_desktop"),
+                hint: String::new(),
+                command: crate::palette::Command::CaptureDesktop,
+            },
+            crate::palette::Entry {
+                label: t("menu.capture_scrollback"),
+                hint: String::new(),
+                command: crate::palette::Command::CaptureScrollback,
+            },
+            action(t("command.settings"), crate::keys::Action::Settings),
+            // Who this is: the studio's existing caption, the site, and
+            // the version — the menu's quiet last line, clicking through
+            // to the website.
+            crate::palette::Entry {
+                label: format!("Unterm · {}", t("sidebar.author_caption")),
+                hint: format!("unterm.app · v{}", env!("CARGO_PKG_VERSION")),
+                command: crate::palette::Command::OpenUrl {
+                    url: "https://unterm.app".to_string(),
+                },
+            },
+        ];
+        // 控制台只在装了资源时进菜单：没装的话点开只会是一个 404。
+        if unterm_settings::console_dir().is_some() {
+            let at = entries
+                .iter()
+                .position(|entry| {
+                    entry.command == crate::palette::Command::Action(crate::keys::Action::Settings)
+                })
+                .map(|index| index + 1)
+                .unwrap_or(entries.len());
+            entries.insert(
+                at,
+                crate::palette::Entry {
+                    label: t("settings.menu.console"),
+                    hint: t("settings.menu.console.hint"),
+                    command: crate::palette::Command::OpenConsole,
+                },
+            );
+        }
+        entries
+    }
+
+    /// Every command the GUI exposes, not only the subset with a key chord.
+    fn command_palette_entries(&self) -> Vec<crate::palette::Entry> {
+        let mut entries = command_entries();
+        // First when there is one: an update is the row someone opened the
+        // palette after the notice to find.
+        if let Some(tag) = crate::updates::available() {
+            entries.insert(
+                0,
+                crate::palette::Entry {
+                    label: unterm_services::i18n::t_args("update.install", &[("tag", &tag)]),
+                    hint: unterm_protocol::PRODUCT_VERSION.to_string(),
+                    command: crate::palette::Command::InstallUpdate,
+                },
+            );
+        }
+        for extra in self.quick_entries() {
+            if !entries.iter().any(|entry| entry.command == extra.command) {
+                entries.push(extra);
+            }
+        }
+        entries.extend(workspace_entries());
+        entries
+    }
+
+    /// The Insights card: what the AI layer is seeing, as rows to read.
+    ///
+    /// A read-only palette rather than a bespoke overlay: Esc, arrows and
+    /// clicking-to-dismiss already work there, and rows whose command is
+    /// `Nothing` cannot run anything by accident.
+    fn open_insights(&mut self) {
+        use unterm_services::i18n::t_args;
+        let row = |label: String| crate::palette::Entry {
+            label,
+            hint: String::new(),
+            command: crate::palette::Command::Nothing,
+        };
+        let status = self.status();
+        let snapshot = crate::engine_backend::mcp_state::insights_mcp_snapshot(8);
+        let mut entries = vec![
+            row(t_args("insights.shell", &[("shell", &status.shell)])),
+            row(t_args("insights.cwd", &[("cwd", &status.directory)])),
+            row(t_args(
+                "insights.inputs",
+                &[("count", &snapshot.input_count.to_string())],
+            )),
+            row(t_args(
+                "insights.agents",
+                &[("count", &snapshot.agents_seen.to_string())],
+            )),
+            row(t_args(
+                "insights.suggestions",
+                &[("count", &snapshot.pending_suggestions.to_string())],
+            )),
+            row(t_args(
+                "insights.confirmations",
+                &[("count", &snapshot.pending_confirmations.to_string())],
+            )),
+        ];
+        // The tail of the audit log, one row each: "what just happened" is
+        // the question an Insights card is opened to answer.
+        for entry in &snapshot.recent_audit {
+            entries.push(row(entry.clone()));
+        }
+        self.open_palette(entries);
+    }
+
+    /// Drop the quick menu under its button, right edge pinned on screen.
+    fn open_quick_menu(&mut self) {
+        if self.window.quick_menu.take().is_some() {
+            // The second press on the chevron closes what the first opened.
+            self.window.drawn_revision = None;
+            return;
+        }
+        let entries = self.quick_entries();
+        let pt = self.chrome_pt();
+        let width = {
+            let mut widest: f32 = 0.0;
+            for entry in &entries {
+                let mut wide = self.chrome_width(&entry.label);
+                if !entry.hint.is_empty() {
+                    wide += self.chrome_width(&entry.hint) + 18.0 * pt;
+                }
+                widest = widest.max(wide);
+            }
+            widest + (12.0 + 14.0) * pt
+        };
+        let window_width = self
+            .window.state
+            .as_ref()
+            .map(|live| live.width as f32)
+            .unwrap_or(0.0);
+        let anchor_right = self
+            .top_bar(window_width)
+            .iter()
+            .find(|piece| piece.item == crate::topbar::Item::Menu)
+            .map(|piece| piece.left + piece.width)
+            .unwrap_or(window_width);
+        let width = width.min((window_width - 8.0 * pt).max(1.0));
+        let left = (anchor_right - width)
+            .max(4.0 * pt)
+            .min((window_width - width - 4.0 * pt).max(0.0));
+        let window_height = self
+            .window.state
+            .as_ref()
+            .map(|live| live.height as f32)
+            .unwrap_or(0.0);
+        let top = self.top_bar_height() + 4.0 * pt;
+        let row_height = self.chrome_row_height();
+        let available_height =
+            (window_height - top - self.status_bar_height() - 4.0 * pt).max(row_height);
+        let visible_rows = ((available_height / row_height) as usize)
+            .max(1)
+            .min(entries.len());
+        self.window.quick_menu = Some(QuickMenu {
+            entries,
+            hover: None,
+            top_row: 0,
+            visible_rows,
+            left,
+            top,
+            width,
+            row_height,
+        });
+        self.window.drawn_revision = None;
+    }
+
+    /// A press while the dropdown is open: run the row under it, and close
+    /// either way — a menu left open after a click elsewhere is debris.
+    fn click_quick_menu(&mut self) -> bool {
+        let Some(mut menu) = self.window.quick_menu.take() else {
+            return false;
+        };
+        self.window.drawn_revision = None;
+        if let Some(delta) = menu.arrow_at(self.window.pointer.0, self.window.pointer.1) {
+            menu.scroll(delta);
+            self.window.quick_menu = Some(menu);
+            return true;
+        }
+        if let Some(at) = menu.row_at(self.window.pointer.0, self.window.pointer.1) {
+            if let Some(entry) = menu.entries.get(at) {
+                self.run_palette_command(entry.command.clone(), "");
+            }
+            return true;
+        }
+        // Outside the card: the press only closes it.
+        true
+    }
+
+    /// The dropdown itself: a bordered card of rows under the chevron.
+    fn append_quick_menu(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(menu) = self.window.quick_menu.clone() else {
+            return;
+        };
+        let pt = self.chrome_pt();
+        let chrome = self.chrome();
+        let radius = 6.0 * pt;
+        // Over everything already drawn, the way a menu has to be.
+        let _mark = quads.mark();
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            menu.left - 1.0,
+            menu.top - 1.0,
+            menu.width + 2.0,
+            menu.height() + 2.0,
+            radius,
+            chrome.outer_edge,
+        ));
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            menu.left,
+            menu.top,
+            menu.width,
+            menu.height(),
+            radius,
+            chrome.group_bg,
+        ));
+        let text_offset = ((menu.row_height - self.window.chrome_font.metrics().height) / 2.0
+            + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+            .max(0.0);
+        let hover = menu.row_at(self.window.pointer.0, self.window.pointer.1);
+        let has_scroll_gutter = menu.entries.len() > menu.visible_rows;
+        for (visible_index, (index, entry)) in menu
+            .entries
+            .iter()
+            .enumerate()
+            .skip(menu.top_row)
+            .take(menu.visible_rows)
+            .enumerate()
+        {
+            let row_top = menu.top + visible_index as f32 * menu.row_height;
+            if hover == Some(index) {
+                let row_inset = (4.0 * pt).round();
+                let row_radius = crate::ui_tokens::CORNER_RADIUS * pt;
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    menu.left + row_inset,
+                    row_top + 1.0,
+                    (menu.width - row_inset * 2.0).max(1.0),
+                    (menu.row_height - 2.0).max(1.0),
+                    row_radius,
+                    chrome.hover_bg,
+                ));
+                self.append_selection_pill(
+                    menu.left + row_inset,
+                    row_top + 1.0,
+                    (menu.row_height - 2.0).max(1.0),
+                    quads,
+                );
+            }
+            let foreground = self.chrome_foreground();
+            self.append_chrome(
+                &entry.label.clone(),
+                foreground,
+                (menu.left + 12.0 * pt, row_top + text_offset),
+                quads,
+            );
+            if !entry.hint.is_empty() {
+                let wide = self.chrome_width(&entry.hint);
+                let label_wide = self.chrome_width(&entry.label);
+                if label_wide + wide + 34.0 * pt <= menu.width {
+                    let right_pad = if has_scroll_gutter { 30.0 } else { 14.0 } * pt;
+                    self.append_chrome(
+                        &entry.hint.clone(),
+                        chrome.dim_text,
+                        (
+                            menu.left + menu.width - wide - right_pad,
+                            row_top + text_offset,
+                        ),
+                        quads,
+                    );
+                }
+            }
+        }
+        let arrow_left = menu.left + menu.width - 13.0 * pt;
+        let arrow_color = self.chrome_foreground();
+        if menu.top_row > 0 {
+            self.append_chrome(
+                "▲",
+                arrow_color,
+                (arrow_left, menu.top + text_offset),
+                quads,
+            );
+        }
+        if menu.top_row + menu.visible_rows < menu.entries.len() {
+            self.append_chrome(
+                "▼",
+                arrow_color,
+                (
+                    arrow_left,
+                    menu.top + menu.height() - menu.row_height + text_offset,
+                ),
+                quads,
+            );
+        }
+    }
+
+    fn open_palette(&mut self, entries: Vec<crate::palette::Entry>) {
+        self.window.palette = Some(crate::palette::Palette::new(entries));
+        self.window.drawn_revision = None;
+    }
+
+    fn open_named_palette(&mut self, entries: Vec<crate::palette::Entry>, title: String) {
+        self.window.palette = Some(crate::palette::Palette::new(entries).titled(title));
+        self.window.drawn_revision = None;
+    }
+
+    fn open_shell_selector(&mut self) {
+        let mut entries = launcher_entries();
+        // Where people look for "a PowerShell as administrator": the list of
+        // shells to start. It opens a separate window, as it must -- see
+        // `admin` -- and the row says so.
+        if crate::admin::available() && !crate::admin::is_admin_window() {
+            entries.push(crate::palette::Entry {
+                label: unterm_services::i18n::t("admin.new_window"),
+                hint: "UAC".to_string(),
+                command: crate::palette::Command::Action(crate::keys::Action::NewAdminWindow),
+            });
+        }
+        self.window.palette = Some(crate::palette::Palette::shells(entries));
+        self.window.drawn_revision = None;
+    }
+
+    fn tab_navigator_entries(&self) -> Vec<crate::palette::Entry> {
+        let sessions =
+            unterm_engine::SessionEngine::list_sessions(&self.engine).unwrap_or_default();
+        self.window.tabs
+            .tab_ids()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, tab_id)| {
+                let pane_id = self.window.tabs.active_pane(tab_id)?;
+                let session = sessions.iter().find(|session| session.id == pane_id)?;
+                let facts = crate::statsbar::known_facts(pane_id);
+                let project = session
+                    .shell
+                    .cwd
+                    .as_deref()
+                    .map(crate::sidebar::project_name)
+                    .unwrap_or_default();
+                let identity = facts
+                    .agent_id
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| session.title.clone());
+                let detail = crate::statusbar::short_name(&session.shell.process_name);
+                Some(crate::palette::Entry {
+                    label: [project, identity, detail]
+                        .into_iter()
+                        .filter(|part| !part.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("  "),
+                    hint: format!("tab {}  pane {}", index + 1, pane_id),
+                    command: crate::palette::Command::ActivateTab { tab_id },
+                })
+            })
+            .collect()
+    }
+
+    fn open_tab_navigator(&mut self) {
+        self.open_palette(self.tab_navigator_entries());
+    }
+
+    /// Show a tab, and tell what is on it how big it now is.
+    ///
+    /// `placements` describes the *active* tab alone, so a pane behind
+    /// another one is not resized while it is there -- and bringing it
+    /// forward is therefore the only moment it can be told. Leave the line
+    /// out and the pane keeps whatever size it last had, until something
+    /// else happens to resize the window while that pane is the one in
+    /// front. Between those two moments its program is drawing to a grid
+    /// that no longer exists.
+    ///
+    /// A full-screen program shows it plainly, because it anchors its
+    /// interface to the bottom of the screen it believes it has: the frame
+    /// lands short of the real bottom and the input line lands somewhere
+    /// else entirely, with the difference in height lying blank in between.
+    /// That was the reported symptom, and forcing one resize by hand put it
+    /// right, which is what pointed here.
+    ///
+    /// `select_tab` has always had the line. Reaching the same tab through
+    /// the palette did not.
+    fn activate_tab(&mut self, tab_id: usize) {
+        if !self.window.tabs.set_active_tab(tab_id) {
+            return;
+        }
+        self.window.tab_id = Some(tab_id);
+        if let Some(pane_id) = self.window.tabs.active_pane(tab_id) {
+            self.focus_session(pane_id);
+        }
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    /// Open a palette whose line is a task rather than a filter.
+    ///
+    /// Nothing to send is nothing to open: a crew picker on a machine with no
+    /// agents installed is an empty card.
+    fn open_fleet(&mut self, entries: Vec<crate::palette::Entry>) {
+        if entries.is_empty() {
+            self.show_notice(unterm_services::i18n::t("cockpit.fleet_no_agents"));
+            return;
+        }
+        self.window.palette = Some(crate::palette::Palette::writing(entries));
+        self.window.drawn_revision = None;
+    }
+
+    /// Open a palette that goes and looks again as the query changes.
+    fn open_browser(&mut self, entries: Vec<crate::palette::Entry>, title: String) {
+        self.window.palette = Some(crate::palette::Palette::browsing(entries).titled(title));
+        self.window.drawn_revision = None;
+    }
+
+    /// Bring a palette's rows up to date with what has been typed.
+    ///
+    /// A fixed list only narrows. A directory list is asked again, because a
+    /// typed path names a place nothing has scanned -- the scan is bounded and
+    /// the disk is not.
+    fn requery_palette(&self, palette: &mut crate::palette::Palette) {
+        match palette.source {
+            crate::palette::Source::Fixed => palette.refilter(),
+            // The line is the task, not a filter: narrowing the crews by what
+            // has been typed empties the list on the first word. Typing does
+            // clear a stale complaint, though -- it was about the last attempt.
+            crate::palette::Source::Text => palette.error = None,
+            crate::palette::Source::Directories => {
+                let rows = self.dir_jump_entries(&palette.query);
+                palette.replace_entries(rows);
+            }
+            crate::palette::Source::Characters => {
+                let rows = self.character_entries(&palette.query);
+                palette.replace_entries(rows);
+            }
+        }
+    }
+
+    /// How round a panel's corners are on this display.
+    ///
+    /// The radius is a size the reader sees, so it grows with the display's
+    /// scale. Fixed in device pixels it is a third smaller on a 1.5x screen
+    /// than on a 1x one, which is the difference between a rounded corner and
+    /// a corner that looks slightly damaged.
+    fn corner_radius(&self) -> f32 {
+        unterm_render::rounded::RADIUS * self.font_scale().max(1.0)
+    }
+
+    /// Where the open palette is, for hit-testing.
+    fn palette_card(&self) -> Option<crate::palette::Geometry> {
+        let palette = self.window.palette.as_ref()?;
+        let live = self.window.state.as_ref()?;
+        let metrics = self.window.font.metrics();
+        let rows = palette.visible().len().min(crate::palette::MAX_ROWS);
+        Some(match palette.view {
+            // The same arithmetic the paint uses, so a row is pressed
+            // where it is drawn.
+            crate::palette::View::Confirm => crate::palette::Geometry::confirming(
+                live.width as f32,
+                (metrics.width, metrics.height),
+                rows,
+                palette.error.is_some(),
+            ),
+            crate::palette::View::Search => {
+                let geometry = if palette.title.is_some() {
+                    crate::palette::Geometry::titled
+                } else {
+                    crate::palette::Geometry::new
+                };
+                geometry(
+                    live.width as f32,
+                    (metrics.width, metrics.height),
+                    rows,
+                    palette.error.is_some(),
+                )
+            }
+            crate::palette::View::ShellSelector => {
+                self.shell_selector_card(rows, palette.error.is_some())
+            }
+        })
+    }
+
+    /// The old shell chooser was a 56-cell card centred inside the terminal
+    /// pane, one third of the way down its free height. Centring against the
+    /// whole window put the replacement half over the navigation dock.
+    fn shell_selector_card(&self, rows: usize, has_error: bool) -> crate::palette::Geometry {
+        let metrics = self.window.font.metrics();
+        let leading_rows = 3;
+        let trailing_rows = 2;
+        let lines = rows + leading_rows + trailing_rows + usize::from(has_error);
+        let area_left = self.terminal_left();
+        let area_top = self.terminal_top();
+        let area_width = self.terminal_width();
+        let area_height = self.terminal_height();
+        let width = (metrics.width * 56.0)
+            .min((area_width - metrics.width * 4.0).max(metrics.width * 24.0))
+            .min(area_width);
+        let height = metrics.height * lines as f32;
+        crate::palette::Geometry {
+            left: area_left + ((area_width - width) / 2.0).max(0.0),
+            top: area_top + ((area_height - height) / 3.0).max(0.0),
+            width,
+            height,
+            row_height: metrics.height,
+            rows,
+            leading_rows,
+            trailing_rows,
+        }
+    }
+
+    /// Follow the pointer over an open palette.
+    ///
+    /// Selecting rather than highlighting separately: the row under the
+    /// pointer is the row Enter runs, so moving the mouse and then pressing
+    /// Enter does what it looks like it will.
+    fn hover_palette(&mut self) -> bool {
+        let Some(card) = self.palette_card() else {
+            return false;
+        };
+        // The right-hand gutter belongs to the scroll arrows.  Hovering one
+        // must not silently select the row underneath it.
+        if self.palette_scroll_arrow_at(card).is_some() {
+            return true;
+        }
+        let Some(row) = card.row_at(self.window.pointer.0, self.window.pointer.1) else {
+            return false;
+        };
+        if let Some(palette) = self.window.palette.as_mut() {
+            let selected = palette.window_start(crate::palette::MAX_ROWS) + row;
+            if palette.selected != selected {
+                palette.selected = selected;
+                self.window.drawn_revision = None;
+            }
+        }
+        true
+    }
+
+    /// Which of the palette's visible scroll arrows is under the pointer.
+    ///
+    /// Arrows are part of the same bounded result window as the wheel and the
+    /// keyboard; keeping their hit test here prevents the painted button and
+    /// the row picker from disagreeing about who owns the click.
+    fn palette_scroll_arrow_at(&self, card: crate::palette::Geometry) -> Option<isize> {
+        let palette = self.window.palette.as_ref()?;
+        if card.rows == 0 {
+            return None;
+        }
+        let metrics = self.window.font.metrics();
+        let in_gutter = self.window.pointer.0 >= card.left + card.width - metrics.width * 2.0
+            && self.window.pointer.0 < card.left + card.width;
+        if !in_gutter {
+            return None;
+        }
+        let first_top = card.top + metrics.height * card.leading_rows as f32;
+        let last_top = first_top + metrics.height * (card.rows.saturating_sub(1)) as f32;
+        if self.window.pointer.1 >= first_top
+            && self.window.pointer.1 < first_top + metrics.height
+            && palette.can_scroll_up()
+        {
+            Some(-1)
+        } else if self.window.pointer.1 >= last_top
+            && self.window.pointer.1 < last_top + metrics.height
+            && palette.can_scroll_down(crate::palette::MAX_ROWS)
+        {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// A press while a palette is open. Returns true when the palette took it.
+    ///
+    /// A press on a row runs it; a press anywhere else closes the palette
+    /// without reaching the terminal. Closing is what everyone expects from a
+    /// menu, and letting the press through as well would put the cursor
+    /// somewhere in the pane the menu was covering.
+    fn click_palette(&mut self) -> bool {
+        let Some(card) = self.palette_card() else {
+            return false;
+        };
+        if let Some(delta) = self.palette_scroll_arrow_at(card) {
+            if let Some(palette) = self.window.palette.as_mut() {
+                palette.scroll(delta, crate::palette::MAX_ROWS);
+            }
+            self.window.drawn_revision = None;
+            return true;
+        }
+        match card.row_at(self.window.pointer.0, self.window.pointer.1) {
+            Some(row) => {
+                let chosen = self.window.palette.as_ref().and_then(|palette| {
+                    let row = palette.window_start(crate::palette::MAX_ROWS) + row;
+                    palette
+                        .visible()
+                        .get(row)
+                        .map(|entry| (entry.command.clone(), palette.query.clone()))
+                });
+                self.window.palette = None;
+                if let Some((command, task)) = chosen {
+                    self.run_palette_command(command, &task);
+                }
+            }
+            None => self.window.palette = None,
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// Type into the open palette. Returns true when the key was the palette's.
+    fn handle_palette_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::Key as WinitKey;
+        let Some(mut palette) = self.window.palette.take() else {
+            return false;
+        };
+        let named = match &event.logical_key {
+            WinitKey::Named(named) => Some(format!("{named:?}")),
+            _ => None,
+        };
+        let character = match &event.logical_key {
+            WinitKey::Character(text) => Some(text.to_string()),
+            _ => None,
+        };
+
+        // Directory-jump parity with 0.57.4: the modifier shortcuts belong to
+        // the picker, not to the terminal underneath it.
+        if palette.source == crate::palette::Source::Directories
+            && self.window.ctrl_held
+            && matches!(character.as_deref(), Some("o") | Some("O"))
+        {
+            self.open_system_directory_picker(crate::palette::BrowseThen::ChangeDirectory);
+            self.window.drawn_revision = None;
+            return true;
+        }
+
+        let mut keep = true;
+        if palette.view == crate::palette::View::ShellSelector {
+            if let Some(index) = character
+                .as_deref()
+                .and_then(|text| text.chars().next())
+                .filter(|ch| ch.is_ascii_digit())
+                .and_then(|ch| ch.to_digit(10))
+                .map(|digit| if digit == 0 { 9 } else { digit as usize - 1 })
+            {
+                if let Some(entry) = palette.visible().get(index).cloned().cloned() {
+                    self.run_palette_command(entry.command, "");
+                    keep = false;
+                }
+            }
+        }
+        if !keep {
+            self.window.drawn_revision = None;
+            return true;
+        }
+        // Ctrl+R turns the character picker to its next group, as it did in
+        // 0.57.4: the thirteen groups are a wheel, and shift turns it the
+        // other way. The query is cleared because it was a search over the
+        // page that is no longer open.
+        if palette.source == crate::palette::Source::Characters
+            && self.window.ctrl_held
+            && matches!(character.as_deref(), Some("r") | Some("R"))
+        {
+            self.charselect_group = if self.window.shift_held {
+                self.charselect_group.previous()
+            } else {
+                self.charselect_group.next()
+            };
+            palette.query.clear();
+            self.requery_palette(&mut palette);
+            self.window.palette = Some(palette);
+            self.window.drawn_revision = None;
+            if let Some(live) = self.window.state.as_ref() {
+                live.window.request_redraw();
+            }
+            return true;
+        }
+        match crate::palette::key_for(named.as_deref(), character.as_deref(), self.window.ctrl_held) {
+            crate::palette::Key::Close => keep = false,
+            crate::palette::Key::Step(delta) => palette.step(delta),
+            crate::palette::Key::Complete => {
+                if palette.source == crate::palette::Source::Directories {
+                    let completed = palette.current().and_then(|entry| match &entry.command {
+                        crate::palette::Command::Browse { path, .. }
+                        | crate::palette::Command::ChangeDirectory { path }
+                        | crate::palette::Command::NewTabIn { path } => Some(path.clone()),
+                        _ => None,
+                    });
+                    if let Some(path) = completed {
+                        palette.query = path;
+                        self.requery_palette(&mut palette);
+                    }
+                }
+            }
+            crate::palette::Key::Backspace => {
+                if palette.source == crate::palette::Source::Directories && palette.query.is_empty()
+                {
+                    if let Some(parent) = self
+                        .current_directory()
+                        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                    {
+                        palette.query = parent.display().to_string();
+                        if !palette.query.ends_with(std::path::MAIN_SEPARATOR) {
+                            palette.query.push(std::path::MAIN_SEPARATOR);
+                        }
+                    }
+                } else {
+                    palette.query.pop();
+                }
+                self.requery_palette(&mut palette);
+            }
+            crate::palette::Key::Type(text) => {
+                palette.query.push_str(&text);
+                self.requery_palette(&mut palette);
+            }
+            crate::palette::Key::Accept => {
+                keep = false;
+                let task = palette.query.clone();
+                if let Some(entry) = palette.current().cloned() {
+                    if palette.source == crate::palette::Source::Directories && self.window.ctrl_held {
+                        let path = match entry.command {
+                            crate::palette::Command::ChangeDirectory { path }
+                            | crate::palette::Command::NewTabIn { path }
+                            | crate::palette::Command::Browse { path, .. } => Some(path),
+                            crate::palette::Command::OpenDirectoryPicker { .. } => {
+                                self.open_system_directory_picker(
+                                    crate::palette::BrowseThen::NewTab,
+                                );
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(path) = path {
+                            self.new_tab_in(&path);
+                        }
+                    } else {
+                        self.run_palette_command(entry.command, &task);
+                    }
+                }
+            }
+            // Nothing reaches the shell while the palette is open: a
+            // keystroke through it would run in the pane behind.
+            crate::palette::Key::NotOurs => {}
+        }
+
+        if keep {
+            self.window.palette = Some(palette);
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    /// Do what a palette row says.
+    ///
+    /// `task` is what was typed. Almost every row ignores it -- the line is a
+    /// filter and the row is the answer -- but on the fleet card the line *is*
+    /// the request, and it has to travel with the row: by the time this runs
+    /// the palette has been taken away, and reading the task back out of it
+    /// finds nothing. Which is what happened: Enter closed the card and
+    /// launched nothing at all.
+    fn run_palette_command(&mut self, command: crate::palette::Command, task: &str) {
+        match command {
+            crate::palette::Command::Action(action) => {
+                let session_id = self.window.state.as_ref().map(|live| live.session_id);
+                if let Some(session_id) = session_id {
+                    self.run_key_action(action, session_id);
+                }
+            }
+            crate::palette::Command::Launch { program, args } => {
+                self.new_tab_running(&program, &args)
+            }
+            crate::palette::Command::ChangeDirectory { path } => self.change_directory(&path),
+            crate::palette::Command::OpenShellSelector => self.open_shell_selector(),
+            crate::palette::Command::NewTabIn { path } => self.new_tab_in(&path),
+            crate::palette::Command::RestoreWorkspace { name } => self.restore_workspace(&name),
+            crate::palette::Command::OpenDirectoryPicker { then } => {
+                self.open_system_directory_picker(then)
+            }
+            crate::palette::Command::OpenWorkspaceSave => self.open_workspace_save(),
+            crate::palette::Command::SaveWorkspace => {
+                let name = task.trim().to_string();
+                if name.is_empty() {
+                    self.show_notice("a workspace needs a name".to_string());
+                } else {
+                    self.save_workspace(&name);
+                }
+            }
+            crate::palette::Command::ToggleRecording => self.toggle_recording(),
+            crate::palette::Command::ExportSession => self.export_session(),
+            crate::palette::Command::OpenSettings => self.open_settings(),
+            crate::palette::Command::InstallUpdate => crate::updates::install(),
+            crate::palette::Command::StarOnGitHub => {
+                let url = "https://github.com/zhitongblog/unterm";
+                if let Err(err) = crate::links::open(url) {
+                    log::warn!("could not open {url}: {err}");
+                }
+            }
+            crate::palette::Command::ShareAmbassadorPost => {
+                let url = ambassador_url(unterm_services::i18n::current_locale());
+                if let Err(err) = crate::links::open(&url) {
+                    log::warn!("could not open {url}: {err}");
+                }
+            }
+            crate::palette::Command::OpenConsole => self.open_console(),
+            crate::palette::Command::ApplyTheme { id } => self.apply_theme(&id),
+            crate::palette::Command::TypeCharacter { glyph, name } => {
+                self.type_character(&glyph, &name)
+            }
+            crate::palette::Command::LaunchFleet { agents } => {
+                self.launch_fleet(agents, task.trim().to_string())
+            }
+            crate::palette::Command::OpenTabNavigator => self.open_tab_navigator(),
+            crate::palette::Command::ActivateTab { tab_id } => self.activate_tab(tab_id),
+            crate::palette::Command::RenameTab { tab_id } => {
+                let title = task.trim();
+                if title.is_empty() {
+                    self.window.tab_titles.remove(&tab_id);
+                } else {
+                    self.window.tab_titles.insert(tab_id, title.to_string());
+                }
+            }
+            crate::palette::Command::CaptureScrollback => self.capture_scrollback(),
+            crate::palette::Command::CaptureDesktop => self.start_system_capture(true),
+            crate::palette::Command::OpenUrl { url } => {
+                if let Err(err) = crate::links::open(&url) {
+                    log::warn!("could not open {url}: {err}");
+                }
+            }
+            crate::palette::Command::ConfirmCloseWindow => {
+                self.window.close_confirmed = true;
+                self.perform_close(CloseOutcome::EndSessions, Leaving::Process);
+            }
+            // The window goes; the Core, the shells and the agents in
+            // them stay -- and an indicator goes up saying so, because a
+            // promise nobody can see is one the user has to remember.
+            crate::palette::Command::KeepRunningInBackground => {
+                self.window.close_confirmed = true;
+                if !self.enter_background() {
+                    // No tray on this desktop. The sessions still outlive
+                    // this process and `unterm` still reopens onto them,
+                    // but this window is not going to sit there invisibly
+                    // pretending an icon exists.
+                    log::warn!("no tray indicator available; closing instead of parking");
+                    // The one case the macOS keep-the-process branch was
+                    // written for: the view goes, the shells stay with the
+                    // Core, and the Dock icon is what brings a window back.
+                    self.perform_close(CloseOutcome::KeepSessions, Leaving::WindowOnly);
+                }
+            }
+            crate::palette::Command::DrainThenExit => {
+                // The Core was asked to stop once its sessions end; quitting
+                // must not then stop it at once. Its orphan watchdog caps how
+                // long "once its sessions end" may take with no window left.
+                crate::engine_backend::set_quit_intent(crate::engine_backend::QuitIntent::Drain);
+                // Off this thread: draining waits on shells that may take
+                // their time (or forever), and the one thread that must
+                // never wait on anything is the one under the pointer.
+                if let crate::engine_backend::AppEngine::Core { client, .. } = &self.engine {
+                    let client = client.clone();
+                    std::thread::spawn(move || {
+                        if let Err(err) = client.drain(true) {
+                            log::warn!("could not ask the core to drain: {err:#}");
+                        }
+                    });
+                }
+                self.window.close_confirmed = true;
+                // Destroying the sessions here would be the opposite of
+                // draining: the Core is being asked to let them finish.
+                // `Leaving::Process` because the command says exit, and the
+                // sessions surviving is not the same thing as the window
+                // that asked to leave staying.
+                self.perform_close(CloseOutcome::KeepSessions, Leaving::Process);
+            }
+            crate::palette::Command::CancelAndExit => {
+                // Everything goes: this window's sessions here, and the Core
+                // with whatever else it holds as the process leaves -- other
+                // windows attached or not. Only a `--headless` Core stays,
+                // since nobody started it to live and die with a window.
+                crate::engine_backend::set_quit_intent(
+                    crate::engine_backend::QuitIntent::Everything,
+                );
+                self.window.close_confirmed = true;
+                self.perform_close(CloseOutcome::EndSessions, Leaving::Process);
+            }
+            crate::palette::Command::OpenTabRename { index } => self.open_tab_rename(index),
+            crate::palette::Command::SelectCaptureRegion => self.start_system_capture(false),
+            crate::palette::Command::SetupAiAgents => self.setup_ai_agents(),
+            crate::palette::Command::OpenCheckpoints => self.open_checkpoints(),
+            crate::palette::Command::CreateCheckpoint => self.create_checkpoint(),
+            crate::palette::Command::RestoreCheckpoint { repo, oid, label } => {
+                self.restore_checkpoint(&repo, &oid, &label)
+            }
+            crate::palette::Command::DiffCheckpoint { repo, oid } => {
+                self.diff_checkpoint(&repo, &oid)
+            }
+            crate::palette::Command::OpenAutonomySelector => self.open_autonomy_selector(),
+            crate::palette::Command::SetAutonomy { level } => self.set_autonomy(&level),
+            crate::palette::Command::OpenAgentHandoff => self.open_agent_handoff(),
+            crate::palette::Command::ExecuteAgentHandoff {
+                source_pane,
+                program,
+            } => self.execute_agent_handoff(source_pane, &program),
+            crate::palette::Command::DiagnoseLastFailure => self.open_failure_diagnosis(),
+            crate::palette::Command::CopyFailureContext => self.copy_failure_context(),
+            crate::palette::Command::FixFailureWithAgent { agent } => {
+                self.fix_failure_with_agent(&agent)
+            }
+            crate::palette::Command::ConfirmSafePaste { pane_id, text } => {
+                self.perform_paste_input(pane_id, &text)
+            }
+            crate::palette::Command::OpenPocketQr => self.open_pocket_qr(),
+            crate::palette::Command::ReconnectSsh { pane_id } => self.reconnect_ssh(pane_id),
+            crate::palette::Command::OpenLanguageSelector => self.open_language_selector(),
+            crate::palette::Command::SetLanguage { code } => self.set_language(&code),
+            crate::palette::Command::OpenCursorSelector => self.open_cursor_selector(),
+            crate::palette::Command::SetCursorStyle { style } => self.set_cursor_style(&style),
+            crate::palette::Command::OpenScrollbackSelector => self.open_scrollback_selector(),
+            crate::palette::Command::SetScrollbackLines { lines } => {
+                self.set_scrollback_lines(lines)
+            }
+            crate::palette::Command::OpenMcpClients => self.open_mcp_clients(),
+            crate::palette::Command::ToggleMcpClient { id, connect } => {
+                self.toggle_mcp_client(&id, connect)
+            }
+            crate::palette::Command::OpenPairedDevices => self.open_paired_devices(),
+            crate::palette::Command::RevokePairedDevice { device_id } => {
+                self.revoke_paired_device(&device_id)
+            }
+            crate::palette::Command::OpenConfigFile => self.open_config_file(),
+            crate::palette::Command::OpenProxySettings => self.open_proxy_settings(),
+            crate::palette::Command::ToggleProxy => {
+                self.toggle_proxy();
+                self.open_proxy_settings();
+            }
+            crate::palette::Command::ApplyProxyToCurrentPane { enable } => {
+                self.apply_proxy_to_current_pane(enable)
+            }
+            crate::palette::Command::SetProxyPreset {
+                mode,
+                http_proxy,
+                socks_proxy,
+            } => self.set_proxy_preset(&mode, http_proxy.as_deref(), socks_proxy.as_deref()),
+            crate::palette::Command::OpenCustomProxyInput => self.open_custom_proxy_input(),
+            crate::palette::Command::SaveCustomProxyUrl => self.save_custom_proxy_url(task),
+            crate::palette::Command::OpenClashGroups => self.open_clash_groups(),
+            crate::palette::Command::OpenClashGroupNodes { group } => {
+                self.open_clash_group_nodes(&group)
+            }
+            crate::palette::Command::SelectClashNode { group, node } => {
+                self.select_clash_node(&group, &node)
+            }
+            crate::palette::Command::OpenProxyConfigFile => self.open_proxy_config_file(),
+            // Information rows: reading them was the point.
+            crate::palette::Command::Nothing => {}
+            crate::palette::Command::Browse { path, then } => {
+                // Stays open on the new directory rather than closing: picking
+                // a folder three deep should be three keystrokes, not three
+                // trips through the menu.
+                self.open_palette(crate::directory::entries(std::path::Path::new(&path), then));
+            }
+        }
+    }
+
+    /// Open a tab running a named program.
+    fn new_tab_running(&mut self, program: &str, args: &[String]) {
+        let mut command = portable_pty::CommandBuilder::new(program);
+        command.args(args);
+        self.open_tab_with(Some(command), None);
+    }
+
+    /// Open a tab, with a shell of its own, where the focused pane is.
+    ///
+    /// It always started in the home directory. Once the strip grouped tabs
+    /// by project that read as a bug: "+ New session" under a project put the
+    /// tab in a different group, and every new tab had to `cd` back. The same
+    /// directory the strip groups by, so the new tab lands in the project it
+    /// was opened from. A directory that has gone falls back to the default.
+    fn new_tab(&mut self) {
+        let shell = self.shell.clone();
+        let directory = self.focused_directory();
+        self.open_tab_with(shell, directory);
+    }
+
+    /// The focused pane's working directory, as the strip knows it, if it
+    /// still exists (falling back to OS process inspection when OSC 7 is absent).
+    fn focused_directory(&self) -> Option<String> {
+        let pane = self.focused_session();
+        let from_shell = unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .into_iter()
+                    .find(|session| session.id == pane)
+                    .and_then(|session| session.shell.cwd)
+            });
+        from_shell
+            .or_else(|| {
+                unterm_engine::SessionEngine::activity(&self.engine, pane)
+                    .ok()
+                    .and_then(|a| a.process)
+                    .and_then(|p| p.foreground_cwd.or(p.root_cwd))
+            })
+            .filter(|cwd| std::path::Path::new(cwd).is_dir())
+    }
+
+    fn open_tab_with(
+        &mut self,
+        command: Option<portable_pty::CommandBuilder>,
+        directory: Option<String>,
+    ) {
+        // A tab needs a window to open into; the size comes from the layout
+        // rather than from the window, because the strip may have taken some.
+        let Some(_live) = self.window.state.as_ref() else {
+            return;
+        };
+        let (cols, rows) = self
+            .window.font
+            .grid_for(self.terminal_width(), self.terminal_height());
+        let env = launch_env_for_new_pane();
+        let session = match self.engine.create_session(CreateSessionRequest {
+            cols,
+            rows,
+            command_dir: directory,
+            command: prepare_shell(command),
+            env,
+            launch_policy: LaunchPolicySnapshot::default(),
+        }) {
+            Ok(session) => session,
+            Err(err) => {
+                log::warn!("could not open a tab: {err:#}");
+                #[cfg(target_os = "macos")]
+                crate::macos_open::trace(&format!("open_tab_with: create_session failed: {err:#}"));
+                return;
+            }
+        };
+        match self.window.tabs.create_tab(session.id) {
+            Ok(tab_id) => {
+                #[cfg(target_os = "macos")]
+                crate::macos_open::trace(&format!(
+                    "open_tab_with: pane {} in tab {tab_id}",
+                    session.id
+                ));
+                self.window.tabs.set_active_tab(tab_id);
+                self.window.tab_id = Some(tab_id);
+                self.focus_session(session.id);
+                self.resize_panes();
+                self.window.drawn_revision = None;
+            }
+            Err(err) => {
+                log::warn!("could not record the tab: {err:#}");
+                #[cfg(target_os = "macos")]
+                crate::macos_open::trace(&format!(
+                    "open_tab_with: create_tab failed for pane {}: {err:#}",
+                    session.id
+                ));
+                crate::statsbar::forget(session.id);
+                unterm_services::ghost_text::forget(session.id as u64);
+                let _ = self.engine.destroy_session(session.id);
+            }
+        }
+    }
+
+    /// Move to the next tab along, wrapping at the ends.
+    ///
+    /// Wrapping rather than stopping: with three tabs, cycling forward twice
+    /// from the last should land somewhere, and a key that does nothing at the
+    /// edge reads as a key that is broken.
+    fn cycle_tab(&mut self, step: isize) {
+        let ids = self.window.tabs.tab_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let current = self.window.tab_id.or_else(|| self.window.tabs.active_tab());
+        let next = ids[next_tab_index(&ids, current, step)];
+        self.window.tabs.set_active_tab(next);
+        self.window.tab_id = Some(next);
+        if let Some(pane) = self.window.tabs.active_pane(next) {
+            self.focus_session(pane);
+        }
+        // Whatever was behind has not been told about any window this size.
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    fn set_all_windows_capture_cloak(&mut self, cloaked: bool) {
+        #[cfg(windows)]
+        {
+            if let Some(live) = self.window.state.as_ref() {
+                crate::win_chrome::set_capture_cloak(&live.window, cloaked);
+            }
+            for parked in &self.parked {
+                if let Some(live) = parked.state.state.as_ref() {
+                    crate::win_chrome::set_capture_cloak(&live.window, cloaked);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = cloaked;
+    }
+
+    /// Start the same native interactive screenshot flow 0.57.4 used.
+    fn start_system_capture(&mut self, hide_window: bool) {
+        if self
+            .capture_started_at
+            .map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(32))
+        {
+            return;
+        }
+        self.capture_started_at = Some(std::time::Instant::now());
+        let mode = if hide_window {
+            unterm_services::i18n::t("screenshot.mode.hidden")
+        } else {
+            unterm_services::i18n::t("screenshot.mode.visible")
+        };
+        self.show_notice(unterm_services::i18n::t_args(
+            "screenshot.started",
+            &[("mode", &mode)],
+        ));
+        if hide_window {
+            self.set_all_windows_capture_cloak(true);
+        }
+        let tx = self.clipboard_tx.clone();
+        crate::clipboard::run(tx, move || ClipboardResult::ScreenshotFinished {
+            mode,
+            result: crate::system_capture::capture_selected_region(hide_window)
+                .map_err(|err| format!("{err:#}")),
+        });
+    }
+
+    /// Move the active tab along the bar without changing its stable id.
+    fn move_tab(&mut self, step: isize) {
+        let Some(tab_id) = self.window.tab_id.or_else(|| self.window.tabs.active_tab()) else {
+            return;
+        };
+        if !self.window.tabs.move_tab_relative(tab_id, step) {
+            return;
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+    }
+
+    /// Close the active tab and everything in it.
+    ///
+    /// The last tab is not closable: a window with no tab has nothing to show
+    /// and no way back, so closing the window is the user's own decision.
+    fn close_tab(&mut self) {
+        let _slow = SlowGuard::new("close_tab");
+        let ids = self.window.tabs.tab_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let Some(tab_id) = self.window.tab_id.or_else(|| self.window.tabs.active_tab()) else {
+            return;
+        };
+        for pane in self.window.tabs.pane_ids(tab_id) {
+            crate::statsbar::forget(pane);
+            unterm_services::ghost_text::forget(pane as u64);
+            let _ = self.engine.destroy_session(pane);
+        }
+        self.window.tabs.forget_tab(tab_id);
+        let remaining = self.window.tabs.tab_ids();
+        let Some(next) = remaining.first().copied() else {
+            return;
+        };
+        self.window.tabs.set_active_tab(next);
+        self.window.tab_id = Some(next);
+        if let Some(pane) = self.window.tabs.active_pane(next) {
+            self.focus_session(pane);
+        }
+        // The tab that takes over was behind until now, so it is owed the
+        // same telling as one brought forward any other way.
+        self.resize_panes();
+        self.window.drawn_revision = None;
+    }
+
+    /// Point the window at a pane, and redraw.
+    fn focus_session(&mut self, session_id: usize) {
+        if !self.window.tabs.set_active_pane(session_id) {
+            #[cfg(target_os = "macos")]
+            crate::macos_open::trace(&format!(
+                "focus_session {session_id}: the tab registry refused it"
+            ));
+            return;
+        }
+        if let Err(err) = unterm_engine::SessionEngine::focus_session(&self.engine, session_id) {
+            log::warn!("could not focus engine session {session_id}: {err:#}");
+        }
+        self.window.tab_id = self.window.tabs.tab_of_pane(session_id);
+        if let Some(notice) = self.window.pane_notices.get_mut(&session_id) {
+            notice.unread = false;
+        }
+        if let Some(live) = self.window.state.as_mut() {
+            // A selection belongs to the pane it was made in. Carried over,
+            // it would be drawn over -- and copied from -- whichever pane
+            // took the focus next, at the same rows and columns.
+            if live.session_id != session_id {
+                self.window.drag = None;
+            }
+            live.session_id = session_id;
+        }
+        self.resize_panes();
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        self.window.drawn_revision = None;
+    }
+
+    /// How tall the terminal area is, once the tab bar has taken its share.
+    fn terminal_height(&self) -> f32 {
+        self.terminal_height_for(self.window_height())
+    }
+
+    /// How tall the terminal is inside a window of this height.
+    fn terminal_height_for(&self, window_height: f32) -> f32 {
+        let height = window_height;
+        // The bar above, the status line below, and a gap at each end. Taken
+        // out of the terminal rather than drawn over it: a bar over the grid
+        // hides a row the shell still believes in.
+        let taken = self.terminal_top() + self.status_bar_height() + self.terminal_padding_bottom();
+        // Floored at the engine's minimum grid for the same reason the width
+        // is: chrome that does not fit must cost a drawn row, not the pane's
+        // contents.
+        (height - taken)
+            .max(unterm_engine::MIN_SESSION_GRID as f32 * self.window.font.metrics().height)
+    }
+
+    /// How tall the line along the bottom is.
+    fn status_bar_height(&self) -> f32 {
+        // Hidden by default in the inbox design: the facts it carried
+        // (cwd, branch, shell) live in the top bar's title, and a
+        // resident strip under every terminal is chrome that says the
+        // same thing twice. `status_bar = true` in the config brings it
+        // back.
+        //
+        // Config alone decides this, never anything transient. Letting
+        // a pending confirmation add the strip changed the terminal's
+        // row count without telling the shell, and every row below the
+        // cursor was then drawn one line off from where the program
+        // believed it was. The banner draws over the grid instead.
+        if !self.status_bar_enabled {
+            return 0.0;
+        }
+        // The bar is one terminal cell plus the slight vertical padding the
+        // previous front end gave it — its text is set in the terminal face.
+        let pt = self.chrome_pt();
+        let pad = (crate::ui_tokens::STATUS_BAR_VERTICAL_PADDING * pt)
+            .round()
+            .max(2.0);
+        (self.window.font.metrics().height + pad * 2.0).round().max(1.0)
+    }
+
+    /// Rebuild this window onto a Core that replaced the one it was
+    /// using.
+    ///
+    /// The previous Core's panes are gone -- their shells died with the
+    /// process -- so every id this window holds is stale. Dropping them
+    /// and opening one shell on the new Core is the difference between
+    /// "Unterm recovered" and the old answer, which was to tell the user
+    /// to restart the application.
+    fn recover_from_replaced_core(&mut self) {
+        log::warn!("unterm-core was replaced; rebuilding this window's sessions");
+        crate::engine_backend::keep_host_channel();
+        self.sync_tabs();
+        let has_session = unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .map(|sessions| sessions.iter().any(|session| !session.is_dead))
+            .unwrap_or(false);
+        if !has_session {
+            let (cols, rows) = self
+                .window.state
+                .as_ref()
+                .map(|live| self.window.font.grid_for(live.width as f32, live.height as f32))
+                .unwrap_or((80, 24));
+            let request = CreateSessionRequest {
+                cols,
+                rows,
+                command_dir: self
+                    .start_directory
+                    .clone()
+                    .or_else(|| self.config_default_cwd.clone())
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                command: prepare_shell(self.shell.clone()),
+                env: launch_env_for_new_pane(),
+                launch_policy: LaunchPolicySnapshot::default(),
+            };
+            match self.engine.create_session(request) {
+                Ok(session) => {
+                    if let Err(err) = self.window.tabs.create_tab(session.id) {
+                        log::warn!("could not show the recovered session: {err:#}");
+                    } else {
+                        self.focus_session(session.id);
+                    }
+                }
+                Err(err) => log::warn!("could not open a shell on the new core: {err:#}"),
+            }
+        }
+        // Recovering in silence would read as "my tabs vanished". The
+        // banner that reported the loss reports the recovery, in the
+        // same place, so the two halves of the story arrive together.
+        self.core_replaced_at = Some(std::time::Instant::now());
+    }
+
+    /// Make the window's tabs match the engine's sessions.
+    ///
+    /// The engine is where sessions actually live, and it is not only this
+    /// window that makes them: an agent calling `session.create` over MCP
+    /// creates one too, and without this the window would never show it. The
+    /// same pass drops tabs whose shells have exited, so a tab bar cannot
+    /// outlive what it names.
+    fn sync_tabs(&mut self) {
+        let Ok(sessions) = unterm_engine::SessionEngine::list_sessions(&self.engine) else {
+            return;
+        };
+        let live_ids: std::collections::HashSet<usize> =
+            sessions.iter().map(|session| session.id).collect();
+
+        // Every window of this process, the front one first.
+        //
+        // All of them, not just the one being drawn. A background window
+        // still owns its shells: an agent that split a pane there, or closed
+        // one, changed that window's arrangement, and leaving the mirror
+        // until the user happened to come back means `instance.windows`
+        // reports an arrangement that is not the one that exists.
+        //
+        // Front first because an orphan -- a session no window has, which is
+        // what a session created over MCP is, and what D1 leaves behind when
+        // a window closes -- belongs to the window the user is in, and
+        // whichever runs first takes it. A split is the exception and settles
+        // itself: every window skips it except the one holding its source.
+        let mut shown: Vec<std::collections::HashSet<usize>> = std::iter::once(&self.window)
+            .chain(self.parked.iter().map(|parked| &parked.state))
+            .map(pane_set)
+            .collect();
+        // A window whose first shell is still being made has a session in the
+        // Core that is in none of its tabs yet: to everyone else it looks
+        // like an orphan. "New Unterm Window Here" with Unterm parked in the
+        // tray brought the old window back and opened the new one in the same
+        // breath, and the old one took the new window's shell while it was
+        // being made -- one pane in two windows, each drawing it at its own
+        // size, so the two never showed the same thing. Orphans wait until
+        // every window has its own.
+        let adopt_orphans = std::iter::once(&self.window)
+            .chain(self.parked.iter().map(|parked| &parked.state))
+            .all(|state| state.startup_session.is_none());
+        let mut changed = false;
+        for index in 0..shown.len() {
+            let elsewhere: std::collections::HashSet<usize> = shown
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .flat_map(|(_, panes)| panes.iter().copied())
+                .collect();
+            let state = match index {
+                0 => &mut self.window,
+                other => &mut self.parked[other - 1].state,
+            };
+            let moved = adopt_sessions_into(state, &sessions, &live_ids, &elsewhere, adopt_orphans);
+            if moved {
+                shown[index] = pane_set(state);
+                // The front window's is settled at the end of this method,
+                // where the pane it is showing is settled with it. A
+                // background one gets no such pass, and one left pointing at
+                // a tab that has gone would come back showing nothing.
+                if index > 0 {
+                    settle_active_tab(state);
+                }
+            }
+            if index == 0 {
+                changed = moved;
+            }
+        }
+
+        // MCP `session.focus` updates the engine from another thread. Mirror
+        // that choice into this front end's tab/layout registry so a peer
+        // Inbox jump brings the requested pane into view, not only its window.
+        //
+        // Mirror it edge-triggered and only into the window the user is in:
+        // several windows share one Core, and every tab click anywhere
+        // asserts the global active session. A window that levels itself to
+        // that value re-follows every click made in every OTHER window, and
+        // with two windows open the sidebars visibly chase each other. A
+        // CHANGE in the global choice reaches the focused window (that is
+        // the Inbox jump); the rest keep their own selection.
+        if let Some(requested) = sessions
+            .iter()
+            .find(|session| session.is_active)
+            .map(|session| session.id)
+        {
+            let externally_changed = self.window.followed_active != Some(requested);
+            self.window.followed_active = Some(requested);
+            let shown = self.window.state.as_ref().map(|live| live.session_id);
+            if externally_changed
+                && self.window.focused
+                && shown != Some(requested)
+                && self.window.tabs.tab_of_pane(requested).is_some()
+            {
+                #[cfg(target_os = "macos")]
+                crate::macos_open::trace(&format!(
+                    "sync follows external focus {requested} (was showing {shown:?})"
+                ));
+                self.focus_session(requested);
+            }
+        }
+
+        if !changed {
+            return;
+        }
+        // The window may have been left pointing at a tab that no longer
+        // exists, or at none at all.
+        settle_active_tab(&mut self.window);
+        // Only when the arrangement actually moved. This used to run on every
+        // pass: a PTY resize per pane, four times a second, forever -- which
+        // is a system call and a reflow each time, and was most of what an
+        // idle window cost. It also asked for a repaint every time, for a
+        // window in which nothing had happened.
+        if changed {
+            self.resize_panes();
+            self.window.drawn_revision = None;
+        }
+    }
+
+    /// Type into the open search. Returns true when the key was the search's.
+    ///
+    /// Everything printable extends the pattern; Enter steps through the
+    /// matches and Esc closes. Nothing else is taken, so a key the search has
+    /// no use for still reaches the shell rather than vanishing.
+    fn click_search_bar(&mut self) -> bool {
+        let Some(mut search) = self.window.search.take() else {
+            return false;
+        };
+        let session_id = self.focused_session();
+        let Some(live) = self.window.state.as_ref() else {
+            self.window.search = Some(search);
+            return false;
+        };
+        let metrics = self.window.font.metrics();
+        let left = self.terminal_left();
+        let width = self.terminal_width();
+        let top = (live.height as f32 - self.status_bar_height() - metrics.height)
+            .max(self.terminal_top());
+        if self.window.pointer.0 < left
+            || self.window.pointer.0 >= left + width
+            || self.window.pointer.1 < top
+            || self.window.pointer.1 >= top + metrics.height
+        {
+            self.window.search = Some(search);
+            return false;
+        }
+
+        let controls_left = left + width - 13.0 * metrics.width;
+        let cell = ((self.window.pointer.0 - controls_left) / metrics.width).floor() as isize;
+        let mut keep = true;
+        let mut research = false;
+        match cell {
+            0..=2 => search.step(-1),
+            3..=5 => search.step(1),
+            6..=9 => {
+                search.cycle_mode();
+                research = true;
+            }
+            10..=12 => keep = false,
+            _ => {}
+        }
+        if keep {
+            if research {
+                let matches = self.run_search(session_id, &search.pattern, search.mode);
+                search.adopt(matches);
+            }
+            if let Some(found) = search.current() {
+                let _ = self
+                    .engine
+                    .scroll_viewport_to(session_id, found.row as isize);
+            }
+            self.window.search = Some(search);
+        }
+        self.window.drawn_revision = None;
+        live.window.request_redraw();
+        true
+    }
+
+    fn handle_search_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::Key as WinitKey;
+        let Some(mut search) = self.window.search.take() else {
+            return false;
+        };
+
+        let named = match &event.logical_key {
+            WinitKey::Named(named) => Some(format!("{named:?}")),
+            _ => None,
+        };
+        let character = match &event.logical_key {
+            WinitKey::Character(text) => Some(text.to_string()),
+            _ => None,
+        };
+
+        let mut keep = true;
+        let mut research = false;
+        match crate::search::key_for(
+            named.as_deref(),
+            character.as_deref(),
+            self.window.ctrl_held,
+            self.window.shift_held,
+        ) {
+            crate::search::Key::Close => keep = false,
+            crate::search::Key::Step(delta) => search.step(delta),
+            crate::search::Key::Backspace => {
+                search.pattern.pop();
+                research = true;
+            }
+            crate::search::Key::Clear => {
+                search.pattern.clear();
+                research = true;
+            }
+            crate::search::Key::CycleMode => {
+                search.cycle_mode();
+                research = true;
+            }
+            crate::search::Key::Type(text) => {
+                search.pattern.push_str(&text);
+                research = true;
+            }
+            crate::search::Key::NotOurs => {
+                self.window.search = Some(search);
+                return false;
+            }
+        }
+
+        if keep {
+            if research {
+                let matches =
+                    self.run_search(self.focused_session(), &search.pattern, search.mode);
+                search.adopt(matches);
+            }
+            // Follow the current match, so finding something shows it.
+            if let Some(found) = search.current() {
+                let _ = self
+                    .engine
+                    .scroll_viewport_to(self.focused_session(), found.row as isize);
+            }
+            self.window.search = Some(search);
+        }
+        self.window.drawn_revision = None;
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.request_redraw();
+        }
+        true
+    }
+
+    /// Copy mode's cursor, and whatever it has selected.
+    fn append_copy_mode(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(mode) = self.window.copy_mode else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let top_offset = self.terminal_top();
+        let (_, widths) = self.screen_shape();
+
+        if let Some(((start_row, start_col), (end_row, end_col))) = mode.selection() {
+            for row in start_row..=end_row {
+                let width = widths.get(row).copied().unwrap_or(0);
+                let from = if row == start_row { start_col } else { 0 };
+                let to = if row == end_row { end_col + 1 } else { width };
+                if to <= from {
+                    continue;
+                }
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: from as f32 * metrics.width,
+                    top: top_offset + row as f32 * metrics.height,
+                    width: (to - from) as f32 * metrics.width,
+                    height: metrics.height,
+                    color: mix(self.window.colors.background, self.window.colors.foreground, 0.28),
+                });
+            }
+        }
+
+        // The cursor over the selection, so it stays visible inside it.
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: mode.column as f32 * metrics.width,
+            top: top_offset + mode.row as f32 * metrics.height,
+            width: metrics.width,
+            height: metrics.height,
+            color: self.window.colors.foreground,
+        });
+    }
+
+    /// Quick select's labels, over the text they stand for.
+    /// A letter on every pane, while one is being picked.
+    ///
+    /// Drawn over the pane's own top-left corner rather than centred: centred
+    /// puts the letter in the middle of whatever the pane is showing, and the
+    /// corner is where the eye already goes to tell panes apart.
+    fn append_pane_select(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(selector) = self.window.pane_select.clone() else {
+            return;
+        };
+        let panes = self.placements();
+        let order = crate::paneselect::reading_order(&panes);
+        let metrics = self.window.font.metrics();
+        let theme = self.theme();
+
+        // Over everything, so a label is never behind the text it labels.
+        let mark = quads.mark();
+        for (index, label) in selector.labels.iter().enumerate() {
+            // Once a letter is typed, only the labels still in the running.
+            // Showing the rest offers choices that are no longer there.
+            if !selector.typing.is_empty() && !label.starts_with(&selector.typing) {
+                continue;
+            }
+            let Some(pane) = order.get(index).and_then(|at| panes.get(*at)) else {
+                continue;
+            };
+            let width = metrics.width * (label.chars().count() as f32 + 2.0);
+            let height = metrics.height * 2.0;
+            let left = pane.origin.0;
+            let top = pane.origin.1;
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                left,
+                top,
+                width,
+                height,
+                self.corner_radius(),
+                theme.selection,
+            ));
+            crate::terminal::append_text(
+                label,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                theme.selection_text,
+                (left + metrics.width, top + metrics.height / 2.0),
+                quads,
+            );
+        }
+        quads.raise_since(mark);
+    }
+
+    fn append_quick_select(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some((found, typed)) = self.window.quick_select.clone() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let top_offset = self.terminal_top();
+        let background = self.window.colors.background;
+        let foreground = self.window.colors.foreground;
+
+        for item in &found {
+            // Once a letter is typed, only the labels still in the running:
+            // showing the rest is showing the user options they no longer have.
+            if !typed.is_empty() && !item.label.starts_with(&typed) {
+                continue;
+            }
+            let left = item.start as f32 * metrics.width;
+            let top = top_offset + item.row as f32 * metrics.height;
+            let width = metrics.width * item.label.chars().count() as f32;
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left,
+                top,
+                width,
+                height: metrics.height,
+                color: foreground,
+            });
+            crate::terminal::append_text(
+                &item.label,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                background,
+                (left, top),
+                quads,
+            );
+        }
+    }
+
+    /// The command palette, centred over the terminal.
+    ///
+    /// Drawn last so it sits over everything, and opaque so the text behind it
+    /// cannot be mistaken for one of its rows.
+    /// A Fluent flyout's card: 8px corners, lifted off the terminal by a soft
+    /// shadow and edged with a one-pixel stroke. There is no blur to draw a
+    /// shadow with, so it is built from a few translucent rounded layers that
+    /// grow outward and sink a little, which reads the same at the distance a
+    /// shadow is seen from.
+    fn append_flyout(
+        &self,
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        fill: [f32; 4],
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let scale = self.window.scale.max(0.5);
+        let radius = (8.0 * scale).round();
+        for step in (1..=6).rev() {
+            let spread = step as f32 * 2.0 * scale;
+            let alpha = 0.035 * (7 - step) as f32 / 6.0 + 0.012;
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                left - spread,
+                top - spread + 4.0 * scale,
+                width + spread * 2.0,
+                height + spread * 2.0,
+                radius + spread,
+                [0.0, 0.0, 0.0, alpha],
+            ));
+        }
+        let stroke = if crate::chrome::is_light_surface(self.window.colors.background) {
+            [0.0, 0.0, 0.0, 0.10]
+        } else {
+            mix(self.window.colors.background, self.window.colors.foreground, 0.18)
+        };
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left - 1.0,
+            top - 1.0,
+            width + 2.0,
+            height + 2.0,
+            radius + 1.0,
+            stroke,
+        ));
+        quads.backgrounds.extend(unterm_render::rounded::panel(
+            left, top, width, height, radius, fill,
+        ));
+    }
+
+    fn append_palette(&mut self, window_width: f32, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(palette) = self.window.palette.as_ref() else {
+            return;
+        };
+        let metrics = self.window.font.metrics();
+        let view = palette.view;
+        let window_start = palette.window_start(crate::palette::MAX_ROWS);
+        let rows: Vec<(String, String, bool)> = palette
+            .visible()
+            .iter()
+            .skip(window_start)
+            .take(crate::palette::MAX_ROWS)
+            .enumerate()
+            .map(|(index, entry)| {
+                let prefix = if view == crate::palette::View::ShellSelector {
+                    format!("{}  ", window_start + index + 1)
+                } else {
+                    String::new()
+                };
+                (
+                    format!("{prefix}{}", entry.label),
+                    entry.hint.clone(),
+                    window_start + index == palette.selected,
+                )
+            })
+            .collect();
+
+        let error = palette.error.clone();
+        // The same arithmetic the hit-testing uses, so a row is pressed where
+        // it is drawn.
+        let card = match view {
+            crate::palette::View::Search => {
+                let geometry = if palette.title.is_some() {
+                    crate::palette::Geometry::titled
+                } else {
+                    crate::palette::Geometry::new
+                };
+                geometry(
+                    window_width,
+                    (metrics.width, metrics.height),
+                    rows.len(),
+                    error.is_some(),
+                )
+            }
+            crate::palette::View::ShellSelector => {
+                self.shell_selector_card(rows.len(), error.is_some())
+            }
+            crate::palette::View::Confirm => crate::palette::Geometry::confirming(
+                window_width,
+                (metrics.width, metrics.height),
+                rows.len(),
+                error.is_some(),
+            ),
+        };
+        let (left, top, width, height) = (card.left, card.top, card.width, card.height);
+        // Cut every row to the card it is drawn in. Without this a long
+        // label and its description ran straight out past the card's
+        // edge and over the terminal behind it -- text with no card
+        // under it, which reads as a rendering fault rather than as a
+        // row that was too long.
+        let columns = ((width / metrics.width.max(1.0)) as usize).saturating_sub(2);
+        let rows: Vec<(String, String, bool)> = rows
+            .into_iter()
+            .map(|(label, hint, selected)| {
+                if hint.is_empty() {
+                    (crate::sidebar::fit(&label, columns), String::new(), selected)
+                } else {
+                    let hint_cols = crate::sidebar::columns(&hint);
+                    let max_label_cols = columns.saturating_sub(hint_cols + 3).max(8);
+                    let fitted_label = crate::sidebar::fit(&label, max_label_cols);
+                    let max_hint_cols = columns
+                        .saturating_sub(crate::sidebar::columns(&fitted_label) + 2);
+                    let fitted_hint = crate::sidebar::fit(&hint, max_hint_cols);
+                    (fitted_label, fitted_hint, selected)
+                }
+            })
+            .collect();
+
+        if matches!(
+            view,
+            crate::palette::View::ShellSelector | crate::palette::View::Confirm
+        ) {
+            // Match the old selector's dimmed stage: it reads as a modal
+            // choice, not as terminal output that happened to be highlighted.
+            // A close prompt gets it for a stronger reason -- it is the one
+            // question that must not be dismissed by habit.
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: self.terminal_left(),
+                top: self.terminal_top(),
+                width: self.terminal_width(),
+                height: self.terminal_height(),
+                color: [0.02, 0.02, 0.02, 0.82],
+            });
+        }
+        // A Fluent flyout: an 8px card lifted off the terminal by a soft
+        // shadow and edged with a one-pixel stroke. There is no blur to draw
+        // a shadow with, so it is built from a few translucent rounded
+        // layers that grow outward and sink a little, which reads the same
+        // at the distance a shadow is seen from.
+        let fill = if view == crate::palette::View::ShellSelector {
+            [0.102, 0.102, 0.102, 1.0]
+        } else {
+            mix(self.window.colors.background, self.window.colors.foreground, 0.10)
+        };
+        self.append_flyout(left, top, width, height, fill, quads);
+
+        let foreground = self.window.colors.foreground;
+        if view == crate::palette::View::ShellSelector {
+            crate::terminal::append_text(
+                "\u{25C6}  Select Shell / New Tab",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                [0.38, 0.69, 0.94, 1.0],
+                (left + metrics.width, top),
+                quads,
+            );
+            crate::terminal::append_text(
+                "Choose the shell for the new tab",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                mix(foreground, self.window.colors.background, 0.35),
+                (left + metrics.width, top + metrics.height),
+                quads,
+            );
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: left + metrics.width,
+                top: top + metrics.height * 2.0 + metrics.height * 0.48,
+                width: (width - metrics.width * 2.0).max(0.0),
+                height: 1.0,
+                color: mix(self.window.colors.background, foreground, 0.25),
+            });
+        } else if view == crate::palette::View::Confirm {
+            // The question, then a rule, then the answers. Nothing to
+            // type into: the heading is the whole prompt.
+            if let Some(title) = palette.title.as_deref() {
+                crate::terminal::append_text(
+                    title,
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    foreground,
+                    (left + metrics.width, top),
+                    quads,
+                );
+            }
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: left + metrics.width,
+                top: top + metrics.height * 1.5,
+                width: (width - metrics.width * 2.0).max(0.0),
+                height: 1.0,
+                color: mix(self.window.colors.background, foreground, 0.25),
+            });
+            // And the keys, under the answers: a prompt that can only
+            // be answered with the mouse is one a keyboard user is
+            // stuck in.
+            let help = unterm_services::i18n::t("close.keys");
+            crate::terminal::append_text(
+                &help,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                mix(foreground, self.window.colors.background, 0.45),
+                (
+                    left + metrics.width,
+                    top + metrics.height * (rows.len() + card.leading_rows) as f32
+                        + metrics.height * 0.4,
+                ),
+                quads,
+            );
+        } else {
+            if let Some(title) = palette.title.as_deref() {
+                crate::terminal::append_text(
+                    title,
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    foreground,
+                    (left + metrics.width, top),
+                    quads,
+                );
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: left + metrics.width,
+                    top: top + metrics.height - 1.0,
+                    width: (width - metrics.width * 2.0).max(0.0),
+                    height: 1.0,
+                    color: mix(self.window.colors.background, foreground, 0.25),
+                });
+            }
+            // The query line, with a caret so an empty palette still looks
+            // like something you type into.
+            let query = format!("> {}", palette.query);
+            let query_top = top + metrics.height * usize::from(palette.title.is_some()) as f32;
+            crate::terminal::append_text(
+                &query,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                foreground,
+                (left + metrics.width, query_top),
+                quads,
+            );
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: left + metrics.width * (query.chars().count() + 1) as f32,
+                top: query_top,
+                width: (metrics.width * 0.15).max(1.0),
+                height: metrics.height,
+                color: foreground,
+            });
+        }
+
+        let hint_ink = self.chrome().dim_text;
+        for (index, (text, hint, selected)) in rows.iter().enumerate() {
+            let row_top = top + metrics.height * (index + card.leading_rows) as f32;
+            if *selected {
+                let pt = self.chrome_pt();
+                let row_radius = crate::ui_tokens::CORNER_RADIUS * pt;
+                let row_left = left + metrics.width * 0.5;
+                let row_width = (width - metrics.width).max(1.0);
+                quads.backgrounds.extend(unterm_render::rounded::panel(
+                    row_left,
+                    row_top,
+                    row_width,
+                    metrics.height,
+                    row_radius,
+                    match view {
+                        crate::palette::View::ShellSelector => [0.176, 0.176, 0.176, 1.0],
+                        // A decision's default answer has to be obvious
+                        // at a glance: this is the one that Enter takes.
+                        crate::palette::View::Confirm => {
+                            mix(self.window.colors.background, self.window.colors.foreground, 0.36)
+                        }
+                        crate::palette::View::Search => {
+                            mix(self.window.colors.background, self.window.colors.foreground, 0.24)
+                        }
+                    },
+                ));
+                self.append_selection_pill(row_left, row_top, metrics.height, quads);
+            }
+            // The answer that cannot be taken back is drawn as one:
+            // a row that ends every running shell must not look like
+            // the row above it, which merely closes a window.
+            let irreversible = palette
+                .visible()
+                .get(window_start + index)
+                .is_some_and(|entry| {
+                    entry.command == crate::palette::Command::CancelAndExit
+                });
+            let ink = if irreversible {
+                [0.95, 0.42, 0.35, 1.0]
+            } else {
+                foreground
+            };
+            crate::terminal::append_text(
+                text,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                ink,
+                (left + metrics.width, row_top),
+                quads,
+            );
+            if !hint.is_empty() {
+                let hint_cols = crate::sidebar::columns(hint) as f32;
+                let hint_left = (left + width - metrics.width * (hint_cols + 1.5))
+                    .max(left + metrics.width * (crate::sidebar::columns(text) as f32 + 2.5));
+                crate::terminal::append_text(
+                    hint,
+                    &mut self.window.font,
+                    &mut self.window.atlas,
+                    hint_ink,
+                    (hint_left, row_top),
+                    quads,
+                );
+            }
+        }
+
+        // Visible, clickable affordances for a result set larger than the
+        // card.  These share `top_row` with arrows, PageUp/PageDown and the
+        // wheel, so every navigation path shows the same slice.
+        let arrow_left = left + width - metrics.width * 1.6;
+        let arrow_color = mix(foreground, self.window.colors.background, 0.25);
+        if palette.can_scroll_up() && !rows.is_empty() {
+            crate::terminal::append_text(
+                "↑",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                arrow_color,
+                (
+                    left + width - metrics.width * 1.6,
+                    top + metrics.height * card.leading_rows as f32,
+                ),
+                quads,
+            );
+        }
+        if palette.can_scroll_down(crate::palette::MAX_ROWS) && !rows.is_empty() {
+            crate::terminal::append_text(
+                "↓",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                arrow_color,
+                (
+                    arrow_left,
+                    top + metrics.height * (card.leading_rows + rows.len() - 1) as f32,
+                ),
+                quads,
+            );
+        }
+
+        if view == crate::palette::View::ShellSelector {
+            let footer_top = top + metrics.height * (card.leading_rows + rows.len()) as f32;
+            crate::terminal::append_text(
+                "\u{2191}\u{2193} move   Enter select   1-9 quick select   Esc close",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                mix(foreground, self.window.colors.background, 0.45),
+                (left + metrics.width, footer_top),
+                quads,
+            );
+            crate::terminal::append_text(
+                "Unterm",
+                &mut self.window.font,
+                &mut self.window.atlas,
+                mix(foreground, self.window.colors.background, 0.65),
+                (
+                    left + (width - metrics.width * "Unterm".len() as f32) / 2.0,
+                    footer_top + metrics.height,
+                ),
+                quads,
+            );
+        }
+
+        // Under the rows rather than instead of them: the answer to "this
+        // repository has uncommitted changes" is to go and commit, and the
+        // task has to still be there to press Enter on afterwards.
+        if let Some(error) = error {
+            let row_top =
+                top + metrics.height * (rows.len() + card.leading_rows + card.trailing_rows) as f32;
+            let danger = crate::window_buttons::CLOSE_HOVER;
+            crate::terminal::append_text(
+                &error,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                danger,
+                (left + metrics.width, row_top),
+                quads,
+            );
+        }
+    }
+
+    /// The search bar, along the bottom.
+    ///
+    /// The bottom rather than the top: the tab bar is up there, and a bar
+    /// that moved the terminal's rows around every time it opened would
+    /// reflow the shell mid-search.
+    /// Tint every visible match, the current one brighter — a search that
+    /// highlights nothing leaves the reader hunting for what it found.
+    fn append_search_matches(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let Some(search) = self.window.search.clone() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
+        if self.window.state.is_none() {
+            return;
+        }
+        let session_id = self.focused_session();
+        let Ok(snapshot) = self.engine.read_styled_screen(session_id) else {
+            return;
+        };
+        let top_row = snapshot.lines.first().map(|line| line.row).unwrap_or(0);
+        let rows = snapshot.rows as i64;
+        let metrics = self.window.font.metrics();
+        let origin = self
+            .placements()
+            .into_iter()
+            .find(|placement| placement.session_id == session_id)
+            .map(|placement| placement.origin)
+            .unwrap_or((self.terminal_left(), self.terminal_top()));
+        let accent = self.chrome().focus_rail;
+        for (index, found) in search.matches.iter().enumerate() {
+            if found.row < top_row || found.row >= top_row + rows {
+                continue;
+            }
+            let columns: usize = search
+                .pattern
+                .chars()
+                .map(crate::terminal::column_width)
+                .sum::<usize>()
+                .max(1);
+            let alpha = if index == search.selected { 0.45 } else { 0.18 };
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: origin.0 + found.col as f32 * metrics.width,
+                top: origin.1 + (found.row - top_row) as f32 * metrics.height,
+                width: columns as f32 * metrics.width,
+                height: metrics.height,
+                color: [accent[0], accent[1], accent[2], alpha],
+            });
+        }
+    }
+
+    fn append_search_bar(
+        &mut self,
+        window_width: f32,
+        quads: &mut unterm_render::quads::FrameQuads,
+    ) {
+        let Some(search) = self.window.search.as_ref() else {
+            return;
+        };
+        let label = search.label();
+        let mode = match search.mode {
+            crate::search::Mode::CaseSensitive => "Aa",
+            crate::search::Mode::CaseInsensitive => "aA",
+            crate::search::Mode::Regex => ".*",
+        };
+        let metrics = self.window.font.metrics();
+        let height = self.window.state.as_ref().map(|live| live.height).unwrap_or(0) as f32;
+        let left = self.terminal_left();
+        let width = self.terminal_width();
+        let top = (height - self.status_bar_height() - metrics.height).max(self.terminal_top());
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left,
+            top,
+            width: width.min(window_width - left),
+            height: metrics.height,
+            color: self.window.colors.foreground,
+        });
+        let background = self.window.colors.background;
+        let button_cells = 13usize;
+        let columns = (width / metrics.width.max(1.0)).floor().max(0.0) as usize;
+        let label = crate::sidebar::fit(&label, columns.saturating_sub(button_cells + 2));
+        crate::terminal::append_text(
+            &label,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            background,
+            (left + metrics.width, top),
+            quads,
+        );
+
+        let buttons = [("↑", 3usize), ("↓", 3usize), (mode, 4usize), ("×", 3usize)];
+        let mut pen = left + width - button_cells as f32 * metrics.width;
+        for (text, cells) in buttons {
+            let button_width = cells as f32 * metrics.width;
+            quads.backgrounds.push(unterm_render::quads::Quad {
+                left: pen + 1.0,
+                top: top + 1.0,
+                width: (button_width - 2.0).max(0.0),
+                height: (metrics.height - 2.0).max(0.0),
+                color: self.window.colors.background,
+            });
+            let text_width = text.chars().count() as f32 * metrics.width;
+            crate::terminal::append_text(
+                text,
+                &mut self.window.font,
+                &mut self.window.atlas,
+                self.window.colors.foreground,
+                (pen + ((button_width - text_width) / 2.0).max(0.0), top),
+                quads,
+            );
+            pen += button_width;
+        }
+    }
+
+    /// Name the window after what is running in it.
+    ///
+    /// A terminal called "Unterm" whatever is inside it tells the user
+    /// nothing when they are looking at a taskbar full of them. The rules are
+    /// the engine's, so both front ends name a shell the same way.
+    fn update_window_title(&mut self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        use unterm_engine::next_core::tab_title::{render, TabContext, TabTitleRules};
+
+        let cached_session = unterm_engine::SessionEngine::list_sessions(&self.engine)
+            .ok()
+            .and_then(|sessions| sessions.into_iter().find(|s| s.id == live.session_id));
+        let process_path = cached_session
+            .as_ref()
+            .map(|session| session.shell.process_name.clone())
+            .unwrap_or_default();
+        let pane_title = cached_session
+            .map(|session| session.title)
+            .unwrap_or_default();
+
+        let index = self
+            .window.tab_id
+            .and_then(|id| self.window.tabs.tab_ids().iter().position(|c| *c == id))
+            .unwrap_or(0)
+            + 1;
+        let rendered = render(
+            &TabTitleRules {
+                // No padding: a window title is not a tab label.
+                format: "{title}".to_string(),
+                ..Default::default()
+            },
+            TabContext {
+                pane_title: &pane_title,
+                process_path: &process_path,
+                index,
+            },
+        );
+        // What the window is about, in the user's words: the project, and
+        // the program when it is something other than the shell itself.
+        // The old shape led with the tab's position and ended with the
+        // shell's name -- "[1/3] unterm — Zsh" -- two facts the sidebar shows
+        // anyway, in the one place a person looks for what they are doing.
+        let project_name = self
+            .current_directory()
+            .map(|dir| crate::sidebar::project_name(&dir.display().to_string()))
+            .filter(|name| !name.is_empty());
+        let program = if rendered.trim().is_empty()
+            || crate::sidebar::same_program(rendered.trim(), &process_path)
+            || is_a_shell(rendered.trim())
+            || crate::sidebar::is_prompt_title(&pane_title)
+        {
+            None
+        } else {
+            Some(rendered.trim().to_string())
+        };
+        let subject = match (project_name, program) {
+            (Some(project), Some(program)) => format!("{project} — {program}"),
+            (Some(project), None) => project,
+            (None, Some(program)) => program,
+            (None, None) => rendered.trim().to_string(),
+        };
+        // A name somebody gave this window outranks the one guessed from it.
+        let subject = crate::mcp_host::pinned_title().unwrap_or(subject);
+        // This process's own instance, not the machine's active one: with two
+        // windows open, `read()` answers for whichever registered last, and
+        // both titles claim to be it.
+        let instance = unterm_services::server_info::read_current().id;
+        let instance = if instance.is_empty() {
+            String::new()
+        } else {
+            format!(" ({instance})")
+        };
+        // The bar's centre gets the same subject without the product
+        // name: the window already says "Unterm" in its own corner, and
+        // a title bar that repeats it has said nothing twice.
+        // The administrator window says so wherever the window is named:
+        // a shell that can change the machine must never be mistaken for one
+        // that cannot.
+        let (subject, instance) = if crate::admin::is_admin_window() {
+            (
+                format!("{}: {subject}", unterm_services::i18n::t("admin.title")),
+                String::new(),
+            )
+        } else {
+            (subject, instance)
+        };
+        self.window.bar_title = subject.clone();
+        let title = format!("{subject} — {}{instance}", unterm_protocol::product_name());
+        if self.window.window_title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        live.window.set_title(&title);
+        crate::mcp_host::note_window_title(self.window.id, &title);
+        self.window.window_title = Some(title);
+    }
+
+    /// Tell the system where the candidate list belongs.
+    ///
+    /// At the caret, not in a corner: an input method that puts its
+    /// candidates across the window from what is being typed makes the user
+    /// look in two places to type one word.
+    fn place_ime_candidates(&self) {
+        let Some(live) = self.window.state.as_ref() else {
+            return;
+        };
+        let Some((origin, metrics)) = self.preedit_origin() else {
+            return;
+        };
+        live.window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(origin.0 as f64, origin.1 as f64),
+            winit::dpi::PhysicalSize::new(
+                (self.window.preedit.columns().max(1) as f32 * metrics.width) as u32,
+                metrics.height as u32,
+            ),
+        );
+    }
+
+    /// Where composed text is drawn, and the cell size it is drawn on.
+    fn preedit_origin(&self) -> Option<((f32, f32), unterm_render::quads::CellMetrics)> {
+        let metrics = self.window.font.metrics();
+        if let Some(palette) = self.window.palette.as_ref() {
+            if palette.view == crate::palette::View::Search {
+                let card = self.palette_card()?;
+                let query_columns = crate::terminal::text_columns(&palette.query);
+                return Some((
+                    (
+                        card.left + metrics.width * (3 + query_columns) as f32,
+                        card.top + metrics.height * usize::from(palette.title.is_some()) as f32,
+                    ),
+                    metrics,
+                ));
+            }
+        }
+        if let Some(search) = self.window.search.as_ref() {
+            let height = self.window.state.as_ref()?.height as f32;
+            let top = (height - self.status_bar_height() - metrics.height).max(self.terminal_top());
+            let columns = crate::terminal::text_columns(&search.pattern);
+            return Some((
+                (
+                    self.terminal_left() + metrics.width * (9 + columns) as f32,
+                    top,
+                ),
+                metrics,
+            ));
+        }
+        let live = self.window.state.as_ref()?;
+        let snapshot = self.engine.read_styled_screen(live.session_id).ok()?;
+        let placement = self
+            .placements()
+            .into_iter()
+            .find(|placement| placement.session_id == live.session_id);
+        let (pane_origin, pane_cols) = match placement {
+            Some(placement) => (placement.origin, placement.cols),
+            None => ((self.terminal_left(), self.terminal_top()), snapshot.cols),
+        };
+        let cursor = (snapshot.cursor.x, snapshot.cursor.y.max(0) as usize);
+        Some((
+            crate::ime::origin(
+                cursor,
+                pane_origin,
+                (metrics.width, metrics.height),
+                pane_cols,
+                self.window.preedit.columns(),
+            ),
+            metrics,
+        ))
+    }
+
+    /// Commit text from an input method to the modal that owns the keyboard.
+    ///
+    /// Winit reports Chinese/Japanese/Korean input as `Ime::Commit`, not as a
+    /// normal keyboard character.  Sending every commit straight to the PTY
+    /// made English palette filtering work while Chinese appeared to do
+    /// nothing (and was secretly typed into the shell underneath).
+    fn commit_ime_to_modal(&mut self, text: &str) -> bool {
+        if let Some(mut palette) = self.window.palette.take() {
+            palette.query.push_str(text);
+            self.requery_palette(&mut palette);
+            self.window.palette = Some(palette);
+            self.window.drawn_revision = None;
+            return true;
+        }
+        if let Some(mut search) = self.window.search.take() {
+            search.pattern.push_str(text);
+            let matches = self.run_search(self.focused_session(), &search.pattern, search.mode);
+            search.adopt(matches);
+            if let Some(found) = search.current() {
+                let _ = self
+                    .engine
+                    .scroll_viewport_to(self.focused_session(), found.row as isize);
+            }
+            self.window.search = Some(search);
+            self.window.drawn_revision = None;
+            return true;
+        }
+        false
+    }
+
+    /// Draw what the input method is still composing.
+    ///
+    /// Inverted, the way every terminal marks text that is not committed yet:
+    /// it is not in the shell, and drawing it like ordinary output would
+    /// suggest it had already been typed.
+    /// Throw away a composition nobody is composing.
+    ///
+    /// Switching input sources mid-composition strands the marked text: the
+    /// old input method never ends it, winit never hears an `Ime` event for
+    /// it, and AppKit keeps routing editing keys into the ghost. Clearing
+    /// our overlay is not enough -- the platform's own marked text has to
+    /// go, and toggling IME off and on is the one lever winit exposes that
+    /// makes AppKit discard it.
+    fn clear_orphan_preedit(&mut self) {
+        self.window.preedit = crate::ime::Preedit::default();
+        if let Some(live) = self.window.state.as_ref() {
+            live.window.set_ime_allowed(false);
+            live.window.set_ime_allowed(true);
+        }
+        self.window.drawn_revision = None;
+    }
+
+    fn append_preedit(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        if self.window.preedit.is_empty() {
+            return;
+        }
+        let Some((origin, metrics)) = self.preedit_origin() else {
+            return;
+        };
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: origin.0,
+            top: origin.1,
+            width: self.window.preedit.columns() as f32 * metrics.width,
+            height: metrics.height,
+            color: self.window.colors.foreground,
+        });
+        let text = self.window.preedit.text.clone();
+        let background = self.window.colors.background;
+        crate::terminal::append_text(
+            &text,
+            &mut self.window.font,
+            &mut self.window.atlas,
+            background,
+            origin,
+            quads,
+        );
+        // A caret inside the composition, so a user editing what they have
+        // typed so far can see where they are.
+        let caret = self.window.preedit.caret_column() as f32 * metrics.width;
+        quads.backgrounds.push(unterm_render::quads::Quad {
+            left: origin.0 + caret,
+            top: origin.1,
+            width: (metrics.width * 0.15).max(1.0),
+            height: metrics.height,
+            color: background,
+        });
+    }
+
+    /// The lines between split panes.
+    ///
+    /// Without them two shells sharing a background read as one shell with
+    /// strange wrapping, which is exactly the confusion a split is supposed
+    /// to remove.
+    fn divider_quads(&self) -> Vec<unterm_render::quads::Quad> {
+        let (Some(tab_id), Some(_live)) = (self.window.tab_id, self.window.state.as_ref()) else {
+            return Vec::new();
+        };
+        let metrics = self.window.font.metrics();
+        let (cols, rows) = self
+            .window.font
+            .grid_for(self.terminal_width(), self.terminal_height());
+        let left_offset = self.terminal_left();
+        let top_offset = self.terminal_top();
+        let positions = self.window.tabs.positions(tab_id, cols, rows);
+        if positions.len() < 2 {
+            return Vec::new();
+        }
+
+        positions
+            .iter()
+            .filter_map(|placed| {
+                let rect = &placed.rect;
+                // Only where the pane does not reach the edge: an edge is
+                // already a boundary, and a line drawn on it is a wasted row.
+                let vertical = rect.left + rect.width < cols;
+                if !vertical && rect.top + rect.height >= rows {
+                    return None;
+                }
+                crate::panes::divider_after(rect.clone(), metrics, vertical)
+            })
+            .map(|(left, top, width, height)| unterm_render::quads::Quad {
+                left: left + left_offset,
+                top: top + top_offset,
+                width,
+                height,
+                // Between the two backgrounds: visible against both without
+                // drawing attention to itself.
+                color: self.theme().divider,
+            })
+            .collect()
+    }
+
+    /// Where each pane goes, in pixels.
+    /// The crews worth offering here, and the task line above them.
+    fn fleet_entries(&self) -> Vec<crate::palette::Entry> {
+        crate::fleet::crews(&unterm_services::cockpit::fleet::installed_agents())
+            .into_iter()
+            .map(|crew| crate::palette::Entry {
+                hint: unterm_services::i18n::t("cockpit.fleet_worktrees"),
+                label: crew.label,
+                command: crate::palette::Command::LaunchFleet {
+                    agents: crew.agents,
+                },
+            })
+            .collect()
+    }
+
+    /// Send a crew at the task that has been typed.
+    ///
+    /// The repository is checked first and on the palette's own thread,
+    /// because the answer is instant and the failure belongs in the card that
+    /// asked: a dirty worktree is fixed by going and committing, and the task
+    /// has to still be there afterwards.
+    ///
+    /// The launch itself is not: creating a worktree per agent and starting a
+    /// tab for each takes seconds, and doing it here would freeze the window
+    /// for all of them.
+    fn launch_fleet(&mut self, agents: Vec<String>, task: String) {
+        let here = self
+            .current_directory()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Two refusals, and both bring the card back with what was typed still
+        // in it. The answer to either is to go and fix something and press
+        // Enter again, which needs the task to have survived.
+        let refusal = if !crate::fleet::task_is_ready(&task) {
+            Some("cockpit.fleet_no_task")
+        } else {
+            unterm_services::cockpit::fleet::precheck(&here).err()
+        };
+        if let Some(key) = refusal {
+            let entries = self.fleet_entries();
+            let mut palette = crate::palette::Palette::writing(entries);
+            palette.query = task;
+            palette.error = Some(unterm_services::i18n::t(key));
+            self.window.palette = Some(palette);
+            self.window.drawn_revision = None;
+            return;
+        }
+
+        self.show_notice(unterm_services::i18n::t("cockpit.fleet_launching"));
+        self.window.drawn_revision = None;
+        // Creating a worktree per agent and starting a tab for each takes
+        // seconds; doing it here would freeze the window for all of them.
+        let spawned = std::thread::Builder::new()
+            .name("fleet-launch".into())
+            .spawn(
+                move || match unterm_services::cockpit::fleet::launch(&here, &task, &agents) {
+                    Ok(fleet) => log::info!(
+                        "fleet {} launched with {} members",
+                        fleet.id,
+                        fleet.members.len()
+                    ),
+                    Err(err) => log::error!("fleet launch failed: {err:#}"),
+                },
+            );
+        if let Err(err) = spawned {
+            log::error!("could not start the fleet launcher: {err:#}");
+        }
+    }
+
+    /// Throw away a pane's history.
+    ///
+    /// The scrollback only, unless the screen is asked for too. A pane with a
+    /// hundred thousand lines behind it is the reason anyone asks; losing what
+    /// is currently on screen is not part of the request.
+    ///
+    /// The view is put back to the bottom afterwards. Scrolled up into history
+    /// that no longer exists is a blank pane, and it looks like the clear broke
+    /// something rather than like it worked.
+    fn clear_scrollback(&mut self, session_id: usize, include_screen: bool) {
+        if let Err(err) = self.engine.erase_scrollback(session_id, include_screen) {
+            log::warn!("could not clear the scrollback: {err:#}");
+            return;
+        }
+        // Back to the bottom. Scrolled up into history that no longer exists
+        // is a blank pane, and that reads as the clear having broken something
+        // rather than as it having worked.
+        let _ = self.engine.scroll_viewport_to(session_id, isize::MAX);
+        self.show_notice(unterm_services::i18n::t(if include_screen {
+            "notice.screen_cleared"
+        } else {
+            "notice.scrollback_cleared"
+        }));
+        self.window.drawn_revision = None;
+    }
+
+    /// Put a letter on every pane.
+    ///
+    /// Nothing to choose between is nothing to open: a selector over one pane
+    /// is a letter you have to press to stay where you already are.
+    fn open_pane_select(&mut self, mode: crate::paneselect::Mode) {
+        let panes = self.placements();
+        if panes.len() < 2 {
+            return;
+        }
+        self.window.pane_select = Some(crate::paneselect::Selector::new(panes.len(), mode));
+        self.window.drawn_revision = None;
+    }
+
+    /// Type at the pane selector. Returns true when the key was its.
+    fn handle_pane_select_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::Key as WinitKey;
+        let Some(mut selector) = self.window.pane_select.take() else {
+            return false;
+        };
+        let named = match &event.logical_key {
+            WinitKey::Named(named) => Some(format!("{named:?}")),
+            _ => None,
+        };
+        let character = match &event.logical_key {
+            WinitKey::Character(text) => Some(text.to_string()),
+            _ => None,
+        };
+
+        match selector.key(named.as_deref(), character.as_deref(), self.window.ctrl_held) {
+            crate::paneselect::Outcome::Chose(index) => self.take_pane(&selector, index),
+            crate::paneselect::Outcome::Typing => self.window.pane_select = Some(selector),
+            crate::paneselect::Outcome::Cancelled => {}
+            // Nothing reaches the shell while it is open: a keystroke through
+            // it would run in whichever pane happens to be in front.
+            crate::paneselect::Outcome::Ignored => self.window.pane_select = Some(selector),
+        }
+        self.window.drawn_revision = None;
+        true
+    }
+
+    /// Do whatever the selector was opened to do, to the pane that was picked.
+    fn take_pane(&mut self, selector: &crate::paneselect::Selector, index: usize) {
+        let panes = self.placements();
+        let order = crate::paneselect::reading_order(&panes);
+        let Some(chosen) = order.get(index).and_then(|at| panes.get(*at)) else {
+            return;
+        };
+        let chosen = chosen.session_id;
+
+        match selector.mode {
+            crate::paneselect::Mode::Activate => {
+                self.window.tabs.set_active_pane(chosen);
+                self.focus_session(chosen);
+            }
+            crate::paneselect::Mode::Swap => self.swap_panes(chosen),
+        }
+    }
+
+    /// Exchange the chosen pane with the one in front, and follow it.
+    ///
+    /// Done by rebuilding the tab's arrangement with the two panes' places
+    /// exchanged, rather than by moving anything: the shells keep running
+    /// where they are, and only the rectangles they are drawn in change.
+    fn swap_panes(&mut self, chosen: usize) {
+        let (Some(tab_id), Some(live)) = (self.window.tab_id, self.window.state.as_ref()) else {
+            return;
+        };
+        let focused = self.window.tabs.active_pane(tab_id).unwrap_or(live.session_id);
+        if focused == chosen {
+            return;
+        }
+        let (cols, rows) = self
+            .window.font
+            .grid_for(self.terminal_width(), self.terminal_height());
+        let mut positions = self.window.tabs.positions(tab_id, cols, rows);
+        for position in &mut positions {
+            if position.pane_id == focused {
+                position.pane_id = chosen;
+            } else if position.pane_id == chosen {
+                position.pane_id = focused;
+            }
+        }
+        // Following means the focus keeps its *pane* rather than its place.
+        let active = chosen;
+        if let Err(err) = self.window.tabs.adopt_tab(tab_id, &positions, active) {
+            log::warn!("could not swap panes: {err:#}");
+            return;
+        }
+        self.window.tabs.set_active_pane(active);
+        self.focus_session(active);
+        self.resize_panes();
+    }
+
+    /// The pane under the pointer, when the tab is split.
+    /// Where each pane's close button sits, when the tab is split.
+    ///
+    /// One per pane, top right, and only with two panes or more: a lone
+    /// pane's close is the tab's close, and a button that would do that is
+    /// a second close button. Ported from 0.57.4, which drew the same x.
+    fn pane_close_buttons(&self) -> Vec<(usize, f32, f32, f32, f32, f32)> {
+        let placements = self.placements();
+        if placements.len() < 2 {
+            return Vec::new();
+        }
+        let metrics = self.window.font.metrics();
+        let Some(active) = self.window.tab_id.and_then(|tab| self.window.tabs.active_pane(tab)) else {
+            return Vec::new();
+        };
+        let max_grid_right = placements
+            .iter()
+            .map(|placement| placement.origin.0 + placement.cols as f32 * metrics.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        placements
+            .into_iter()
+            // 0.57.4 intentionally shows exactly one close affordance: on the
+            // active pane.  A button on every pane leaves an X floating in the
+            // middle of a left/right split and reads as a misplaced control.
+            .filter(|placement| placement.session_id == active)
+            .map(|placement| {
+                let grid_right = placement.origin.0 + placement.cols as f32 * metrics.width;
+                let pane_right = if (grid_right - max_grid_right).abs() <= 0.5 {
+                    self.terminal_left() + self.terminal_width()
+                } else {
+                    grid_right
+                };
+                let button_width = metrics.width * 3.0;
+                let button_height = metrics.height;
+                (
+                    placement.session_id,
+                    (pane_right - button_width).max(0.0),
+                    placement.origin.1 - metrics.height * 0.28,
+                    button_width,
+                    button_height,
+                    pane_right,
+                )
+            })
+            .collect()
+    }
+
+    /// The pane close button under the pointer, if it is on one.
+    fn pane_close_button_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.pane_close_buttons()
+            .into_iter()
+            .find(|(_, left, top, width, height, _)| {
+                x >= *left && x < left + width && y >= *top && y < top + height
+            })
+            .map(|(session_id, ..)| session_id)
+    }
+
+    /// Draw the split-pane close buttons over the panes.
+    fn append_pane_close_buttons(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let buttons = self.pane_close_buttons();
+        if buttons.is_empty() {
+            return;
+        }
+        let chrome = self.chrome();
+        let hovered = self.pane_close_button_at(self.window.pointer.0, self.window.pointer.1);
+        for (session_id, left, top, width, height, pane_right) in buttons {
+            let hover = hovered == Some(session_id);
+            let chip = (height * 0.82).min(width * 0.82);
+            let arm = (chip * 0.22).max(3.0);
+            let center_x = (pane_right - 5.0 * self.chrome_pt() - arm).max(left + arm);
+            let center_y = top + height / 2.0;
+            if hover {
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: center_x - chip / 2.0,
+                    top: center_y - chip / 2.0,
+                    width: chip,
+                    height: chip,
+                    color: chrome.hover_bg,
+                });
+            }
+            let mut color = if hover {
+                self.chrome_foreground()
+            } else {
+                self.chrome_foreground()
+            };
+            color[3] *= if hover { 0.9 } else { 0.26 };
+            // The old renderer hand-stroked the X above terminal glyphs.
+            // Using a font glyph changes its baseline and makes it sink into
+            // the first text row, which is the severe offset seen here.
+            let thick = (height / 12.0).max(1.6);
+            let steps = ((arm * 4.0).round() as i32).max(24);
+            for step in -steps..=steps {
+                let t = step as f32 / steps as f32;
+                let dx = t * arm;
+                let dy = t * arm;
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: center_x + dx - thick / 2.0,
+                    top: center_y + dy - thick / 2.0,
+                    width: thick,
+                    height: thick,
+                    color,
+                });
+                quads.backgrounds.push(unterm_render::quads::Quad {
+                    left: center_x + dx - thick / 2.0,
+                    top: center_y - dy - thick / 2.0,
+                    width: thick,
+                    height: thick,
+                    color,
+                });
+            }
+        }
+    }
+
+    /// Quiet corner micro-pills for panes whose last command exited with an error.
+    fn pane_error_pills(&mut self) -> Vec<(usize, f32, f32, f32, f32, String)> {
+        let placements = self.placements();
+        if placements.is_empty() {
+            return Vec::new();
+        }
+        let metrics = self.window.font.metrics();
+        let pt = self.chrome_pt();
+        let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+        let max_grid_right = placements
+            .iter()
+            .map(|placement| placement.origin.0 + placement.cols as f32 * metrics.width)
+            .fold(0.0_f32, f32::max);
+        let has_split = placements.len() > 1;
+        let active = self.focused_session();
+        let mut pills = Vec::new();
+        for placement in placements {
+            let notice = self
+                .window
+                .pane_notices
+                .get(&placement.session_id)
+                .copied()
+                .unwrap_or_default();
+            let exit_code = notice.last_exit_code.unwrap_or(0);
+            if !notice.error && exit_code == 0 {
+                continue;
+            }
+            let label = if is_zh {
+                if exit_code != 0 {
+                    format!("●  AI 诊断 · exit {exit_code}")
+                } else {
+                    "●  AI 诊断".to_string()
+                }
+            } else if exit_code != 0 {
+                format!("●  Diagnose · exit {exit_code}")
+            } else {
+                "●  Diagnose".to_string()
+            };
+            let text_w = self.chrome_width(&label);
+            let pill_w = (text_w + 14.0 * pt).round();
+            let pill_h = (self.window.chrome_font.metrics().height + 6.0 * pt)
+                .round()
+                .max(20.0 * pt);
+            let grid_right = placement.origin.0 + placement.cols as f32 * metrics.width;
+            let pane_right = if (grid_right - max_grid_right).abs() <= 0.5 {
+                self.terminal_left() + self.terminal_width()
+            } else {
+                grid_right
+            };
+            // Leave room for the active split pane's close button in the top-right corner.
+            let right_inset = if has_split && placement.session_id == active {
+                metrics.width * 3.0 + 6.0 * pt
+            } else {
+                10.0 * pt
+            };
+            let left = (pane_right - right_inset - pill_w).max(placement.origin.0 + 4.0 * pt);
+            let top = placement.origin.1 + 6.0 * pt;
+            pills.push((placement.session_id, left, top, pill_w, pill_h, label));
+        }
+        pills
+    }
+
+    fn pane_error_pill_at(&mut self, x: f32, y: f32) -> Option<usize> {
+        self.pane_error_pills()
+            .into_iter()
+            .find(|(_, left, top, width, height, _)| {
+                x >= *left && x < left + width && y >= *top && y < top + height
+            })
+            .map(|(session_id, ..)| session_id)
+    }
+
+    fn append_pane_error_pills(&mut self, quads: &mut unterm_render::quads::FrameQuads) {
+        let pills = self.pane_error_pills();
+        if pills.is_empty() {
+            return;
+        }
+        let pt = self.chrome_pt();
+        let chrome = self.chrome();
+        let hovered = self.pane_error_pill_at(self.window.pointer.0, self.window.pointer.1);
+        for (session_id, left, top, width, height, label) in pills {
+            let is_hovered = hovered == Some(session_id);
+            let radius = height / 2.0;
+            let mut fill = chrome.status_err_bg;
+            if is_hovered {
+                fill[3] = (fill[3] + 0.12).min(1.0);
+            }
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                left - 1.0,
+                top - 1.0,
+                width + 2.0,
+                height + 2.0,
+                radius + 1.0,
+                chrome.status_err_outline,
+            ));
+            quads.backgrounds.extend(unterm_render::rounded::panel(
+                left,
+                top,
+                width,
+                height,
+                radius,
+                fill,
+            ));
+            let text_w = self.chrome_width(&label);
+            let text_left = left + ((width - text_w) / 2.0).max(4.0 * pt);
+            let text_top = top
+                + ((height - self.window.chrome_font.metrics().height) / 2.0
+                    + crate::ui_tokens::CHROME_TEXT_BASELINE_NUDGE * pt)
+                    .max(0.0);
+            self.append_chrome(&label, chrome.status_err, (text_left, text_top), quads);
+        }
+    }
+
+    fn pane_under_pointer(&self) -> Option<usize> {
+        let metrics = self.window.font.metrics();
+        self.placements()
+            .into_iter()
+            .find(|placement| {
+                let width = placement.cols as f32 * metrics.width;
+                let height = placement.rows as f32 * metrics.height;
+                self.window.pointer.0 >= placement.origin.0
+                    && self.window.pointer.0 < placement.origin.0 + width
+                    && self.window.pointer.1 >= placement.origin.1
+                    && self.window.pointer.1 < placement.origin.1 + height
+            })
+            .map(|placement| placement.session_id)
+    }
+
+    fn placements(&self) -> Vec<crate::panes::PanePlacement> {
+        let (Some(tab_id), Some(_live)) = (self.window.tab_id, self.window.state.as_ref()) else {
+            return Vec::new();
+        };
+        let metrics = self.window.font.metrics();
+        let (cols, rows) = self
+            .window.font
+            .grid_for(self.terminal_width(), self.terminal_height());
+        let left = self.terminal_left();
+        let top = self.terminal_top();
+        self.window.tabs
+            .positions(tab_id, cols, rows)
+            .into_iter()
+            .map(|placed| {
+                let mut placement = crate::panes::place(placed.pane_id, placed.rect, metrics);
+                placement.origin.0 += left;
+                placement.origin.1 += top;
+                placement
+            })
+            .collect()
+    }
+
+    /// Tell every pane the size it is being drawn at.
+    ///
+    /// A shell wrapping at a width it is not shown at is the most confusing
+    /// possible symptom, so this runs on every split and every resize.
+    fn resize_panes(&mut self) {
+        for placement in self.placements() {
+            // Only a size the pane does not already have. Telling a PTY it is
+            // the size it already is still costs a system call, and on Windows
+            // it makes the console reflow -- so a resize that changes nothing
+            // is not free, it is a flicker.
+            let unchanged = self
+                .window.pane_sizes
+                .get(&placement.session_id)
+                .is_some_and(|size| *size == (placement.cols, placement.rows));
+            if unchanged {
+                continue;
+            }
+            if self
+                .engine
+                .resize_session(placement.session_id, placement.cols, placement.rows)
+                .is_ok()
+            {
+                self.window.pane_sizes
+                    .insert(placement.session_id, (placement.cols, placement.rows));
+            }
+        }
+        // A pane that has gone takes its remembered size with it, so a reused
+        // id cannot inherit one.
+        let live: std::collections::HashSet<usize> = self
+            .placements()
+            .iter()
+            .map(|placement| placement.session_id)
+            .collect();
+        self.window.pane_sizes.retain(|pane, _| live.contains(pane));
+    }
+
+    /// Redraw only when the screen actually moved.
+    /// The work every tick does, whatever woke it.
+    ///
+    /// Only the redraw check runs at the tick rate. The housekeeping -- the tab
+    /// list, the cockpit, the window's title -- is not latency-critical and is
+    /// expensive: listing sessions clones every snapshot, and feeding the
+    /// cockpit reads every pane's screen. Running those as fast as the loop
+    /// spins is most of what an idle window used to cost.
+    fn tick(&mut self) {
+        let _slow = SlowGuard::new("tick");
+        // A click on a maximise button that answers Snap Layouts arrives as
+        // non-client messages; the window procedure keeps it for us.
+        if self
+            .window.state
+            .as_ref()
+            .is_some_and(|live| crate::win_chrome::take_maximise_click(&live.window))
+        {
+            self.toggle_maximize();
+            self.window.drawn_revision = None;
+        }
+        self.finish_startup_session();
+        if !self.window.startup_terminal_content_marked {
+            if let Some(live) = self.window.state.as_ref().filter(|live| live.session_id != 0) {
+                self.engine.refresh_cached_frame(live.session_id);
+            }
+        }
+        if self.window.restore_extra_tabs_pending
+            && self.window.startup_first_frame_marked
+            && self.window.startup_session.is_none()
+            && self.window.state.as_ref().is_some_and(|live| live.session_id != 0)
+        {
+            self.window.restore_extra_tabs_pending = false;
+            self.restore_extra_tabs();
+        }
+        if let Some(request) = unterm_services::theme_state::after(self.theme_request_seen) {
+            self.theme_request_seen = request.generation;
+            self.apply_theme(&request.id);
+        } else if self.theme_file_checked_at.elapsed() >= std::time::Duration::from_millis(180) {
+            self.theme_file_checked_at = std::time::Instant::now();
+            let mtime = crate::theme::remembered_mtime();
+            if mtime != self.theme_file_mtime {
+                self.theme_file_mtime = mtime;
+                if let Some(id) = crate::theme::remembered() {
+                    if self.theme_id.as_deref() != Some(id.as_str()) {
+                        self.apply_theme(&id);
+                    }
+                }
+            }
+        }
+        // Checked every tick rather than with the housekeeping: a window
+        // whose Core was replaced is showing tabs for shells that no
+        // longer exist, and waiting out the housekeeping interval to say
+        // so leaves the user typing into nothing.
+        if self.engine.session_epoch() != self.seen_session_epoch {
+            self.seen_session_epoch = self.engine.session_epoch();
+            self.recover_from_replaced_core();
+        }
+        if self.window.kept_house_at.elapsed() >= HOUSEKEEPING
+            && (!crate::statsbar::user_typing_recently()
+                || self.window.kept_house_at.elapsed() >= std::time::Duration::from_secs(4))
+        {
+            self.window.kept_house_at = std::time::Instant::now();
+            self.sync_tabs();
+            self.feed_cockpit();
+            self.update_window_title();
+            self.keep_last_session_current();
+            self.sync_frame();
+            crate::engine_backend::keep_host_channel();
+            self.report_terminal_colors();
+            self.report_cell_size();
+            for text in crate::updates::take_notices() {
+                self.show_notice(text);
+            }
+        }
+        // The composer is checked every tick while it is open, because it is
+        // waiting for a pane to go idle and a prompt held back for a quarter of
+        // a second is a prompt somebody notices.
+        if self.window.composer.is_some() {
+            self.drain_composer();
+        }
+        if let Some(pane_id) = crate::mcp_host::take_focus_pane_request() {
+            self.sync_tabs();
+            if let Some(tab_id) = self.window.tabs.tab_of_pane(pane_id) {
+                self.window.tabs.set_active_tab(tab_id);
+                self.window.tab_id = Some(tab_id);
+                let _ = self.window.tabs.set_active_pane(pane_id);
+                if let Some(live) = self.window.state.as_mut() {
+                    live.session_id = pane_id;
+                    live.window.set_minimized(false);
+                    crate::win_chrome::bring_to_front(&live.window);
+                    live.window.focus_window();
+                    live.window.request_redraw();
+                }
+                self.resize_panes();
+                self.window.occluded = false;
+                self.window.quiet_since = None;
+                self.window.drawn_revision = None;
+            }
+        }
+        if self.window.occluded
+            && self.window.drawn_confirmation
+                != unterm_mcp::handler::pending_confirmation_view().map(|v| v.id)
+        {
+            self.window.occluded = false;
+            self.window.quiet_since = None;
+        }
+        if self.window.occluded {
+            // Nothing is shown, so nothing is drawn: `draw` returns at once
+            // for an occluded window and never records what it was asked to
+            // show. Asking anyway was a spin. The screen still looked changed
+            // on the next tick, so it asked again -- and on macOS a redraw
+            // request wakes the run loop, which cut the tick's wait short
+            // every time. A window left behind others at the wrong moment
+            // sat at 100% of a core until it was uncovered. `Occluded(false)`
+            // asks for the frame that was missed.
+            if self.window.quiet_since.is_none() {
+                self.window.quiet_since = Some(std::time::Instant::now());
+            }
+        } else if self.needs_redraw() {
+            // A frame asked for and never drawn. On macOS a redraw request is
+            // also a run-loop wake-up, and the frame arrives only when AppKit
+            // chooses to draw the view -- which it does not for a window it
+            // considers hidden, whether or not it says so. Asking again on
+            // every tick then woke the loop the moment it went to sleep: the
+            // sampled 100%-of-a-core spin was this, `request_redraw` into
+            // `CFRunLoopWakeUp` over and over with `draw` almost never
+            // reached. So an unanswered request is repeated at most ten times
+            // a second, and a window that is not drawing is not busy.
+            const UNANSWERED: std::time::Duration = std::time::Duration::from_millis(100);
+            let waiting = self.window.redraw_requested_at.map(|at| at.elapsed());
+            let stalled = waiting.is_some_and(|waited| waited >= UNANSWERED);
+            if !stalled {
+                self.window.quiet_since = None;
+            } else if self.window.quiet_since.is_none() {
+                self.window.quiet_since = Some(std::time::Instant::now());
+            }
+            // One frame per refresh interval, no matter how fast the PTY
+            // writes. A skipped request costs nothing: the busy tick fires
+            // within the same interval and asks again, so the trailing
+            // frame always lands.
+            let frame_due = self
+                .window.presented_at
+                .map_or(true, |at| at.elapsed() >= std::time::Duration::from_millis(8));
+            let asked_just_now = waiting.is_some_and(|waited| waited < UNANSWERED);
+            if frame_due && !asked_just_now {
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                    self.window.redraw_requested_at = Some(std::time::Instant::now());
+                }
+            }
+        } else if self.window.quiet_since.is_none() {
+            self.window.quiet_since = Some(std::time::Instant::now());
+        }
+    }
+
+    fn finish_startup_session(&mut self) {
+        let ready = self
+            .window.startup_session
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        if !ready {
+            return;
+        }
+        let Some(worker) = self.window.startup_session.take() else {
+            return;
+        };
+        match worker.join() {
+            Ok(Ok(session)) => {
+                crate::startup_trace::mark("session.ready");
+                // This window asked for the shell; it is this window's. Any
+                // other that picked it up as an orphan before now gives it
+                // back, rather than both drawing it.
+                for parked in &mut self.parked {
+                    if parked.state.tabs.tab_of_pane(session.id).is_some() {
+                        parked.state.tabs.close_pane(session.id);
+                        parked.state.pane_sizes.remove(&session.id);
+                        settle_active_tab(&mut parked.state);
+                    }
+                }
+                self.window.tab_id = self
+                    .window
+                    .tabs
+                    .tab_of_pane(session.id)
+                    .or_else(|| self.window.tabs.create_tab(session.id).ok());
+                if let Some(live) = self.window.state.as_mut() {
+                    live.session_id = session.id;
+                    live.window.request_redraw();
+                }
+                self.resize_panes();
+                self.engine.refresh_cached_frame(session.id);
+                self.window.quiet_since = None;
+                self.window.drawn_revision = None;
+                self.draw();
+                if !self.window.startup_input.is_empty() {
+                    let input = std::mem::take(&mut self.window.startup_input);
+                    if let Err(err) = self.engine.write_input(session.id, &input) {
+                        log::warn!("could not replay startup input: {err:#}");
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                log::error!("startup session failed: {err:#}");
+                let err = err.to_string();
+                self.show_notice(unterm_services::i18n::t_args(
+                    "profile.toast.spawn_failed",
+                    &[("err", err.as_str())],
+                ));
+                self.window.startup_input.clear();
+            }
+            Err(_) => {
+                log::error!("startup session worker panicked");
+                self.show_notice("Startup shell failed".to_string());
+                self.window.startup_input.clear();
+            }
+        }
+    }
+
+    /// How long to wait before asking again.
+    ///
+    /// A frame while anything is happening, so output appears as soon as a
+    /// display can show it. Slower once a window has been quiet for a while,
+    /// because a pane that has produced nothing for two seconds is a pane
+    /// nobody is watching for latency -- and a terminal left open on a desk
+    /// should not cost a core. Anything the user does wakes the loop directly
+    /// and this never gets in the way of it.
+    fn tick_interval(&self) -> std::time::Duration {
+        const BUSY: std::time::Duration = std::time::Duration::from_millis(8);
+        const RESTING: std::time::Duration = std::time::Duration::from_millis(96);
+        const SETTLES_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let now = std::time::Instant::now();
+        let mut interval = if !self.window.startup_terminal_content_marked
+            && self.window.state.as_ref().is_some_and(|live| live.session_id != 0)
+        {
+            BUSY
+        } else {
+            match self.window.quiet_since {
+                Some(since) if since.elapsed() > SETTLES_AFTER => RESTING,
+                _ => BUSY,
+            }
+        };
+
+        if let Some(deadline) = self.window.pending_input_redraw_at {
+            let until_deadline = deadline
+                .saturating_duration_since(now)
+                .max(std::time::Duration::from_millis(1));
+            interval = interval.min(until_deadline);
+        }
+
+        if let Some(presented) = self.window.presented_at {
+            let elapsed = presented.elapsed();
+            if elapsed < BUSY && self.needs_redraw() {
+                let until_frame_due = BUSY
+                    .saturating_sub(elapsed)
+                    .max(std::time::Duration::from_millis(1));
+                interval = interval.min(until_frame_due);
+            }
+        }
+
+        interval
+    }
+
+    fn needs_redraw(&self) -> bool {
+        let Some(live) = self.window.state.as_ref() else {
+            return false;
+        };
+        if self
+            .window
+            .pending_input_redraw_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            return true;
+        }
+        // Something is mid-animation -- a hover fading in or out.
+        if self
+            .window.animate_until
+            .is_some_and(|until| until > std::time::Instant::now())
+        {
+            return true;
+        }
+        // One number across the panes on screen: any of them moving is
+        // a reason to redraw, and the backend answers it the cheapest
+        // way it can -- per-pane revisions in this process, the frame
+        // cache's own counter when the sessions are in a Core.
+        let placements = self.placements();
+        if placements.is_empty() && live.session_id == 0 {
+            return self.window.drawn_revision != Some(0);
+        }
+        let panes: Vec<usize> = if placements.is_empty() {
+            vec![live.session_id]
+        } else {
+            placements
+                .iter()
+                .map(|placement| placement.session_id)
+                .collect()
+        };
+        let revision = self.engine.render_generation(&panes);
+        if Some(revision) != self.window.drawn_revision {
+            return true;
+        }
+        // A fading flash needs frames of its own: nothing about the screen
+        // changes while it fades out. A blinking cursor needs exactly one
+        // frame when its phase flips, not a frame on every idle tick.
+        if self.window.bell_at.is_some()
+            || (self.cursor_style.blinking
+                && self.window.drawn_cursor_solid != Some(self.cursor_is_solid()))
+        {
+            return true;
+        }
+        // Blinking text likewise: one frame when a cadence the screen is
+        // using flips phase, and none at all when nothing on screen blinks.
+        if let Some(drawn) = self.window.drawn_blink {
+            let phase = self.blink_phase();
+            if (self.window.screen_blink.0 && drawn.slow_on != phase.slow_on)
+                || (self.window.screen_blink.1 && drawn.rapid_on != phase.rapid_on)
+            {
+                return true;
+            }
+        }
+        // A turning working spinner is animation with no screen change
+        // underneath: one frame per phase step, and none once nothing works.
+        if self.window.drawn_breath_step.is_some_and(|drawn| {
+            let elapsed = unterm_services::cockpit::status::breath_epoch()
+                .elapsed()
+                .as_millis() as u64;
+            crate::sidebar::spin_step(elapsed) != drawn
+        }) {
+            return true;
+        }
+        // A drag changes what is highlighted without changing the screen
+        // underneath it.
+        if self.window.drag.is_some() {
+            return true;
+        }
+        // A banner arrives from the MCP thread, which changes no screen; if
+        // only the screen could ask for a redraw, the question would never be
+        // drawn and the agent would wait out its timeout looking at nothing.
+        self.window.drawn_confirmation != unterm_mcp::handler::pending_confirmation_view().map(|v| v.id)
+            || self.window.drawn_suggestions
+                != crate::engine_backend::mcp_state::pending_suggestions_for_pane(self.focused_session() as u64)
+                    .len()
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        // The window procedure's notes about this handle go with it.
+        crate::win_chrome::forget(&self.window);
+    }
+}
+
+impl Live {
+    fn configure(&self, format: wgpu::TextureFormat) {
+        self.surface.configure(
+            self.renderer.device(),
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: self.width,
+                height: self.height,
+                present_mode: wgpu::PresentMode::AutoVsync,
+                alpha_mode: self.alpha_mode,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+            },
+        );
+        if let Some(composition) = self.composition.as_ref() {
+            composition.commit();
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        crate::startup_trace::mark("winit.resumed");
+        // A parked process has no window on purpose. Resuming into one here
+        // would put the terminal back on screen without anyone asking, which
+        // is the opposite of what "keep running in the background" means.
+        //
+        // Not the path back from "no windows, still in the Dock", though it
+        // was written believing it was: winit reports `resumed` once, at
+        // launch, and AppKit does not repeat it for an app it already
+        // considers running. Reopening lands in
+        // `applicationShouldHandleReopen:` instead, and `about_to_wait` is
+        // where that request is answered. D3 of the multi-window design
+        // keeps the process alive; the window it needs is made there.
+        if self.window.state.is_some() || self.window.tray.is_some() {
+            return;
+        }
+        match self.start(event_loop) {
+            Ok(live) => {
+                self.window.state = Some(live);
+                self.window.restore_extra_tabs_pending = true;
+                self.sync_frame();
+                self.finish_startup_session();
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+                self.draw();
+                if let Some(live) = self.window.state.as_ref() {
+                    crate::win_chrome::set_startup_cloak(&live.window, false);
+                }
+                crate::startup_trace::mark("window.state.ready");
+            }
+            Err(err) => {
+                crate::report_fatal(&format!("Unterm could not start: {err:#}"));
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        // Nothing here ends the loop directly any more: closing goes through
+        // `perform_close`, and `about_to_wait` is what acts on the flag it
+        // sets -- one exit path, whether the press was on our chrome or the
+        // system's.
+        _event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        // Which window this is about. winit says so per event; everything
+        // below reads `self.window`, so the named one has to be there first.
+        // A miss means the event outlived its window -- there is nothing to
+        // act on and nothing to report.
+        if !self.focus_window(window_id) {
+            return;
+        }
+        match event {
+            WindowEvent::Occluded(occluded) => {
+                self.window.occluded = occluded;
+                if !occluded {
+                    // Visible again: whatever changed while hidden gets one
+                    // one frame now rather than at the next input.
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::Focused(focused) => {
+                self.window.focused = focused;
+                if focused
+                    && self.capture_started_at.map_or(true, |started| {
+                        started.elapsed() > std::time::Duration::from_millis(1200)
+                    })
+                {
+                    self.set_all_windows_capture_cloak(false);
+                }
+                self.sync_frame();
+                // What `instance.windows` calls focused, and the window a
+                // call that names none is about. It is recorded here rather
+                // than in `focus_window` above, which looks like the same
+                // thing and is not: that one runs for every event and only
+                // says which window an event was about, so a background
+                // window asking to be redrawn would have claimed the focus.
+                if focused {
+                    crate::mcp_host::set_focused_window(self.window.id);
+                }
+                // Anything that turned on focus reporting is told. vim redraws
+                // its cursor on it and tmux its pane borders, so a terminal
+                // that stays silent leaves them showing the wrong thing.
+                self.report_focus(focused);
+                // Coming back is a reason to look again straight away rather
+                // than at the next resting tick.
+                if focused {
+                    self.window.quiet_since = None;
+                }
+                // A prompt that dims when unfocused has to be redrawn to show
+                // it, and nothing about the screen changed to ask for a frame.
+                self.window.drawn_revision = None;
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+            }
+
+            WindowEvent::DroppedFile(path) => {
+                // A file dropped on the terminal types its path, quoted when
+                // the shell would need it to be -- ready to be an argument.
+                let text = path.display().to_string();
+                let plain = text
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || "_-./:\\~".contains(ch));
+                let quoted = if plain { text } else { format!("\"{text}\"") };
+                let pane = self.focused_session();
+                let _ = self.engine.paste_input(pane, &quoted);
+                self.window.drawn_revision = None;
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+            }
+
+            WindowEvent::CloseRequested => {
+                let _slow = SlowGuard::new("close_requested");
+                // The system frame's close button, Cmd-W and Alt-F4 all land
+                // here, and they mean exactly what the title bar's own cross
+                // means. Routing them through the same function is what stops
+                // the two disagreeing about whether the shells survive; a
+                // running program earns one confirmation either way, because
+                // a stray click killing an agent mid-task is no smaller an
+                // accident on this path than on the other.
+                self.close_pressed();
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+            }
+
+            WindowEvent::Resized(size) => {
+                // `Resized(0, 0)` is the window saying it is not being
+                // drawn, not saying how wide it is being drawn. This used to
+                // clamp it to one pixel, and one pixel is a size: every
+                // fallback below floored at one cell, so the pane was told it
+                // was one column wide, which truncated every line *and the
+                // whole scrollback* to its first character. Restoring the
+                // window could not bring any of it back. A window with no
+                // size now keeps the last size it really had and tells no
+                // pane anything.
+                if !is_drawable_size(size.width, size.height) {
+                    return;
+                }
+                if let Some(live) = self.window.state.as_mut() {
+                    live.width = size.width;
+                    live.height = size.height;
+                    live.configure(live.renderer.format());
+                    live.window.request_redraw();
+                }
+                // Every pane has to learn its new grid, or a shell keeps
+                // wrapping at a width it is no longer drawn at.
+                self.resize_panes();
+                self.window.drawn_revision = None;
+            }
+
+            // The display's scale changed under the window: it moved to a
+            // monitor with a different DPI, a remote session reconnected at a
+            // new density, or an outside process resized it across a
+            // virtualisation boundary. Fonts, atlas and pane grids are all
+            // sized in physical pixels derived from this scale, so reopen
+            // them at the new one — leaving this unhandled drew the whole
+            // window at the old density, stretched.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let scale = scale_factor as f32;
+                if (scale - self.window.scale).abs() > f32::EPSILON {
+                    self.reopen_font(self.window.font_points, scale);
+                }
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+                self.window.drawn_revision = None;
+            }
+
+            WindowEvent::Ime(ime) => {
+                use winit::event::Ime;
+                // Same urgency as a plain keystroke: a committed composition
+                // is input on its way to an echo.
+                self.window.quiet_since = None;
+                crate::statsbar::note_user_input();
+                self.window.last_ime_event = Some(std::time::Instant::now());
+                let modal_owns_ime = self.window.quick_menu.is_some()
+                    || unterm_mcp::handler::pending_confirmation_view().is_some();
+                if modal_owns_ime {
+                    self.window.preedit = crate::ime::Preedit::default();
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                    self.window.drawn_revision = None;
+                    return;
+                }
+                match ime {
+                    Ime::Preedit(text, caret) => {
+                        self.window.preedit = crate::ime::Preedit {
+                            text,
+                            caret: caret.map(|(start, _end)| start),
+                        };
+                        self.place_ime_candidates();
+                        if let Some(live) = self.window.state.as_ref() {
+                            live.window.request_redraw();
+                        }
+                        self.window.drawn_revision = None;
+                    }
+                    Ime::Commit(text) => {
+                        self.window.preedit = crate::ime::Preedit::default();
+                        // A palette/search owns committed IME text while it is
+                        // open.  Only an unclaimed commit belongs to the PTY.
+                        if self.commit_ime_to_modal(&text) {
+                            self.window.drawn_revision = None;
+                            if let Some(live) = self.window.state.as_ref() {
+                                live.window.request_redraw();
+                            }
+                        } else if self.window.state.is_some() {
+                            self.window.quiet_since = None;
+                            crate::statsbar::note_user_input();
+                            let pane = self.focused_session();
+                            let _ = self.engine.scroll_viewport_to(pane, isize::MAX);
+                            if self.engine.write_input(pane, &text).is_ok() {
+                                crate::ghost::observe_text(pane as u64, &text);
+                            }
+                            self.window.pending_input_redraw_at =
+                                Some(std::time::Instant::now() + std::time::Duration::from_millis(4));
+                        }
+                    }
+                    Ime::Enabled => self.place_ime_candidates(),
+                    Ime::Disabled => {
+                        self.window.preedit = crate::ime::Preedit::default();
+                        self.window.drawn_revision = None;
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.window.shift_held = modifiers.state().shift_key();
+                self.window.ctrl_held = modifiers.state().control_key();
+                self.window.alt_held = modifiers.state().alt_key();
+                self.window.super_held = modifiers.state().super_key();
+                // The link hint appears and disappears with Ctrl, and nothing
+                // else about the screen changed to ask for a frame.
+                self.window.drawn_revision = None;
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.request_redraw();
+                }
+            }
+
+            WindowEvent::KeyboardInput { mut event, .. } => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                if self.window.state.is_none() {
+                    return;
+                }
+                // A keystroke is about to produce an echo, and the resting
+                // tick would keep the loop from looking for almost 100ms --
+                // which is exactly the pause-then-type lag people report as
+                // "typing feels slow". Drop back to the busy cadence now,
+                // before the shell has even seen the byte.
+                self.window.quiet_since = None;
+                crate::statsbar::note_user_input();
+                // An orphan composition is marked text whose input method
+                // has gone quiet: stranded by a source switch, it swallows
+                // every editing key from then on. A LIVE composition also
+                // reaches us here -- winit reports KeyboardInput alongside
+                // Ime events -- so silence, not arrival, is the test: only
+                // a preedit nobody has updated for two seconds is a ghost.
+                if !self.window.preedit.is_empty()
+                    && self
+                        .window.last_ime_event
+                        .map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(2))
+                {
+                    self.clear_orphan_preedit();
+                }
+                // A composition that is still alive owns its keystrokes
+                // outright. winit hands over the same presses the input
+                // method is composing with, and forwarding them typed the
+                // pinyin under the hanzi it was about to become: the shell
+                // received "fangjianli" AND the 房间里 the user meant, and
+                // zle's column accounting never recovered. The orphan sweep
+                // above has already run, so a dead preedit cannot wedge
+                // this gate shut.
+                if !self.window.preedit.is_empty() {
+                    return;
+                }
+
+                if matches!(
+                    &event.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Process)
+                ) {
+                    return;
+                }
+
+                if let winit::keyboard::Key::Unidentified(winit::keyboard::NativeKey::Windows(vkey)) =
+                    event.logical_key
+                {
+                    if let Some(recovered) =
+                        recover_unidentified_windows_key(vkey, self.window.shift_held)
+                    {
+                        if !self.window.ctrl_held && !self.window.alt_held {
+                            event.text = Some(recovered.clone());
+                        }
+                        event.logical_key = winit::keyboard::Key::Character(recovered);
+                    }
+                }
+
+                use winit::keyboard::Key;
+
+                if std::env::var_os("UNTERM_TRACE_KEYS").is_some() {
+                    log::info!(
+                        "key: logical={:?} physical={:?} text={:?} ctrl={} shift={} alt={}",
+                        event.logical_key,
+                        event.physical_key,
+                        event.text,
+                        self.window.ctrl_held,
+                        self.window.shift_held,
+                        self.window.alt_held,
+                    );
+                    log::info!(
+                        "  action_for -> {:?}",
+                        crate::keys::action_for(
+                            &event.logical_key,
+                            self.window.ctrl_held,
+                            self.window.shift_held,
+                            self.window.alt_held,
+                        )
+                    );
+                }
+
+                let pending_confirmation = unterm_mcp::handler::pending_confirmation_view();
+
+                // While an agent write waits on its visible banner, the
+                // banner owns the keys -- even over an open quick menu, whose
+                // Enter would otherwise double as silent consent. Otherwise an
+                // open quick menu is modal and must swallow every key; a stale
+                // pending-confirmation count must not leak letters into the
+                // shell under Claude or another mouse-reporting TUI.
+                if self.window.quick_menu.is_some()
+                    && quick_menu_owns_keyboard(pending_confirmation.is_some())
+                {
+                    match event.logical_key {
+                        Key::Named(winit::keyboard::NamedKey::Escape) => {
+                            self.window.quick_menu = None;
+                        }
+                        Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            if let Some(menu) = self.window.quick_menu.as_mut() {
+                                let next = menu.hover.map(|row| row + 1).unwrap_or(0)
+                                    % menu.entries.len().max(1);
+                                menu.hover = Some(next);
+                                menu.reveal_hover();
+                            }
+                        }
+                        Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            if let Some(menu) = self.window.quick_menu.as_mut() {
+                                let len = menu.entries.len().max(1);
+                                menu.hover =
+                                    Some(menu.hover.unwrap_or(0).checked_sub(1).unwrap_or(len - 1));
+                                menu.reveal_hover();
+                            }
+                        }
+                        Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            let command = self.window.quick_menu.take().and_then(|menu| {
+                                menu.entries
+                                    .get(menu.hover.unwrap_or(0))
+                                    .map(|entry| entry.command.clone())
+                            });
+                            if let Some(command) = command {
+                                self.run_palette_command(command, "");
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.window.drawn_revision = None;
+                    // Every other key is the menu's to ignore: nothing may
+                    // fall through to the shell under an open menu.
+                    return;
+                }
+                if pending_confirmation.is_none() && self.handle_suggestion_key(&event) {
+                    return;
+                }
+                if self.window.quick_select.is_some() && self.handle_quick_select_key(&event) {
+                    return;
+                }
+                if self.window.copy_mode.is_some() && self.handle_copy_mode_key(&event) {
+                    return;
+                }
+                if pending_confirmation.is_none()
+                    && self.window.inbox_open
+                    && self.handle_inbox_key(&event)
+                {
+                    return;
+                }
+
+                // The palette takes the keyboard while it is open, before
+                // anything else looks at the key.
+                if self.window.pocket_qr.is_some() && self.handle_pocket_qr_key(&event) {
+                    return;
+                }
+                if self.window.palette.is_some() && self.handle_palette_key(&event) {
+                    return;
+                }
+
+                // And so does the pane selector: every letter on screen is one
+                // of its labels, and a letter that fell through would run in
+                // whichever pane happens to be in front.
+                if self.window.pane_select.is_some() && self.handle_pane_select_key(&event) {
+                    return;
+                }
+
+                // A search takes the keyboard while it is open: the letters
+                // typed are the pattern, not input for the shell.
+                if self.window.search.is_some() && self.handle_search_key(&event) {
+                    return;
+                }
+                if self.window.composer.is_some() && self.handle_composer_key(&event) {
+                    return;
+                }
+
+                let Some(live) = self.window.state.as_ref() else {
+                    return;
+                };
+
+                // A parked agent write comes first: while the banner is up
+                // these keys answer it rather than reaching the shell, and
+                // everything else is ignored so a stray keystroke cannot be
+                // mistaken for consent.
+                if let Some(pending) = pending_confirmation {
+                    let decision = match &event.logical_key {
+                        Key::Named(winit::keyboard::NamedKey::Escape) => {
+                            Some(unterm_mcp::handler::ConfirmationDecision::Block)
+                        }
+                        // Enter allows, as 0.57.4's banner had it; safe to
+                        // take because the banner swallows every key below.
+                        Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            Some(unterm_mcp::handler::ConfirmationDecision::Allow)
+                        }
+                        Key::Character(text) => crate::confirm::decision_for(text),
+                        _ => None,
+                    };
+                    if let Some(decision) = decision {
+                        unterm_mcp::handler::resolve_confirmation(pending.id, decision);
+                        if let Some(live) = self.window.state.as_ref() {
+                            live.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                let pane = self.focused_session();
+                let startup_pending = live.session_id == 0;
+                if crate::ghost::is_accept_key(
+                    &event.logical_key,
+                    self.window.ctrl_held,
+                    self.window.shift_held,
+                    self.window.alt_held,
+                ) && unterm_services::ghost_text::has_pending_ghost(pane as u64)
+                    && crate::ghost::pane_takes_predictions(pane as u64)
+                {
+                    if let Some(continuation) = unterm_services::ghost_text::accept(pane as u64) {
+                        if let Err(err) = self.engine.write_input(pane, &continuation) {
+                            log::warn!("could not accept ghost text: {err:#}");
+                        }
+                        self.window.drawn_revision = None;
+                        if let Some(live) = self.window.state.as_ref() {
+                            live.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                // What the keys do lives in `keys`, so an agent asking the
+                // MCP surface gets the same answer this acts on.
+                if let Some(action) = crate::keys::action_for(
+                    &event.logical_key,
+                    self.window.ctrl_held,
+                    self.window.shift_held,
+                    self.window.alt_held,
+                ) {
+                    if startup_pending {
+                        return;
+                    }
+                    self.run_key_action(action, live.session_id);
+                    return;
+                }
+
+                let held = crate::mouse::Held {
+                    shift: self.window.shift_held,
+                    ctrl: self.window.ctrl_held,
+                    alt: self.window.alt_held,
+                };
+                let engine = &self.engine;
+                let modes = || {
+                    engine
+                        .pane_modes(pane)
+                        .map(|modes| key_encoding::KeyboardModes {
+                            kitty: modes.kitty_keyboard,
+                            modify_other_keys: modes.modify_other_keys,
+                        })
+                        .unwrap_or_default()
+                };
+                if let Some(text) = encode_with(&event.logical_key, held, modes) {
+                    if startup_pending {
+                        if self.window.startup_input.len() + text.len() <= 4096 {
+                            self.window.startup_input.push_str(&text);
+                        }
+                        return;
+                    }
+                    let _ = self.engine.scroll_viewport_to(pane, isize::MAX);
+                    if self.engine.write_input(pane, &text).is_ok() {
+                        let _ = crate::ghost::observe_key(
+                            pane as u64,
+                            &event.logical_key,
+                            self.window.ctrl_held,
+                            self.window.alt_held,
+                        );
+                        self.window.pending_input_redraw_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(4));
+                        if text == unterm_services::interrupt::INTERRUPT_BYTE {
+                            self.interrupt(pane);
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                self.window.pointer = (-1.0, -1.0);
+                self.refresh_pointer_target();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.window.pointer = (position.x as f32, position.y as f32);
+                self.apply_cursor();
+                self.refresh_pointer_target();
+                if self.window.dragging_scrollbar {
+                    self.scroll_to_pointer();
+                    return;
+                }
+                if let Some(menu) = self.window.quick_menu.as_mut() {
+                    // The row under the pointer lights up -- but only a
+                    // change of row is worth a frame. Repainting on every
+                    // motion event turned a busy pane plus an open menu
+                    // into a redraw storm.
+                    let over = {
+                        let (x, y) = self.window.pointer;
+                        menu.row_at(x, y)
+                    };
+                    if menu.hover != over {
+                        menu.hover = over;
+                        self.window.drawn_revision = None;
+                        if let Some(live) = self.window.state.as_ref() {
+                            live.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if let Some(TabDrag { tab_id, origin, engaged }) = self.window.dragging_tab {
+                    // A held row is not a carried row until the pointer has
+                    // truly left where it pressed: hands drift a pixel or
+                    // two in every click, and a strip that reorders on that
+                    // drift scrambles itself under its owner's clicks.
+                    if !engaged {
+                        let dx = self.window.pointer.0 - origin.0;
+                        let dy = self.window.pointer.1 - origin.1;
+                        let slack = self
+                            .sidebar_dock()
+                            .map(|(_, _, _, _, row_height)| row_height * 0.6)
+                            .unwrap_or(12.0);
+                        if (dx * dx + dy * dy).sqrt() < slack {
+                            return;
+                        }
+                        if let Some(drag) = self.window.dragging_tab.as_mut() {
+                            drag.engaged = true;
+                        }
+                        #[cfg(target_os = "macos")]
+                        crate::macos_open::trace("tab drag engaged");
+                    }
+                    if let Some(at) = self.sidebar_row_at(self.window.pointer.0, self.window.pointer.1) {
+                        let rows = self.sidebar_rows();
+                        // Which tab this row is: the row says so. Counting the
+                        // tab rows at or above it instead read the strip as if
+                        // it were the tab order, which it is not -- a folded
+                        // project hides rows and a project gathers its own, so
+                        // the count fell short of the position by however many
+                        // tabs were out of sight or filed further up.
+                        let Some(target) = crate::sidebar::tab_at_or_after(&rows, at) else {
+                            return;
+                        };
+                        let ids = self.window.tabs.tab_ids();
+                        if let Some(current) = ids.iter().position(|id| *id == tab_id) {
+                            let delta = target as isize - current as isize;
+                            if delta != 0 && self.window.tabs.move_tab_relative(tab_id, delta) {
+                                self.window.drawn_revision = None;
+                                if let Some(live) = self.window.state.as_ref() {
+                                    live.window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if self.window.dragging_sidebar_width {
+                    // The strip follows the pointer; `sidebar::width` clamps
+                    // it between readable and greedy.
+                    // Let go well short of the narrowest it can be, and it
+                    // folds to its rail; drawn back out, it opens again.
+                    let pt = self.chrome_pt();
+                    let points = (self.window.pointer.0 / pt.max(0.001)).max(1.0);
+                    let folded = crate::sidebar::snaps_to_rail(points);
+                    // A choice only when it differs from what the window would
+                    // do by itself: a grip nudged on a narrow window's rail is
+                    // not the user folding every window from now on.
+                    let width = self.window.state.as_ref().map(|live| live.width).unwrap_or(800) as f32;
+                    let automatic = crate::sidebar::rail_by_default(width / self.window.scale.max(0.1));
+                    self.window.sidebar_rail = (folded != automatic).then_some(folded);
+                    if !folded {
+                        self.window.sidebar_points = Some(points);
+                    }
+                    self.resize_panes();
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                    return;
+                }
+                // An open menu follows the pointer before anything else looks
+                // at it: the row under the mouse is the row Enter runs, and
+                // nothing behind a menu should react to being pointed at.
+                if self.hover_palette() {
+                    return;
+                }
+                // A swallowed Ctrl+Left gesture keeps its motion too: the
+                // program never saw the press, so a drag report -- or a
+                // selection -- growing out of it would come from nowhere.
+                if self.window.swallow_left_after_secondary {
+                    return;
+                }
+                if self.report_mouse(
+                    unterm_engine::next_core::mouse_encoding::MouseEventKind::Motion,
+                    self.window.held_mouse_button,
+                ) {
+                    return;
+                }
+                if self.window.drag.is_some() {
+                    // Dragging past the edge scrolls the view along, so a
+                    // selection is not capped at one screen of text.
+                    if let Some(live) = self.window.state.as_ref() {
+                        let session_id = live.session_id;
+                        let bottom = live.height as f32 - self.status_bar_height();
+                        if self.window.pointer.1 < self.terminal_top() {
+                            let _ = self.engine.scroll_viewport_by(session_id, 1);
+                        } else if self.window.pointer.1 > bottom {
+                            let _ = self.engine.scroll_viewport_by(session_id, -1);
+                        }
+                    }
+                    let point = self.cell_under_pointer();
+                    self.extend_drag_to(point);
+                    self.update_selection();
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                use unterm_engine::next_core::mouse_encoding::MouseEventKind;
+                use winit::event::MouseButton;
+
+                // A Ctrl+Left press consumed as a secondary click swallows
+                // the rest of that physical gesture: its release would
+                // otherwise fall through to the left-button paths --
+                // complete a selection, open a link -- and make a single
+                // click both paste and act.
+                if self.window.swallow_left_after_secondary {
+                    match (state, button) {
+                        (ElementState::Released, MouseButton::Left) => {
+                            self.window.swallow_left_after_secondary = false;
+                            // The press was consumed too, so nothing is held.
+                            self.window.held_mouse_button = None;
+                            return;
+                        }
+                        (ElementState::Pressed, _) => {
+                            self.window.swallow_left_after_secondary = false;
+                        }
+                        _ => {}
+                    }
+                }
+
+                let held = crate::mouse::Held {
+                    shift: self.window.shift_held,
+                    ctrl: self.window.ctrl_held,
+                    alt: self.window.alt_held,
+                };
+                // The platform's other right button: everywhere a right
+                // press acts, a macOS Ctrl+Left press acts the same.
+                let secondary = button == MouseButton::Right
+                    || (button == MouseButton::Left && crate::mouse::ctrl_left_is_secondary(held));
+
+                // The program gets the click if it asked for one -- every
+                // button, not only the left, since that is what a program
+                // with a context menu is waiting for.
+                let engine_button = match button {
+                    MouseButton::Left => {
+                        Some(unterm_engine::next_core::mouse_encoding::MouseButton::Left)
+                    }
+                    MouseButton::Middle => {
+                        Some(unterm_engine::next_core::mouse_encoding::MouseButton::Middle)
+                    }
+                    MouseButton::Right => {
+                        Some(unterm_engine::next_core::mouse_encoding::MouseButton::Right)
+                    }
+                    _ => None,
+                };
+                self.window.held_mouse_button = match state {
+                    ElementState::Pressed => engine_button,
+                    ElementState::Released => None,
+                };
+                // Ended here, before any branch can consume the event: a
+                // release that a mouse-reporting program swallowed used to
+                // leave the drag armed, and every later cursor move kept
+                // reordering the strip with no button held at all.
+                if state == ElementState::Released && self.window.dragging_tab.is_some() {
+                    self.window.dragging_tab = None;
+                    return;
+                }
+                let kind = match state {
+                    ElementState::Pressed => MouseEventKind::Press,
+                    ElementState::Released => MouseEventKind::Release,
+                };
+                // The dropdown is modal for the whole mouse gesture. The
+                // press may choose a row; the matching release must not leak
+                // into the pane underneath as terminal mouse input.
+                if self.window.quick_menu.is_some() {
+                    match quick_menu_mouse_action(state, button, secondary) {
+                        QuickMenuMouseAction::ActivateHovered => {
+                            self.click_quick_menu();
+                        }
+                        QuickMenuMouseAction::Close => {
+                            self.window.quick_menu = None;
+                            self.window.drawn_revision = None;
+                            if secondary && button == MouseButton::Left {
+                                self.window.swallow_left_after_secondary = true;
+                            }
+                        }
+                        QuickMenuMouseAction::Swallow => {}
+                    }
+                    return;
+                }
+                // An open menu takes the press before the program does: a
+                // click aimed at a row must not also land in the pane the menu
+                // is covering.
+                if self.window.palette.is_some()
+                    && state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_palette()
+                {
+                    return;
+                }
+                // And so does the tab strip: a press on a row is a press on a
+                // row, not a click into the pane beside it.
+                #[cfg(target_os = "macos")]
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    // A "clicked the tab and nothing happened" report needs
+                    // this press's whole story: where it was, which row that
+                    // resolved to, and which branch ate it. Strip presses
+                    // only — a terminal full of clicks has nothing to say
+                    // here and would drown the log saying it.
+                    let row = self.sidebar_row_at(self.window.pointer.0, self.window.pointer.1);
+                    if row.is_some() {
+                        crate::macos_open::trace(&format!(
+                            "press at ({:.0},{:.0}) secondary={} ctrl={} row={:?}",
+                            self.window.pointer.0, self.window.pointer.1, secondary, self.window.ctrl_held, row,
+                        ));
+                    }
+                }
+                if state == ElementState::Released && self.window.dragging_sidebar_width {
+                    self.window.dragging_sidebar_width = false;
+                    let prefs = crate::sidebar::Prefs::new(
+                        self.window.sidebar_points,
+                        self.window.sidebar_rail,
+                    );
+                    if prefs != self.window.sidebar_saved {
+                        prefs.save();
+                        self.window.sidebar_saved = prefs;
+                    }
+                    self.apply_cursor();
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.sidebar_grip_at(self.window.pointer.0, self.window.pointer.1)
+                {
+                    self.window.dragging_sidebar_width = true;
+                    self.apply_cursor();
+                    return;
+                }
+                if self.window.sidebar_open
+                    && state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_sidebar()
+                {
+                    return;
+                }
+                if self.window.tree.is_some()
+                    && state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_tree()
+                {
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_search_bar()
+                {
+                    return;
+                }
+                // The Git dock is read-only, as in 0.57.4. Its reserved
+                // gutter swallows presses so they cannot reach the pane
+                // beside it as terminal mouse input or a selection -- but
+                // only presses: a release belongs to whatever drag is in
+                // flight, and eating it here left selections and scrollbar
+                // drags wedged to the pointer.
+                if state == ElementState::Pressed
+                    && self.window.drag.is_none()
+                    && !self.window.dragging_scrollbar
+                    && self.click_git_panel()
+                {
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_confirmation_banner()
+                {
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.click_status_bar()
+                {
+                    return;
+                }
+                // A secondary press on the chrome answers with its menus
+                // before the program can see it: a right press -- or its
+                // macOS Ctrl+Left form -- aimed at a tab is asking for the
+                // tab's menu, not the pane behind it.
+                if secondary && state == ElementState::Pressed && self.chrome_right_click() {
+                    if button == MouseButton::Left {
+                        self.window.swallow_left_after_secondary = true;
+                    }
+                    return;
+                }
+                // Chrome belongs to the terminal, not the program inside it.
+                // TUIs such as Claude enable mouse reporting; if top-bar
+                // presses wait until after report_mouse, the chevron click is
+                // delivered to the TUI and the quick menu never opens.
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !secondary
+                    && self.window.pointer.1 < self.top_bar_height()
+                    && self.click_top_bar()
+                {
+                    return;
+                }
+                // The copy/paste gesture, ahead of mouse reporting when a
+                // selection proves the user is mid-gesture: in a reporting
+                // pane it can only have been made with Shift held, and its
+                // natural completion is the secondary click's copy. Without
+                // one the click still belongs to the program.
+                let reporting = !held.shift
+                    && self.window.mouse_modes.tracking
+                        != unterm_engine::next_core::mouse_encoding::MouseTracking::None;
+                if state == ElementState::Released {
+                    // Whichever button came up, the gesture that was in
+                    // flight is over.
+                    self.window.secondary_gesture.released();
+                }
+                if secondary
+                    && state == ElementState::Pressed
+                    && crate::mouse::secondary_click_acts(reporting, self.window.selected.is_some())
+                {
+                    // macOS delivers one Control-click as both a right press
+                    // and a ctrl+left press. Acting twice does not merely
+                    // repeat: the first copies the selection and lets go of
+                    // it, so the second sees none and pastes — into whatever
+                    // is running in the pane, which is usually an agent's
+                    // prompt. Once per physical click.
+                    if !self.window.secondary_gesture.take() {
+                        return;
+                    }
+                    if button == MouseButton::Left {
+                        self.window.swallow_left_after_secondary = true;
+                    }
+                    // A direct gesture rather than a menu, and one thing
+                    // rather than two: it pastes. Selecting already put the
+                    // text on the clipboard when the button came up, so the
+                    // press has nothing left to copy -- and a press that
+                    // copied instead was a paste that did not happen.
+                    // Only on press, so the release does not undo it.
+                    if crate::mouse::secondary_press_pastes(self.window.selected.is_some()) {
+                        self.paste_clipboard();
+                    }
+                    return;
+                }
+                if self.report_mouse(kind, engine_button) {
+                    return;
+                }
+
+                if button == MouseButton::Right {
+                    // Acted on above, or forwarded: the release must not act
+                    // again, and a press the program declined still must not
+                    // start a left-button drag.
+                    return;
+                }
+                if button == MouseButton::Middle {
+                    // The middle button pastes, as terminals have always had
+                    // it -- from the one clipboard this platform has.
+                    if state == ElementState::Pressed {
+                        self.paste_clipboard();
+                    }
+                    return;
+                }
+                if button != MouseButton::Left {
+                    return;
+                }
+                // The edges first: a borderless window has no system resize
+                // handles, so a press there has to start one.
+                if state == ElementState::Pressed {
+                    if let Some(direction) = self.resize_edge_at_pointer() {
+                        if let Some(live) = self.window.state.as_ref() {
+                            let _ = live.window.drag_resize_window(direction);
+                            return;
+                        }
+                    }
+                }
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(session_id) =
+                        self.pane_close_button_at(self.window.pointer.0, self.window.pointer.1)
+                    {
+                        self.close_pane(session_id);
+                        self.window.drawn_revision = None;
+                        return;
+                    }
+                    if let Some(session_id) =
+                        self.pane_error_pill_at(self.window.pointer.0, self.window.pointer.1)
+                    {
+                        self.focus_session(session_id);
+                        self.open_failure_diagnosis();
+                        self.window.drawn_revision = None;
+                        return;
+                    }
+                }
+                if self.window.sidebar_open && state == ElementState::Pressed {
+                    if let Some((left, _top, width, _height, _row)) = self.sidebar_dock() {
+                        let pt = self.chrome_pt();
+                        let edge = left + width;
+                        if (self.window.pointer.0 - edge).abs()
+                            <= crate::ui_tokens::LEFT_TAB_BAR_GRIP * pt / 2.0
+                        {
+                            self.window.dragging_sidebar_width = true;
+                            return;
+                        }
+                    }
+                }
+                if state == ElementState::Released && self.window.dragging_sidebar_width {
+                    self.window.dragging_sidebar_width = false;
+                    // Remembered: a width dragged by hand that came back at
+                    // the default next launch was a width set every launch.
+                    let prefs = crate::sidebar::Prefs::new(
+                        self.window.sidebar_points,
+                        self.window.sidebar_rail,
+                    );
+                    if prefs != self.window.sidebar_saved {
+                        prefs.save();
+                        self.window.sidebar_saved = prefs;
+                    }
+                    return;
+                }
+                if state == ElementState::Pressed && self.pointer_on_scrollbar() {
+                    self.window.dragging_scrollbar = true;
+                    self.scroll_to_pointer();
+                    return;
+                }
+                if state == ElementState::Released && self.window.dragging_scrollbar {
+                    self.window.dragging_scrollbar = false;
+                    return;
+                }
+                if state == ElementState::Pressed
+                    && crate::links::opens_on_click(
+                        self.window.ctrl_held || self.window.super_held,
+                    )
+                {
+                    if let Some(link) = self.link_under_pointer() {
+                        self.open_terminal_link(&link);
+                        return;
+                    }
+                }
+                // A press in a pane that is not in front brings it in
+                // front, and does nothing else: focusing should never also
+                // select or paste, which is why the click stops here.
+                if state == ElementState::Pressed {
+                    if let Some(pane) = self.pane_under_pointer() {
+                        if pane != self.focused_session() {
+                            // Keep the registry, engine and Live session in
+                            // lockstep.  Updating only the registry left input
+                            // and the solid cursor in the previous pane.
+                            self.focus_session(pane);
+                            return;
+                        }
+                    }
+                }
+                match state {
+                    ElementState::Pressed => {
+                        use unterm_engine::next_core::selection::SelectionShape;
+                        let cell = self.cell_under_pointer();
+                        // Shift extends the previous selection from its
+                        // original anchor; Alt drags out a block, as before.
+                        if self.window.shift_held {
+                            if let Some(anchor) = self.window.select_anchor {
+                                let mut drag =
+                                    crate::select::Drag::start(anchor, SelectionShape::Linear);
+                                drag.extend(cell);
+                                self.window.drag = Some(drag);
+                                self.update_selection();
+                                self.window.drawn_revision = None;
+                                return;
+                            }
+                        }
+                        let click = match self.window.terminal_click.take() {
+                            Some(previous) => previous.again(0, self.window.pointer.0, self.window.pointer.1),
+                            None => {
+                                crate::sidebar::RowClick::first(0, self.window.pointer.0, self.window.pointer.1)
+                            }
+                        };
+                        let streak = click.streak();
+                        self.window.terminal_click = Some(click);
+                        let shape = if self.window.alt_held {
+                            SelectionShape::Block
+                        } else {
+                            SelectionShape::Linear
+                        };
+                        self.window.select_anchor = Some(cell);
+                        self.window.select_granularity = match streak {
+                            2 => SelectGranularity::Word,
+                            n if n >= 3 => SelectGranularity::Line,
+                            _ => SelectGranularity::Cell,
+                        };
+                        match streak {
+                            2 => self.select_word_at(cell),
+                            n if n >= 3 => self.select_line_at(cell),
+                            _ => {
+                                self.window.drag = Some(crate::select::Drag::start(cell, shape));
+                                self.window.selected = None;
+                            }
+                        }
+                        self.window.drawn_revision = None;
+                    }
+                    ElementState::Released => {
+                        // A press that never moved is a click, and a click on
+                        // a link opens it -- the way it worked before Ctrl
+                        // became a requirement.
+                        let was_click = self
+                            .window.drag
+                            .map(|drag| drag.selection().is_none())
+                            .unwrap_or(false);
+                        self.update_selection();
+                        self.window.drag = None;
+                        if self.window.selected.is_some() {
+                            // Selecting is copying, exactly as it was before:
+                            // release the button and the text is already on
+                            // the clipboard.
+                            self.copy_selection();
+                        } else if was_click && !self.window.shift_held && !self.window.ctrl_held {
+                            if let Some(link) = self.link_under_pointer() {
+                                self.open_terminal_link(&link);
+                            }
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                use winit::event::MouseScrollDelta;
+                let cell_height = self.window.font.metrics().height;
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => crate::scroll::lines_for_wheel(
+                        crate::scroll::WheelDelta::Lines(y),
+                        cell_height,
+                    ),
+                    MouseScrollDelta::PixelDelta(position) => crate::scroll::lines_for_wheel(
+                        crate::scroll::WheelDelta::Pixels(position.y as f32),
+                        cell_height,
+                    ),
+                };
+                if lines == 0 {
+                    return;
+                }
+                if let Some(menu) = self.window.quick_menu.as_mut() {
+                    menu.scroll(-lines);
+                    self.window.drawn_revision = None;
+                    return;
+                }
+                if let Some(palette) = self.window.palette.as_mut() {
+                    palette.scroll(-lines, crate::palette::MAX_ROWS);
+                    self.window.drawn_revision = None;
+                    return;
+                }
+                // The wheel belongs to whatever is under the pointer. A tree
+                // that scrolls the pane beside it instead is a tree you cannot
+                // reach the bottom of.
+                if self.tree_row_at(self.window.pointer.0, self.window.pointer.1).is_some() {
+                    let metrics = self.window.font.metrics();
+                    let visible = (self.terminal_height() / metrics.height.max(1.0)) as usize;
+                    if let Some(tree) = self.window.tree.as_mut() {
+                        tree.scroll_by(-lines, visible.max(1));
+                    }
+                    self.window.drawn_revision = None;
+                    return;
+                }
+                // The wheel over the top bar walks the tabs, the way the old
+                // bar always answered it.
+                if self.window.pointer.1 < self.top_bar_height() {
+                    self.cycle_tab(if lines > 0 { -1 } else { 1 });
+                    self.window.drawn_revision = None;
+                    if let Some(live) = self.window.state.as_ref() {
+                        live.window.request_redraw();
+                    }
+                    return;
+                }
+                // The tab strip scrolls under its own wheel, like the tree: a
+                // strip that scrolls the pane beside it is a strip you cannot
+                // reach the bottom of.
+                if self.window.sidebar_open && self.window.tree.is_none() {
+                    if let Some((left, top, width, height, _row_height)) = self.sidebar_dock() {
+                        let inside = self.window.pointer.0 >= left
+                            && self.window.pointer.0 < left + width
+                            && self.window.pointer.1 >= top
+                            && self.window.pointer.1 < top + height;
+                        if inside {
+                            // Bounded on the way in. Left unbounded the
+                            // number climbed past the end while the painter
+                            // clamped what it drew, so every notch spent
+                            // down there had to be spent again before the
+                            // strip would come back up.
+                            let rows = self.sidebar_rows().len();
+                            let visible = self.sidebar_visible_rows().unwrap_or(1);
+                            self.window.sidebar_scroll = crate::sidebar::scroll_by(
+                                self.window.sidebar_scroll,
+                                -(lines as isize),
+                                rows,
+                                visible,
+                            );
+                            self.window.drawn_revision = None;
+                            if let Some(live) = self.window.state.as_ref() {
+                                live.window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+                // A program that asked for the mouse gets the wheel too --
+                // that is how less and htop scroll themselves. One report per
+                // notch, because that is what a wheel is.
+                if let Some(button) = crate::mouse::wheel_button(lines as f32) {
+                    let notches = lines.unsigned_abs().min(16);
+                    let mut reported = false;
+                    for _ in 0..notches {
+                        reported = self.report_mouse(
+                            unterm_engine::next_core::mouse_encoding::MouseEventKind::Press,
+                            Some(button),
+                        );
+                        if !reported {
+                            break;
+                        }
+                    }
+                    if reported {
+                        return;
+                    }
+                }
+                if let Some(live) = self.window.state.as_ref() {
+                    // The wheel belongs to the pane under the pointer, not
+                    // whichever pane happens to hold the keyboard.
+                    let session_id = self.pane_under_pointer().unwrap_or(live.session_id);
+                    // On the alternate screen there is nothing to scroll back
+                    // into: less, man and vim without mouse reporting expect
+                    // the wheel as arrow keys, three per notch, exactly as the
+                    // previous front end sent them.
+                    let modes = self.engine.pane_modes(session_id).unwrap_or_default();
+                    if modes.alt_screen_active {
+                        let arrow = if lines > 0 {
+                            if modes.application_cursor_keys {
+                                "\x1bOA"
+                            } else {
+                                "\x1b[A"
+                            }
+                        } else if modes.application_cursor_keys {
+                            "\x1bOB"
+                        } else {
+                            "\x1b[B"
+                        };
+                        let presses = arrow.repeat((lines.unsigned_abs().min(16)) * 3);
+                        let _ = self.engine.write_input(session_id, &presses);
+                        return;
+                    }
+                    // Positive is toward older output, and the wheel rolls
+                    // away from you to go back in time.
+                    let _ = self.engine.scroll_viewport_by(session_id, -lines);
+                }
+            }
+
+            WindowEvent::RedrawRequested => {
+                self.draw();
+            }
+
+            _ => {}
+        }
+    }
+
+    /// The event loop is ending -- the other way out.
+    ///
+    /// On macOS a Cmd+Q goes through `applicationWillTerminate:`, which winit
+    /// reports here and which never reaches the window teardown that ends the
+    /// process itself. Stopping the Core has to hang off both, or quitting
+    /// the ordinary way on a Mac leaves one running.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        crate::engine_backend::stop_core_if_ours();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Cheap, and the only place that sees every way a tab or a session
+        // can appear or go: `instance.windows` reports this, and
+        // `session.focus` uses it to find the window a session is in. Parked
+        // windows are pushed too -- a window keeps running its tabs while
+        // another one is in front, so what it happened to be showing when it
+        // was parked would be wrong the first time anything changed behind
+        // it, and `session.focus` would raise the wrong window.
+        Self::note_window_view(&self.window);
+        for parked in &self.parked {
+            Self::note_window_view(&parked.state);
+        }
+        // Asked for from outside -- an MCP call, a keystroke, or a second
+        // launch that handed over rather than becoming another process. Each
+        // request carries the id its window was promised, and two callers
+        // asking at once want two windows rather than one.
+        //
+        // Only with a window already up. `open_window` parks the one in front
+        // and puts the new one in its place, so with none to park it returns
+        // without a word -- and the request, already off the queue, is gone
+        // with it. That is the same defect the path queue below carries its
+        // own note about: "New Unterm Window Here" on a parked Unterm read
+        // the ask and dropped it. Left queued, it survives until the wake
+        // readers further down have built a window, and opens then -- so the
+        // ask below is for that window, not for this one.
+        if self.window.state.is_some() {
+            for request in unterm_engine::take_window_requests() {
+                crate::startup_trace::mark("window.second.start");
+                self.open_window(event_loop, request);
+                crate::startup_trace::mark("window.second.ready");
+            }
+        } else if unterm_engine::window_requests_pending() {
+            crate::tray::request_wake();
+        }
+        // `unterm-cli quit` asked, from outside. Whatever state the window
+        // is in -- up, parked in the tray, mid-prompt -- it leaves the way a
+        // confirmed close does, without asking anyone: the question was
+        // answered at the prompt the command was typed at.
+        if !self.window.closing && crate::engine_backend::take_external_quit() {
+            log::info!("quit requested from outside; leaving");
+            self.window.tray = None;
+            self.window.close_confirmed = true;
+            // In-process sessions (the administrator window) end with the
+            // process; the Core's are the Core's, and `perform_close` asks it
+            // to stop on the way out.
+            let outcome = match &self.engine {
+                crate::engine_backend::AppEngine::Local(_) => CloseOutcome::EndSessions,
+                crate::engine_backend::AppEngine::Core { .. } => CloseOutcome::KeepSessions,
+            };
+            self.perform_close(outcome, Leaving::Process);
+        }
+        #[cfg(target_os = "macos")]
+        if !self.window.closing && crate::macos_open::take_quit_request() {
+            self.quit_pressed();
+        }
+        if self.window.closing {
+            // The close button was pressed. There is no native title bar to
+            // do this for us any more.
+            event_loop.exit();
+            return;
+        }
+        // Before the parked branch below returns: a loop that stops beating
+        // is a loop the stall watchdog reports as frozen, and "parked" is the
+        // one quiet state that is not a freeze.
+        crate::stallwatch::beat();
+        // Parked in the tray: no window, no frame, nothing to draw. The loop
+        // stays alive only to answer the indicator and keep its counts
+        // honest, so it wakes a few times a minute rather than at frame rate.
+        if self.window.tray.is_some() {
+            match crate::tray::poll() {
+                Some(crate::tray::Action::Open) => {
+                    self.leave_background(event_loop);
+                    return;
+                }
+                Some(crate::tray::Action::QuitAll) => {
+                    // The same irreversible action the close prompt's last
+                    // row performs, reached from the only surface left. The
+                    // Core is stopped by `perform_close` on the way out.
+                    crate::engine_backend::set_quit_intent(
+                        crate::engine_backend::QuitIntent::Everything,
+                    );
+                    self.window.tray = None;
+                    self.window.close_confirmed = true;
+                    // It stopped the Core and then kept the process, with no
+                    // window and no longer an indicator either: the one row
+                    // whose whole purpose is to end everything was the surest
+                    // way to be left with something that could not be ended.
+                    self.perform_close(CloseOutcome::KeepSessions, Leaving::Process);
+                    return;
+                }
+                None => {}
+            }
+            if self.window.tray_refreshed.elapsed() >= std::time::Duration::from_secs(2) {
+                self.window.tray_refreshed = std::time::Instant::now();
+                // Nothing else drives the cockpit tracker, and "2 agents are
+                // waiting for you" is precisely the number this indicator
+                // exists to carry. Skipping it while parked would freeze that
+                // count at whatever it read the instant the window closed --
+                // a report that looks live and is not. It rate-limits itself,
+                // so calling it on every refresh costs one screen read per
+                // pane per second and no frames at all.
+                self.feed_cockpit();
+                let status = self.background_status();
+                if let Some(tray) = self.window.tray.as_mut() {
+                    tray.update(status);
+                }
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(200),
+            ));
+            return;
+        }
+        // Neither a window nor an indicator. macOS is the only platform that
+        // reaches this today: it keeps the process after the last window
+        // closes so the Dock icon can bring one back, where the others end
+        // the process and never have a windowless moment to be stuck in.
+        //
+        // `resumed` was meant to be that way back, and it is not one. AppKit
+        // does not re-send it to an app it already considers running; a
+        // reopen arrives as `applicationShouldHandleReopen:`, which only sets
+        // the wake latch. The latch's one reader lived in the parked branch
+        // above, and nothing enters that branch without a tray -- so with the
+        // window closed rather than parked, the Dock icon, Spotlight and
+        // Finder's "New Unterm Tab Here" were all wired to nothing, and the
+        // only way back was Force Quit. This is the missing reader.
+        //
+        // Not spelled `#[cfg(macos)]`, though only macOS gets here: a loop
+        // that finds itself with no window and someone asking for one should
+        // build it on any platform, and the alternative is a reader that is
+        // dead code on two of the three.
+        if self.window.state.is_none() && crate::tray::take_wake() {
+            self.leave_background(event_loop);
+            return;
+        }
+        // The machine may have been asleep since the last tick. Nothing here
+        // asks the operating system: a monotonic clock does not advance while
+        // suspended and a wall clock does, so the two disagreeing by a lot is
+        // the wake. Cheap enough for an idle tick — two clock reads — and it
+        // works the same on all three platforms.
+        if let Some(away) = self.wake_watch.tick() {
+            let report = unterm_services::wake_watch::on_wake(away);
+            log::info!("woke after {}s away: {report}", away.as_secs());
+        }
+
+        // An input-source switch mid-composition strands marked text that
+        // eats editing keys. But the pinyin IME announces a "switch" for
+        // its own internal mode flips too -- half-width punctuation, caps
+        // -- in the middle of a perfectly live composition, and killing
+        // that one commits its fragments as garbage. Same rule as the key
+        // path: only a composition whose IME has gone silent is a ghost.
+        #[cfg(target_os = "macos")]
+        if crate::ime_watch::input_source_changed()
+            && !self.window.preedit.is_empty()
+            && self
+                .window.last_ime_event
+                .map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(2))
+        {
+            self.clear_orphan_preedit();
+        }
+        // What macOS asked us to open -- Finder's right-click, a folder on
+        // the Dock icon -- becomes a tab, the same way it would anywhere.
+        //
+        // Only with a window to open into. `open_tab_with` needs one and
+        // returns without a word when there is none, so draining while
+        // closed read the request, wrote "opening" in the log, and threw the
+        // path away -- which is what "I pressed New Unterm Tab Here and
+        // nothing happened" was. Left in the queue it survives until the
+        // wake above has built the window, and opens then.
+        #[cfg(target_os = "macos")]
+        if self.window.state.is_some() {
+            for path in crate::macos_open::drain() {
+                let dir = if path.is_dir() {
+                    Some(path.clone())
+                } else {
+                    path.parent().map(std::path::Path::to_path_buf)
+                };
+                // Written down, not just acted on: "it opened the wrong folder"
+                // is undebuggable without knowing what macOS actually handed us.
+                crate::macos_open::trace(&format!(
+                    "received {:?} -> opening {:?}",
+                    path,
+                    dir.as_deref()
+                ));
+                if let Some(dir) = dir {
+                    self.new_tab_in(&dir.to_string_lossy());
+                }
+                if let Some(live) = self.window.state.as_ref() {
+                    live.window.focus_window();
+                }
+            }
+        }
+        self.collect_clipboard_results();
+        if crate::mcp_host::take_repaint() {
+            self.window.drawn_revision = None;
+            self.window.quiet_since = None;
+        }
+        self.tick();
+        // Waiting until the next tick rather than spinning. Something has to
+        // ask the engine whether a shell has written -- nothing wakes the loop
+        // when one does -- but asking as fast as the CPU allows is how this
+        // came to burn most of a core sitting at an idle prompt.
+        //
+        // The interval is the answer to "how late may output be", not "how
+        // often can we ask": a frame is the shortest delay anybody can see, and
+        // a pane that has been quiet for a while can be asked far less often
+        // without anyone noticing. Typing does not depend on either -- a key
+        // wakes the loop by itself.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            std::time::Instant::now() + self.tick_interval(),
+        ));
+    }
+}
+
+/// Keep a new window on its display. The default size is the grid the config
+/// asks for plus the sidebar and padding, and a saved one is whatever the last
+/// display allowed; on a small or different screen either can run past the
+/// edge and put the caption buttons out of reach.
+fn fit_to_monitor(window: &Window) {
+    let Some(monitor) = window.current_monitor().or_else(|| window.primary_monitor()) else {
+        return;
+    };
+    let screen = monitor.size();
+    let outer = window.outer_size();
+    let inner = window.inner_size();
+    let (frame_w, frame_h) = (
+        outer.width.saturating_sub(inner.width),
+        outer.height.saturating_sub(inner.height),
+    );
+    let max_w = screen.width * 9 / 10;
+    let max_h = screen.height * 9 / 10;
+    if outer.width <= max_w && outer.height <= max_h {
+        return;
+    }
+    let width = inner.width.min(max_w.saturating_sub(frame_w)).max(1);
+    let height = inner.height.min(max_h.saturating_sub(frame_h)).max(1);
+    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+}
+
+/// Whether a title is only a shell's name, which says nothing a tab row does
+/// not already say.
+fn is_a_shell(title: &str) -> bool {
+    let stem = title
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(title)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "zsh" | "bash" | "sh" | "fish" | "nu" | "pwsh" | "powershell" | "cmd" | "tcsh" | "dash" | "elvish" | "xonsh"
+    )
+}
+
+/// The command the config names, if it names one.
+///
+/// A string is the program; a list is the program and its arguments. Real
+/// shells need arguments -- `pwsh -NoLogo`, `bash --login` -- and a setting
+/// that cannot express them makes the user pick between their flags and the
+/// config.
+/// Apply the current window identity and launch policy immediately before a
+/// pane is spawned. Keeping only the base command in `App` means a profile
+/// change affects future panes without mutating shells that already exist.
+/// A path quoted for the shell the pane runs.
+///
+/// The POSIX single-quote form leaves nothing for the shell to expand --
+/// `$`, backticks and spaces are all literal, and the quote itself is the
+/// one thing escaped. A repo can contain a directory named `$(rm -rf ~)`;
+/// double quotes would hand that to the shell. Windows paths cannot contain
+/// `"`, so the double-quoted form is enough for cmd and PowerShell alike.
+fn shell_quoted_path(path: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{path}\"")
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+/// What a held drag snaps to, decided by the click streak that started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectGranularity {
+    Cell,
+    Word,
+    Line,
+}
+
+/// One screen row as a per-column string for selection work.
+///
+/// A wide glyph owns two grid columns; the second holds a space the user
+/// never typed. Copy paths that keep it turn 你好 into 你 好 on paste, and
+/// word selection sees a boundary in the middle of every CJK word. The
+/// spacer becomes a NUL so columns still line up for the extraction math,
+/// and `strip_spacer_marks` removes it from anything headed to the
+/// clipboard. The parser never stores a NUL in a cell, so the marker
+/// cannot collide with real content.
+fn selection_row_text(cells: &[unterm_engine::StyledCell]) -> String {
+    cells
+        .iter()
+        .map(|cell| if cell.width == 0 { '\u{0}' } else { cell.ch })
+        .collect()
+}
+
+/// Drop the wide-glyph spacer markers from text bound for the clipboard.
+fn strip_spacer_marks(text: String) -> String {
+    if text.contains('\u{0}') {
+        text.replace('\u{0}', "")
+    } else {
+        text
+    }
+}
+
+/// Times a close-path suspect and reports it if it held the GUI thread.
+/// Whether closing now leaves the process running with no window of its own.
+///
+/// Lifted out of `perform_close` so it can be asserted. The bug it stands
+/// against was one value answering two questions, and that shape is invisible
+/// until the combinations are written down beside each other.
+fn close_leaves_process_running(
+    leaving: Leaving,
+    outcome: CloseOutcome,
+    last_window_close_ends_process: bool,
+) -> bool {
+    leaving == Leaving::WindowOnly
+        && !last_window_close_ends_process
+        && outcome == CloseOutcome::KeepSessions
+}
+
+struct SlowGuard {
+    what: &'static str,
+    since: std::time::Instant,
+    /// What the thread was inside when this guard was made, so a nested one
+    /// does not erase its caller on the way out.
+    previous: &'static str,
+}
+impl SlowGuard {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            since: std::time::Instant::now(),
+            // Registered on the way in as well as reported on the way out.
+            // The report needs the drop to run, and a GUI thread wedged in a
+            // Core call that never answers never drops anything -- which is
+            // why the freeze that ended in a reboot could only ever be
+            // described by its length.
+            previous: crate::stallwatch::enter(what),
+        }
+    }
+}
+impl Drop for SlowGuard {
+    fn drop(&mut self) {
+        crate::stallwatch::leave(self.previous);
+        crate::stallwatch::note_if_slow(self.what, self.since, 300);
+    }
+}
+
+fn prepare_shell(
+    mut shell: Option<portable_pty::CommandBuilder>,
+) -> Option<portable_pty::CommandBuilder> {
+    unterm_services::launch_env::apply_unterm_windows_utf8(&mut shell);
+    unterm_services::launch_env::apply_unterm_profile_env(&mut shell);
+    unterm_services::launch_env::apply_unterm_proxy_env(&mut shell);
+    shell
+}
+
+fn launch_env_for_new_pane() -> Vec<(String, String)> {
+    let mut env = unterm_services::launch_env::current_profile_env();
+    env.extend(unterm_services::launch_env::read_unterm_proxy_env().unwrap_or_default());
+    // Which Unterm this shell belongs to.
+    //
+    // The engine puts the pane's own number in beside this, but a number
+    // alone is not an address: pane 5 exists in every window, so a bridge
+    // that connected to a different instance and then named "pane 5" would
+    // be pointing at a stranger. With the instance named, the bridge can
+    // check it reached the right one before it claims anything -- and say
+    // nothing when it did not, which is no worse than the behaviour this
+    // replaces.
+    let instance = unterm_services::server_info::read_current().id;
+    if !instance.is_empty() {
+        for name in unterm_services::env_names::both("INSTANCE") {
+            env.push((name, instance.clone()));
+        }
+    }
+    env
+}
+
+fn shell_from(config: &config::Config) -> Option<portable_pty::CommandBuilder> {
+    match config.get("shell") {
+        Some(config::Value::Str(program)) => Some(portable_pty::CommandBuilder::new(program)),
+        Some(config::Value::List(parts)) => {
+            let mut words = parts.iter().filter_map(|part| match part {
+                config::Value::Str(word) => Some(word.as_str()),
+                _ => None,
+            });
+            let mut command = portable_pty::CommandBuilder::new(words.next()?);
+            for word in words {
+                command.arg(word);
+            }
+            Some(command)
+        }
+        Some(_) => None,
+        None => command_from_argv(unterm_services::settings::preferred_platform_shell()?),
+    }
+}
+
+fn command_from_argv(argv: Vec<String>) -> Option<portable_pty::CommandBuilder> {
+    let mut words = argv.into_iter();
+    let mut command = portable_pty::CommandBuilder::new(words.next()?);
+    for word in words {
+        command.arg(word);
+    }
+    Some(command)
+}
+
+/// Walk `split_from` up to the pane an arrangement was grown from.
+///
+/// A split is recorded on the pane that was split off, pointing at its
+/// source, so a tab's panes form a chain back to one root. Rebuilding has to
+/// start there: every other pane needs its source to already be in a tab.
+///
+/// A dead or missing source ends the walk -- that subtree cannot be rebuilt
+/// anyway -- and the step count is bounded by the session list, so a
+/// malformed chain cannot spin here while a window waits to open.
+fn split_lineage_root(
+    live: &[unterm_engine::SessionSnapshot],
+    session: unterm_engine::SessionSnapshot,
+) -> unterm_engine::SessionSnapshot {
+    let mut current = session;
+    for _ in 0..live.len() {
+        let Some(parent) = current
+            .split_from
+            .and_then(|source| live.iter().find(|session| session.id == source))
+        else {
+            break;
+        };
+        current = parent.clone();
+    }
+    current
+}
+
+/// Whether what this window remembers about a pane's size has been overtaken
+/// by what the pane actually is.
+///
+/// `None` is not staleness: a pane nothing was ever sent has nothing to be
+/// wrong about, and `resize_panes` gives it a size on its next pass anyway.
+/// Equal is not staleness either, and saying so would be expensive rather
+/// than merely useless -- it runs every housekeeping tick, and a resize that
+/// changes nothing still makes the console reflow on Windows.
+fn pane_size_went_stale(remembered: Option<(usize, usize)>, actual: (usize, usize)) -> bool {
+    remembered.is_some_and(|size| size != actual)
+}
+
+/// Whether one window should take a session into its tabs.
+///
+/// The whole of who-owns-what, in one place because every part of it was
+/// learned from a way multi-window went wrong:
+///
+/// - A window keeps what it already has.
+/// - A pane another window holds is that window's. Every window used to
+///   mirror the Core's whole session list, so a second window showed the
+///   first one's shells as well as its own and the two drifted towards the
+///   same set.
+/// - A pane split off another belongs in that one's window, even when the
+///   user is looking at a different one. An agent splitting a pane in a
+///   background window and getting a new tab in the foreground one got
+///   something else than it asked for, and the split it did ask for was
+///   nowhere to be seen.
+/// - Anything else is an orphan and is taken. That is not a leak: it is a
+///   session created over MCP, which nothing named a window for, and it is
+///   what D1 leaves behind when a window closes and its shells keep running.
+///   Windows are offered sessions front one first, so an orphan lands in the
+///   window the user is in.
+fn window_should_adopt(
+    pane_id: usize,
+    split_from: Option<usize>,
+    already_here: bool,
+    shown_elsewhere: &std::collections::HashSet<usize>,
+) -> bool {
+    if already_here {
+        return false;
+    }
+    if shown_elsewhere.contains(&pane_id) {
+        return false;
+    }
+    if split_from.is_some_and(|source| shown_elsewhere.contains(&source)) {
+        return false;
+    }
+    true
+}
+
+/// Every pane one window is showing, across all of its tabs.
+fn pane_set(state: &WindowState) -> std::collections::HashSet<usize> {
+    state
+        .tabs
+        .tab_ids()
+        .into_iter()
+        .flat_map(|tab| state.tabs.pane_ids(tab))
+        .collect()
+}
+
+/// Mirror the Core's session list into one window's tabs.
+///
+/// The Core is the only place sessions exist; a window's `TabRegistry` is a
+/// picture of the ones it is showing. This keeps the picture true -- panes
+/// closed elsewhere go, panes this window should have arrive -- and it is
+/// deliberately about one window: `shown_elsewhere` is what the others
+/// already hold, and nothing here may take one of those.
+///
+/// Returns true when the arrangement moved.
+fn adopt_sessions_into(
+    state: &mut WindowState,
+    sessions: &[unterm_engine::SessionSnapshot],
+    live_ids: &std::collections::HashSet<usize>,
+    shown_elsewhere: &std::collections::HashSet<usize>,
+    adopt_orphans: bool,
+) -> bool {
+    state
+        .pane_notices
+        .retain(|pane_id, _| live_ids.contains(pane_id));
+    let mut changed = false;
+
+    // Sessions may be closed through MCP as well as through this window.
+    // Remove each missing pane from the mirrored layout, not only tabs
+    // whose every pane vanished: otherwise destroying one half of a split
+    // leaves the survivor permanently laid out at half width.
+    for pane in missing_mirrored_panes(&state.tabs, live_ids) {
+        state.tabs.close_pane(pane);
+        state.pane_sizes.remove(&pane);
+        changed = true;
+    }
+
+    // Sizes may be changed through MCP as well as through this window --
+    // the same sentence as the one above it, and the half that was missing.
+    //
+    // `resize_panes` skips a pane it believes is already the right size, and
+    // what it believes is the last size *this window* sent. That is only the
+    // pane's real size while nothing else touches it, and `session.resize`
+    // does: an agent that resizes a pane leaves this window skipping it from
+    // then on, so the pane keeps the size the agent gave it and the window
+    // never argues. Resizing the window is what breaks the tie, because then
+    // the layout wants a size that differs from the remembered one -- which
+    // is why the pane looked squeezed until it was maximised.
+    //
+    // A terminal built for agents to drive cannot treat its own memory as
+    // the authority on what the agent did. The engine reports what each pane
+    // actually is; believe that, and let `resize_panes` (which `sync_tabs`
+    // runs when this returns true) put the layout's size back.
+    //
+    // No loop: the engine adopts a resize verbatim or refuses it outright --
+    // it never quietly clamps -- so once the layout's size is in force the
+    // two agree and this stops firing.
+    for session in sessions {
+        let remembered = state.pane_sizes.get(&session.id).copied();
+        if pane_size_went_stale(remembered, (session.cols, session.rows)) {
+            state
+                .pane_sizes
+                .insert(session.id, (session.cols, session.rows));
+            changed = true;
+        }
+    }
+
+    for session in sessions.iter().filter(|_| adopt_orphans) {
+        if !window_should_adopt(
+            session.id,
+            session.split_from,
+            state.tabs.tab_of_pane(session.id).is_some(),
+            shown_elsewhere,
+        ) {
+            continue;
+        }
+        // A pane split off another belongs beside it, not in a tab of its
+        // own: an agent asking for a split and getting a new tab got
+        // something else than it asked for.
+        let split = session
+            .split_from
+            .filter(|source| state.tabs.tab_of_pane(*source).is_some());
+        // Which way, at what size, and on which side -- from the engine,
+        // which resolved all three when the split was made. That is what lets
+        // an arrangement survive a restart: this window may never have seen
+        // the split it is rebuilding. Falling back to horizontal-half-second
+        // is for panes made before the engine recorded any of this.
+        let outcome = match split {
+            Some(source) => state
+                .tabs
+                .split(
+                    source,
+                    session.id,
+                    session
+                        .split_axis
+                        .unwrap_or(unterm_engine::next_core::layout::SplitAxis::Horizontal),
+                    session.split_ratio.unwrap_or(0.5),
+                    session
+                        .split_side
+                        .unwrap_or(unterm_engine::next_core::layout::SplitSide::Second),
+                )
+                .map(|_| ()),
+            None => state.tabs.create_tab(session.id).map(|_| ()),
+        };
+        match outcome {
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                crate::macos_open::trace(&format!(
+                    "adopt session {} (split of {:?})",
+                    session.id, split
+                ));
+                changed = true;
+            }
+            Err(err) => log::warn!("could not adopt session {}: {err:#}", session.id),
+        }
+    }
+    changed
+}
+
+/// Point a window at a tab that exists, after its arrangement moved.
+fn settle_active_tab(state: &mut WindowState) {
+    let ids = state.tabs.tab_ids();
+    if state.tab_id.map(|id| ids.contains(&id)).unwrap_or(false) {
+        return;
+    }
+    let Some(first) = ids.first().copied() else {
+        state.tab_id = None;
+        return;
+    };
+    state.tabs.set_active_tab(first);
+    state.tab_id = Some(first);
+    if let Some(pane) = state.tabs.active_pane(first) {
+        state.tabs.set_active_pane(pane);
+        if let Some(live) = state.state.as_mut() {
+            live.session_id = pane;
+        }
+    }
+}
+
+fn missing_mirrored_panes(
+    tabs: &unterm_engine::next_core::tabs::TabRegistry,
+    live_ids: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    tabs.tab_ids()
+        .into_iter()
+        .flat_map(|tab_id| tabs.pane_ids(tab_id))
+        .filter(|pane| !live_ids.contains(pane))
+        .collect()
+}
+
+/// Turn a key press into the bytes a PTY expects.
+///
+/// Named keys go through next-core's encoder, which knows the escape sequences;
+/// printable text is sent as typed, which is what the shell reads for anything
+/// the encoder has no opinion about.
+/// Turn a key press into the bytes a shell expects.
+///
+/// The engine already knows every sequence; what this has to get right is
+/// which key and which modifiers it is handed. Both were wrong before:
+/// modifiers were dropped on the floor, so Ctrl+arrow could not move by word
+/// and Ctrl+C sent the letter `c` rather than an interrupt, and only a
+/// handful of named keys were mapped at all.
+fn encode(logical: &winit::keyboard::Key, held: crate::mouse::Held) -> Option<String> {
+    encode_with(logical, held, Default::default)
+}
+
+/// `encode`, under the keyboard protocols the pane's program asked for.
+///
+/// `modes` is only called for a key whose bytes depend on them -- Esc, and
+/// Enter/Tab/Backspace or a character with modifiers -- so plain typing never
+/// waits on a question to the Core.
+fn encode_with(
+    logical: &winit::keyboard::Key,
+    held: crate::mouse::Held,
+    modes: impl FnOnce() -> key_encoding::KeyboardModes,
+) -> Option<String> {
+    use termwiz::input::{KeyCode, Modifiers};
+    use winit::keyboard::{Key, NamedKey};
+
+    let mut mods = Modifiers::NONE;
+    if held.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    if held.ctrl {
+        mods |= Modifiers::CTRL;
+    }
+    if held.alt {
+        mods |= Modifiers::ALT;
+    }
+
+    let key = match logical {
+        Key::Named(named) => match named {
+            NamedKey::Enter => KeyCode::Enter,
+            NamedKey::Backspace => KeyCode::Backspace,
+            NamedKey::Tab => KeyCode::Tab,
+            NamedKey::Escape => KeyCode::Escape,
+            NamedKey::ArrowUp => KeyCode::UpArrow,
+            NamedKey::ArrowDown => KeyCode::DownArrow,
+            NamedKey::ArrowLeft => KeyCode::LeftArrow,
+            NamedKey::ArrowRight => KeyCode::RightArrow,
+            NamedKey::Home => KeyCode::Home,
+            NamedKey::End => KeyCode::End,
+            NamedKey::PageUp => KeyCode::PageUp,
+            NamedKey::PageDown => KeyCode::PageDown,
+            NamedKey::Delete => KeyCode::Delete,
+            NamedKey::Insert => KeyCode::Insert,
+            NamedKey::Space => KeyCode::Char(' '),
+            NamedKey::F1 => KeyCode::Function(1),
+            NamedKey::F2 => KeyCode::Function(2),
+            NamedKey::F3 => KeyCode::Function(3),
+            NamedKey::F4 => KeyCode::Function(4),
+            NamedKey::F5 => KeyCode::Function(5),
+            NamedKey::F6 => KeyCode::Function(6),
+            NamedKey::F7 => KeyCode::Function(7),
+            NamedKey::F8 => KeyCode::Function(8),
+            NamedKey::F9 => KeyCode::Function(9),
+            NamedKey::F10 => KeyCode::Function(10),
+            NamedKey::F11 => KeyCode::Function(11),
+            NamedKey::F12 => KeyCode::Function(12),
+            // Modifier keys themselves produce nothing, and neither do the
+            // dozens of media and system keys a keyboard may have.
+            _ => return None,
+        },
+        Key::Character(text) => {
+            let mut chars = text.chars();
+            let (Some(first), None) = (chars.next(), chars.next()) else {
+                // Several characters from one key press: a dead-key
+                // composition or an input method's output. It is already the
+                // text the user meant, and no modifier applies to it.
+                return Some(text.to_string());
+            };
+            KeyCode::Char(first)
+        }
+        // Dead keys on their way to composing something, and anything else
+        // winit could not name.
+        _ => return None,
+    };
+
+    if key_encoding::depends_on_keyboard_modes(key, mods) {
+        key_encoding::encode_key_with(key, mods, modes())
+    } else {
+        key_encoding::encode_key(key, mods)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GPU fallback chain must end with the software rasteriser.
+    ///
+    /// A machine with no usable GPU driver has to be able to open a window.
+    /// Windows on ARM inside a VM is the case that found this: DX12 finds an
+    /// adapter but cannot configure a surface on the virtual display, GL has
+    /// no driver at all, and with only those two the terminal refused to
+    /// start -- never asking for WARP, which ships with D3D12 and needs no
+    /// driver.
+    ///
+    /// Asserted over the source because the chain is built inside
+    /// `request_graphics`, which needs a real window and a real event loop to
+    /// call. Lines holding a string literal are skipped so this test cannot
+    /// match its own prose.
+    #[test]
+    fn the_gpu_fallback_chain_ends_in_software() {
+        let source = include_str!("window.rs");
+        let mut forces_software = false;
+        for line in source.lines() {
+            if line.contains('"') {
+                continue;
+            }
+            if line.contains("attempts.push((PRIMARY_GPU_BACKEND, true))") {
+                forces_software = true;
+            }
+        }
+        assert!(
+            forces_software,
+            "request_graphics no longer retries with force_fallback_adapter; \
+             a machine with no GPU driver cannot open a window without it"
+        );
+        assert!(
+            source.contains("force_fallback_adapter: force_software"),
+            "try_backend no longer passes the software flag through to wgpu"
+        );
+    }
+
+    #[test]
+    fn a_command_that_says_exit_always_exits() {
+        // The regression: `CloseOutcome::KeepSessions` answers what becomes
+        // of the *sessions*, and the macOS keep-the-process-for-the-Dock
+        // branch read it as the answer to whether the process should live.
+        // "Drain then exit", "cancel and exit" and the indicator's "quit
+        // everything" all pass it -- they really do leave the shells to the
+        // Core -- so all three stopped exiting and left behind a process
+        // with no window and no indicator, which nothing could reach and
+        // only Force Quit could end.
+        for outcome in [CloseOutcome::EndSessions, CloseOutcome::KeepSessions] {
+            for ends in [true, false] {
+                assert!(
+                    !close_leaves_process_running(Leaving::Process, outcome, ends),
+                    "Leaving::Process must end the process ({outcome:?}, ends={ends})"
+                );
+            }
+        }
+        // The one case the branch was written for: a lone view going away on
+        // a platform whose application outlives its last window, with shells
+        // the Core is still holding and a Dock tile to come back from.
+        assert!(close_leaves_process_running(
+            Leaving::WindowOnly,
+            CloseOutcome::KeepSessions,
+            false
+        ));
+        // Nothing left to come back to, and nowhere to come back from.
+        assert!(!close_leaves_process_running(
+            Leaving::WindowOnly,
+            CloseOutcome::EndSessions,
+            false
+        ));
+        assert!(!close_leaves_process_running(
+            Leaving::WindowOnly,
+            CloseOutcome::KeepSessions,
+            true
+        ));
+    }
+
+    /// Every way of bringing a tab forward has to tell its panes how big this
+    /// window is.
+    ///
+    /// Checked against the source because there is no seam to check it at:
+    /// each of these is a few lines that set the active tab, and the resize
+    /// is one more line that is easy to leave out and silent when it is.
+    /// `select_tab` had the line; the palette's `activate_tab`, the
+    /// keyboard's `cycle_tab`, `close_tab` and `open_tab_with` did not, and
+    /// a pane brought forward by any of those four kept the size it had when
+    /// it was last in front.
+    ///
+    /// A heuristic, and worth knowing where it stops: it asks only that the
+    /// call appears within the next few lines, so it catches the omission it
+    /// was written for and would not catch a `resize_panes` put on a branch
+    /// that does not run. `settle_active_tab` is exempt on purpose -- it
+    /// takes a `WindowState` rather than the front end, so it cannot resize
+    /// anything, and both of its callers do it themselves.
+    #[test]
+    fn every_tab_switch_resizes_the_panes_it_brings_forward() {
+        let source = include_str!("window.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut missing = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("tabs.set_active_tab(") {
+                continue;
+            }
+            let enclosing = lines[..=index]
+                .iter()
+                .rev()
+                .find(|candidate| candidate.trim_start().starts_with("fn "))
+                .map(|candidate| candidate.trim())
+                .unwrap_or("");
+            if enclosing.starts_with("fn settle_active_tab") {
+                continue;
+            }
+            let window = &lines[index..(index + 25).min(lines.len())];
+            if !window.iter().any(|line| line.contains("resize_panes()")) {
+                missing.push(format!("line {}: {enclosing}", index + 1));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "a tab is brought forward without its panes being resized:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+
+    /// Every way of asking this window to close goes through one door.
+    ///
+    /// Two did not. The cross this window paints called `request_close`
+    /// directly while the system's close, Cmd-W and Alt-F4 asked
+    /// `close_this_view` first -- and with a second window open that is the
+    /// difference between closing a view and ending the application, because
+    /// nothing is confirmed when another window is behind. Pressing the
+    /// painted cross took the whole of Unterm down and every session in that
+    /// window with it.
+    ///
+    /// Checked against the source because there is no seam: both are one line
+    /// in a match arm, and a third way to close would be one more line that
+    /// looks exactly as reasonable as the one that was wrong.
+    #[test]
+    fn every_close_goes_through_the_same_door() {
+        let source = include_str!("window.rs");
+        let mut stray = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            // Skip lines holding a string: this test names the call it is
+            // looking for, and a scan that reads itself reports itself. Not
+            // done by cutting the file at the first `cfg(test)` -- the first
+            // one here sits a few hundred lines in, which would leave the
+            // closing code unscanned and the test unable to fail at all.
+            if line.contains('"') {
+                continue;
+            }
+            if !line.contains("self.request_close()") {
+                continue;
+            }
+            let enclosing = source
+                .lines()
+                .take(index + 1)
+                .filter(|candidate| candidate.trim_start().starts_with("fn "))
+                .last()
+                .map(str::trim)
+                .unwrap_or("");
+            if enclosing.starts_with("fn close_pressed") {
+                continue;
+            }
+            stray.push(format!("line {}: {enclosing}", index + 1));
+        }
+        assert!(
+            stray.is_empty(),
+            "a close that skips `close_pressed` ends the application \
+             where it meant to close a view:\n  {}",
+            stray.join("\n  ")
+        );
+    }
+
+    /// A row's position in the strip is not a number key.
+    ///
+    /// `select_tab` maps a *key*, and nine and above mean "the last tab"
+    /// there, which is right for a keyboard with nine of them. The strip has
+    /// no such limit: its ninth row is the ninth tab. Feeding a row index in
+    /// as a key sent every click past the eighth to the end of the strip --
+    /// a tab that switches, just not to the one under the pointer. Rows go
+    /// through `select_tab_at`, which takes the position it is given.
+    #[test]
+    fn a_row_position_never_arrives_as_a_number_key() {
+        let source = include_str!("window.rs");
+        let offenders: Vec<String> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let line = line.trim();
+                line.starts_with("self.select_tab(") && line.contains("index")
+            })
+            .map(|(index, line)| format!("line {}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a strip position was passed as a number key:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// A window with no size must not be mistaken for a one-cell one.
+    ///
+    /// This is the top of the chain that cost a pane its scrollback: every
+    /// step below here floors at one cell, so a zero never reached the pane
+    /// as a zero -- it reached it as `cols: 1`, which truncates the pane's
+    /// lines instead of reflowing them. The engine refuses that grid as a
+    /// backstop; this is the refusal that keeps it from being asked for.
+    #[test]
+    fn a_window_with_no_size_is_not_a_window_one_cell_wide() {
+        assert!(!is_drawable_size(0, 0));
+        assert!(!is_drawable_size(0, 600));
+        assert!(!is_drawable_size(800, 0));
+        assert!(is_drawable_size(1, 1));
+        assert!(is_drawable_size(1280, 720));
+    }
+
+    #[test]
+    fn startup_content_trace_ignores_blank_cells_and_spacers() {
+        let cell = |ch: char, width: usize| unterm_engine::StyledCell {
+            ch,
+            style: Default::default(),
+            width,
+            combining: None,
+        };
+        let line = |cells| unterm_engine::StyledScreenLine {
+            row: 0,
+            cells,
+            wrapped: false,
+        };
+
+        assert!(!styled_lines_have_text(&[line(vec![
+            cell(' ', 1),
+            cell('\t', 1),
+            cell(' ', 0),
+        ])]));
+        assert!(styled_lines_have_text(&[line(vec![
+            cell(' ', 0),
+            cell('P', 1),
+            cell('S', 1),
+        ])]));
+    }
+
+    #[test]
+    fn a_wide_glyph_copies_without_its_spacer_cell() {
+        let cell = |ch: char, width: usize| unterm_engine::StyledCell {
+            ch,
+            style: Default::default(),
+            width,
+            combining: None,
+        };
+        // 你好 ab on the grid: each hanzi owns a lead cell and a spacer.
+        let cells = vec![
+            cell('你', 2),
+            cell(' ', 0),
+            cell('好', 2),
+            cell(' ', 0),
+            cell(' ', 1),
+            cell('a', 1),
+            cell('b', 1),
+        ];
+        let text = selection_row_text(&cells);
+        // Column math still sees one entry per grid column...
+        assert_eq!(text.chars().count(), cells.len());
+        // ...but nothing the user never typed reaches the clipboard.
+        assert_eq!(strip_spacer_marks(text), "你好 ab");
+    }
+
+    /// The close prompt is for the last window, not for every window.
+    ///
+    /// D2 of the multi-window design. With another window open, closing this
+    /// one decides nothing about the sessions -- the process stays, the Core
+    /// stays, and the panes are reachable from the window that remains. A
+    /// prompt there asks a question whose answers are all the same.
+    #[test]
+    fn the_close_prompt_belongs_to_the_last_window() {
+        // The production rule itself, not a copy of it. `window_count` is
+        // read in exactly two places and both turn on whether it is 1:
+        // `close_needs_confirmation` returns early when it is more, and
+        // `close_this_view` refuses to close a view when it is not.
+        assert_eq!(
+            App::window_count_for(0),
+            1,
+            "no parked window means this is the last one"
+        );
+        assert_eq!(App::window_count_for(1), 2, "one parked window makes two");
+        assert_eq!(App::window_count_for(2), 3);
+    }
+
+    fn elsewhere(panes: &[usize]) -> std::collections::HashSet<usize> {
+        panes.iter().copied().collect()
+    }
+
+    /// A session belongs to one window.
+    ///
+    /// Every window mirrors the Core's session list into its own tabs, and
+    /// every window sees the whole list. Without this rule a second window
+    /// showed the first one's shells as well as its own -- open one and its
+    /// title bar said `[1/2]` before anything had been run in it.
+    #[test]
+    fn a_pane_another_window_holds_is_not_taken() {
+        assert!(
+            !window_should_adopt(1, None, false, &elsewhere(&[1])),
+            "the window showing pane 1 keeps it"
+        );
+        assert!(
+            window_should_adopt(2, None, false, &elsewhere(&[1])),
+            "a pane no window holds is taken"
+        );
+        assert!(
+            !window_should_adopt(1, None, true, &elsewhere(&[])),
+            "a pane already here is not adopted twice"
+        );
+    }
+
+    /// A split belongs beside the pane it came from, in that pane's window.
+    ///
+    /// The user may well be looking at a different window when an agent asks
+    /// for the split. Adopting it here would put a new tab in the window the
+    /// user is in and leave the split that was asked for nowhere to be seen.
+    #[test]
+    fn a_split_follows_its_source_into_the_other_window() {
+        assert!(
+            !window_should_adopt(3, Some(1), false, &elsewhere(&[1])),
+            "pane 1 is in another window, so its split goes there"
+        );
+        assert!(
+            window_should_adopt(3, Some(1), false, &elsewhere(&[9])),
+            "the window holding pane 1 takes the split"
+        );
+    }
+
+    /// An orphan is taken rather than left running invisibly.
+    ///
+    /// Two things make orphans: a session created over MCP, which named no
+    /// window, and D1 -- closing a window closes a view and leaves its shells
+    /// running. Both have to resurface, and windows are offered sessions
+    /// front one first, so both land in the window the user is in.
+    #[test]
+    fn a_session_no_window_holds_is_taken() {
+        assert!(window_should_adopt(4, None, false, &elsewhere(&[1, 2])));
+        assert!(
+            window_should_adopt(4, Some(9), false, &elsewhere(&[1, 2])),
+            "a split whose source no window holds either is still an orphan"
+        );
+    }
+
+    /// An agent resizing a pane must not leave the window arguing with it
+    /// forever.
+    ///
+    /// `resize_panes` skips a pane whose size it believes is already right,
+    /// and what it believes is the last size this window sent -- true only
+    /// while nothing else touches the pane. `session.resize` over MCP does,
+    /// and this terminal exists to be driven that way. Without this check the
+    /// window kept skipping the pane, so it held the agent's size until the
+    /// window itself was resized: squeezed until you maximise it, and only
+    /// sometimes, because it takes an agent having resized something.
+    #[test]
+    fn a_pane_resized_behind_this_window_is_noticed() {
+        // What the engine reports differs from what we sent: somebody else
+        // moved it, and the layout has to be put back.
+        assert!(pane_size_went_stale(Some((120, 30)), (80, 24)));
+
+        // Agreement is the common case and must stay silent: this runs every
+        // housekeeping tick, and a resize that changes nothing is not free --
+        // on Windows it makes the console reflow, which is the flicker the
+        // remembered size exists to avoid.
+        assert!(!pane_size_went_stale(Some((80, 24)), (80, 24)));
+
+        // Nothing remembered is not a disagreement. A pane this window has
+        // not sent a size to gets one from `resize_panes` on its next pass;
+        // calling that stale would resize every pane on the first tick after
+        // a window opens.
+        assert!(!pane_size_went_stale(None, (80, 24)));
+    }
+
+    #[test]
+    fn display_scale_is_applied_once_to_fonts_and_chrome() {
+        assert_eq!(App::font_scale_for(1.0), 1.0);
+        assert_eq!(App::font_scale_for(1.5), 1.5);
+        assert_eq!(App::font_scale_for(2.0), 2.0);
+    }
+
+    /// Closing a window ends the shells it was showing -- and only those.
+    ///
+    /// The list came from the engine, which in Core mode is every window's:
+    /// two windows open, close one, and the other was left running with no
+    /// panes at all. The tab registry is this window's own, so it is what
+    /// "the shells I was showing" means.
+    #[test]
+    fn a_window_closes_only_the_panes_it_holds() {
+        let mut mine = unterm_engine::next_core::tabs::TabRegistry::new();
+        mine.create_tab(1).expect("a tab");
+        mine.split(
+            1,
+            2,
+            unterm_engine::next_core::layout::SplitAxis::Horizontal,
+            0.5,
+            unterm_engine::next_core::layout::SplitSide::Second,
+        )
+        .expect("a split");
+        mine.create_tab(3).expect("a second tab");
+
+        // What `perform_close(EndSessions)` now destroys.
+        let mut closing: Vec<usize> = mine
+            .tab_ids()
+            .into_iter()
+            .flat_map(|tab| mine.pane_ids(tab))
+            .collect();
+        closing.sort();
+
+        assert_eq!(closing, vec![1, 2, 3], "every pane this window holds");
+        // Pane 4 belongs to another window on the same Core. Nothing here
+        // may reach it.
+        assert!(
+            !closing.contains(&4),
+            "another window's pane must survive this close"
+        );
+    }
+
+    #[test]
+    fn an_externally_closed_split_is_removed_from_the_mirrored_layout() {
+        let mut tabs = unterm_engine::next_core::tabs::TabRegistry::new();
+        tabs.create_tab(1).expect("first pane should make a tab");
+        tabs.split(
+            1,
+            2,
+            unterm_engine::next_core::layout::SplitAxis::Horizontal,
+            0.5,
+            unterm_engine::next_core::layout::SplitSide::Second,
+        )
+        .expect("second pane should split the tab");
+        let live = std::collections::HashSet::from([1]);
+
+        assert_eq!(missing_mirrored_panes(&tabs, &live), vec![2]);
+        tabs.close_pane(2);
+        assert_eq!(tabs.pane_ids(tabs.tab_ids()[0]), vec![1]);
+    }
+
+    #[test]
+    fn migrated_legacy_chrome_colours_override_derived_tones() {
+        let config = config::parse(
+            r##"
+[window_frame]
+active_titlebar_bg = "#2c2c2c"
+active_titlebar_fg = "#ffffff"
+
+[colors.tab_bar.active_tab]
+bg_color = "#0c0c0c"
+
+[colors.tab_bar.inactive_tab]
+fg_color = "#cccccc"
+
+[colors.tab_bar.inactive_tab_hover]
+bg_color = "#3a3a3a"
+"##,
+        )
+        .expect("config should parse");
+        let overrides = ChromeOverrides::from_config(&config);
+        let chrome = overrides.apply(
+            crate::chrome::chrome(
+                crate::chrome::srgb(0x12, 0x12, 0x12),
+                crate::chrome::srgb(0xee, 0xee, 0xee),
+            ),
+            true,
+        );
+
+        assert_eq!(chrome.surface, crate::chrome::srgb(0x2c, 0x2c, 0x2c));
+        assert_eq!(chrome.selected_bg, crate::chrome::srgb(0x0c, 0x0c, 0x0c));
+        assert_eq!(chrome.hover_bg, crate::chrome::srgb(0x3a, 0x3a, 0x3a));
+        assert_eq!(chrome.dim_text, crate::chrome::srgb(0xcc, 0xcc, 0xcc));
+        assert_eq!(
+            overrides.active_foreground,
+            Some(crate::chrome::srgb(0xff, 0xff, 0xff))
+        );
+    }
+
+    #[test]
+    fn inactive_pane_transform_dims_without_changing_alpha() {
+        let color = transform_hsv([0.8, 0.4, 0.2, 0.7], 1.0, 0.8, 0.55);
+
+        assert!(color[0] < 0.8);
+        assert!(color[1] < 0.4);
+        assert!(color[2] < 0.2);
+        assert_eq!(color[3], 0.7);
+    }
+
+    #[test]
+    fn identity_inactive_pane_transform_changes_nothing() {
+        let color = [0.15, 0.45, 0.8, 1.0];
+        assert_eq!(transform_hsv(color, 1.0, 1.0, 1.0), color);
+    }
+
+    /// The hue factor turns the colour around the wheel without touching how
+    /// bright or how saturated it is: pure blue halved lands on pure green,
+    /// still as saturated, still as bright.
+    #[test]
+    fn the_hue_factor_turns_the_colour_without_dimming_it() {
+        let color = transform_hsv([0.0, 0.0, 1.0, 1.0], 0.5, 1.0, 1.0);
+
+        assert_eq!(color, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn the_configured_shell_is_used() {
+        let config = config::parse("shell = \"pwsh.exe\"").expect("config should parse");
+
+        let shell = shell_from(&config).expect("a named shell should be used");
+
+        // Without this the session falls back to %COMSPEC% -- cmd.exe on
+        // Windows, which is not what a config naming pwsh meant.
+        assert_eq!(shell.get_argv()[0], "pwsh.exe");
+    }
+
+    #[test]
+    fn a_shell_can_carry_its_arguments() {
+        let config =
+            config::parse(r#"shell = ["pwsh.exe", "-NoLogo"]"#).expect("config should parse");
+
+        let shell = shell_from(&config).expect("a named shell should be used");
+
+        // A setting that cannot express arguments makes the user choose
+        // between their flags and the config.
+        let argv = shell.get_argv();
+        assert_eq!(argv[0], "pwsh.exe");
+        assert_eq!(argv[1], "-NoLogo");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_config_naming_no_shell_leaves_the_choice_to_the_engine() {
+        let config = config::parse("font_size = 13").expect("config should parse");
+
+        assert!(shell_from(&config).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_config_naming_no_shell_uses_the_platform_powershell_default() {
+        let config = config::parse("font_size = 13").expect("config should parse");
+        let shell = shell_from(&config).expect("Windows has a platform shell");
+        let argv = shell.get_argv();
+        let name = argv[0].to_string_lossy().to_ascii_lowercase();
+
+        assert!(name.contains("powershell") || name.contains("pwsh"), "{argv:?}");
+        assert_eq!(argv[1].to_string_lossy(), "-NoLogo");
+        assert_eq!(argv[2].to_string_lossy(), "-NoProfile");
+    }
+
+    #[test]
+    fn the_first_pane_is_measured_against_the_terminal_not_the_whole_window() {
+        // The bug this pins: `start` sized the very first shell with
+        // `grid_for(window_width, window_height)` while every later
+        // measurement used `terminal_width()`, which subtracts the tab strip
+        // and the padding. The shell was therefore told it had the sidebar's
+        // columns as well as its own, so a TUI launched at startup — Claude
+        // Code, reported 2026-08-15 — drew past the right edge and stayed
+        // that way until a resize. Maximising "fixed" it because the resize
+        // was the first measurement that was correct.
+        let config = config::parse("font_size = 13").expect("config should parse");
+        let app = App::new(&config).expect("an app without a window");
+        let metrics = app.window.font.metrics();
+
+        // Exactly the situation `start` is in: a known window size and no
+        // `Live` state yet.
+        let window_width = 1200.0_f32;
+        let dock = app.dock_width_for(window_width, metrics);
+        let terminal = app.terminal_width_for(window_width);
+
+        assert!(
+            dock > 0.0,
+            "the tab strip has width at startup, so it must be subtracted"
+        );
+        assert!(
+            terminal <= window_width - dock,
+            "the terminal is {terminal} wide inside a {window_width} window whose              strip already takes {dock}; the shell would be given columns it              cannot draw into"
+        );
+
+        let (honest_cols, _) = app.window.font.grid_for(terminal, 600.0);
+        let (whole_window_cols, _) = app.window.font.grid_for(window_width, 600.0);
+        assert!(
+            honest_cols < whole_window_cols,
+            "measuring the window instead of the terminal must yield more              columns ({whole_window_cols}) than the grid has ({honest_cols});              if these are equal the test is no longer measuring the defect"
+        );
+    }
+
+    #[test]
+    fn cycling_forward_from_the_last_tab_wraps_to_the_first() {
+        let ids = [10, 20, 30];
+        assert_eq!(next_tab_index(&ids, Some(30), 1), 0);
+        assert_eq!(next_tab_index(&ids, Some(10), 1), 1);
+    }
+
+    #[test]
+    fn cycling_back_from_the_first_tab_wraps_to_the_last() {
+        let ids = [10, 20, 30];
+        assert_eq!(next_tab_index(&ids, Some(10), -1), 2);
+        assert_eq!(next_tab_index(&ids, Some(30), -1), 1);
+    }
+
+    #[test]
+    fn a_tab_that_is_no_longer_there_cycles_from_the_start() {
+        // Closing a tab can leave the remembered id dangling; landing on the
+        // first tab is a defined answer, and panicking is not.
+        let ids = [10, 20, 30];
+        assert_eq!(next_tab_index(&ids, Some(99), 1), 1);
+        assert_eq!(next_tab_index(&ids, None, 1), 1);
+    }
+
+    #[test]
+    fn cycling_with_no_tabs_answers_rather_than_dividing_by_zero() {
+        let ids: [usize; 0] = [];
+        assert_eq!(next_tab_index(&ids, None, 1), 0);
+    }
+}
+
+/// Which tab a cycle lands on.
+///
+/// Wrapping rather than stopping at the ends: with three tabs, cycling
+/// forward twice from the last has to land somewhere, and a key that does
+/// nothing at the edge reads as a key that is broken.
+fn next_tab_index<T: PartialEq>(ids: &[T], current: Option<T>, step: isize) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let index = current
+        .and_then(|id| ids.iter().position(|candidate| *candidate == id))
+        .unwrap_or(0) as isize;
+    (index + step).rem_euclid(ids.len() as isize) as usize
+}
+
+/// Blend two colours.
+fn mix(from: [f32; 4], to: [f32; 4], amount: f32) -> [f32; 4] {
+    let blend = |a: f32, b: f32| a + (b - a) * amount;
+    [
+        blend(from[0], to[0]),
+        blend(from[1], to[1]),
+        blend(from[2], to[2]),
+        from[3],
+    ]
+}
+
+/// Give the renderer the texture of every picture this frame shows that it
+/// does not have yet, fetched from the pane that holds it.
+///
+/// Pictures are named by their content, so a texture once uploaded is never
+/// stale; what goes is only what has not been on screen for a while, once
+/// enough have piled up to matter.
+fn upload_inline_images(
+    engine: &crate::engine_backend::AppEngine,
+    renderer: &unterm_render::gpu::Renderer,
+    quads: &unterm_render::quads::FrameQuads,
+) {
+    if quads.inline_images.is_empty() {
+        return;
+    }
+    for image in &quads.inline_images {
+        if renderer.has_inline_image(&image.image) {
+            continue;
+        }
+        match unterm_engine::ScreenEngine::read_inline_image(engine, image.pane, &image.image) {
+            Ok(Some(data)) => {
+                renderer.upload_inline_image(&data.image, data.width, data.height, &data.rgba)
+            }
+            Ok(None) => {}
+            Err(err) => log::debug!("could not fetch picture {}: {err:#}", image.image),
+        }
+    }
+    const KEEP: usize = 64;
+    if renderer.inline_image_count() > KEEP {
+        let shown: std::collections::HashSet<&str> =
+            quads.inline_images.iter().map(|image| image.image.as_str()).collect();
+        renderer.retain_inline_images(|name| shown.contains(name));
+    }
+}
+
+fn dim_pane_quads(
+    quads: &mut unterm_render::quads::FrameQuads,
+    background_start: usize,
+    glyph_start: usize,
+    hue: f32,
+    saturation: f32,
+    brightness: f32,
+) {
+    if (hue - 1.0).abs() < f32::EPSILON
+        && (saturation - 1.0).abs() < f32::EPSILON
+        && (brightness - 1.0).abs() < f32::EPSILON
+    {
+        return;
+    }
+    for quad in &mut quads.backgrounds[background_start..] {
+        quad.color = transform_hsv(quad.color, hue, saturation, brightness);
+    }
+    for glyph in &mut quads.glyphs[glyph_start..] {
+        glyph.quad.color = transform_hsv(glyph.quad.color, hue, saturation, brightness);
+    }
+}
+
+/// Multiply a colour's hue, saturation and brightness, as the old renderer's
+/// shader did: each HSV component times its factor, the hue wrapping around
+/// the wheel rather than piling up at red.
+fn transform_hsv(color: [f32; 4], hue_factor: f32, saturation: f32, brightness: f32) -> [f32; 4] {
+    if (hue_factor - 1.0).abs() < f32::EPSILON
+        && (saturation - 1.0).abs() < f32::EPSILON
+        && (brightness - 1.0).abs() < f32::EPSILON
+    {
+        return color;
+    }
+    let [red, green, blue, alpha] = color;
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if max == red {
+        ((green - blue) / delta).rem_euclid(6.0)
+    } else if max == green {
+        (blue - red) / delta + 2.0
+    } else {
+        (red - green) / delta + 4.0
+    };
+    let hue = (hue * hue_factor).rem_euclid(6.0);
+    let sat = if max <= f32::EPSILON {
+        0.0
+    } else {
+        (delta / max * saturation).clamp(0.0, 1.0)
+    };
+    let value = (max * brightness).clamp(0.0, 1.0);
+    let chroma = value * sat;
+    let x = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hue as i32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = value - chroma;
+    [r1 + m, g1 + m, b1 + m, alpha]
+}
+
+/// The palette's rows: every action a key can reach.
+///
+/// Built from the same table the keys use, so a chord and a palette row
+/// cannot drift apart -- and the chord is shown as the hint, which is how a
+/// palette teaches the keyboard.
+fn command_entries() -> Vec<crate::palette::Entry> {
+    let mut entries: Vec<crate::palette::Entry> = Vec::new();
+    for &action in crate::keys::PALETTE_ACTIONS {
+        if !crate::keys::available(action) {
+            continue;
+        }
+        let label = command_label(action);
+        entries.push(crate::palette::Entry {
+            label,
+            hint: crate::keys::chord_hint(action).unwrap_or_default(),
+            command: crate::palette::Command::Action(action),
+        });
+    }
+    entries.push(crate::palette::Entry {
+        label: unterm_services::i18n::t("command.tab_navigator"),
+        hint: unterm_services::i18n::t("command.tab_navigator.hint"),
+        command: crate::palette::Command::OpenTabNavigator,
+    });
+    entries.push(crate::palette::Entry {
+        label: unterm_services::i18n::t("command.capture_region"),
+        hint: unterm_services::i18n::t("command.capture_region.hint"),
+        command: crate::palette::Command::SelectCaptureRegion,
+    });
+    let is_zh = unterm_services::i18n::current_locale().starts_with("zh");
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "Git 自动检查点与一键回滚 (Checkpoints)".to_string()
+        } else {
+            "Git Checkpoints & 1-Click Rollback".to_string()
+        },
+        hint: "git stash / rollback".to_string(),
+        command: crate::palette::Command::OpenCheckpoints,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "AI 助手 MCP 接入管理 (Per-Client MCP)".to_string()
+        } else {
+            "AI Clients MCP Manager".to_string()
+        },
+        hint: "Claude \u{00b7} Codex \u{00b7} Gemini \u{00b7} Agy \u{00b7} Cursor".to_string(),
+        command: crate::palette::Command::OpenMcpClients,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "AI 自主权与安全审批级别 (Autonomy)".to_string()
+        } else {
+            "AI Autonomy & Safety Guardrail".to_string()
+        },
+        hint: unterm_settings::run_settings().autonomy.label().to_string(),
+        command: crate::palette::Command::OpenAutonomySelector,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "AI 诊断当前窗格报错 / 一键修复 (Diagnose Failure)".to_string()
+        } else {
+            "Diagnose Last Command Failure with AI".to_string()
+        },
+        hint: "Error report / Split AI Fix".to_string(),
+        command: crate::palette::Command::DiagnoseLastFailure,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "跨 Agent 接力当前窗格 (Context Handoff)".to_string()
+        } else {
+            "Cross-Agent Context Handoff".to_string()
+        },
+        hint: "Claude \u{2194} Codex \u{2194} Gemini".to_string(),
+        command: crate::palette::Command::OpenAgentHandoff,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "手机扫码远程查看与审批 (Pocket Unterm QR)".to_string()
+        } else {
+            "Mobile Remote Pairing QR (Pocket Unterm)".to_string()
+        },
+        hint: "QR + PIN".to_string(),
+        command: crate::palette::Command::OpenPocketQr,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "界面语言 (UI Language)".to_string()
+        } else {
+            "UI Language".to_string()
+        },
+        hint: unterm_services::i18n::current_locale().to_string(),
+        command: crate::palette::Command::OpenLanguageSelector,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "光标形状与闪烁 (Cursor Style)".to_string()
+        } else {
+            "Cursor Style & Blink".to_string()
+        },
+        hint: "Block / Bar / Underline".to_string(),
+        command: crate::palette::Command::OpenCursorSelector,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "历史回滚行数上限 (Scrollback Limit)".to_string()
+        } else {
+            "Scrollback History Limit".to_string()
+        },
+        hint: "5k - 500k lines".to_string(),
+        command: crate::palette::Command::OpenScrollbackSelector,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "网络代理与 Clash 节点设置 (Proxy & Clash Settings)".to_string()
+        } else {
+            "Network Proxy & Clash Node Settings".to_string()
+        },
+        hint: if unterm_services::launch_env::unterm_proxy_enabled() {
+            "proxy: ON".to_string()
+        } else {
+            "proxy: OFF".to_string()
+        },
+        command: crate::palette::Command::OpenProxySettings,
+    });
+    entries.push(crate::palette::Entry {
+        label: if is_zh {
+            "编辑配置文件 (unterm.conf)".to_string()
+        } else {
+            "Edit Configuration File (unterm.conf)".to_string()
+        },
+        hint: "unterm.conf".to_string(),
+        command: crate::palette::Command::OpenConfigFile,
+    });
+    // Last, and only here: there to be found by whoever looks for it.
+    entries.push(crate::palette::Entry {
+        label: unterm_services::i18n::t("command.star"),
+        hint: "github.com/zhitongblog/unterm".to_string(),
+        command: crate::palette::Command::StarOnGitHub,
+    });
+    entries.push(crate::palette::Entry {
+        label: unterm_services::i18n::t("command.ambassador"),
+        hint: "unterm.app/ambassador".to_string(),
+        command: crate::palette::Command::ShareAmbassadorPost,
+    });
+    entries
+}
+
+/// The ambassador page in the UI's language. The site serves English at the
+/// root and every other locale under its code, the same codes the app uses.
+fn ambassador_url(locale: &str) -> String {
+    if locale == "en-US" {
+        "https://unterm.app/ambassador".to_string()
+    } else {
+        format!("https://unterm.app/{locale}/ambassador")
+    }
+}
+
+fn command_label(action: crate::keys::Action) -> String {
+    command_label_key(action)
+        .map(unterm_services::i18n::t)
+        .unwrap_or_else(|| action.label().to_string())
+}
+
+/// The catalogue key a palette row's name comes from.
+fn command_label_key(action: crate::keys::Action) -> Option<&'static str> {
+    use crate::keys::Action;
+    match action {
+        Action::Copy => Some("command.copy"),
+        Action::Paste => Some("command.paste"),
+        Action::SplitRight => Some("command.split_right"),
+        Action::SplitDown => Some("command.split_down"),
+        Action::NewTab => Some("command.new_tab"),
+        Action::CloseTab => Some("command.close_tab"),
+        Action::Search => Some("command.search"),
+        Action::CommandPalette => Some("command.command_palette"),
+        Action::Launcher => Some("command.launcher"),
+        Action::NewWindow => Some("command.new_window"),
+        Action::NewAdminWindow => Some("admin.new_window"),
+        Action::ZoomPane => Some("command.zoom_pane"),
+        Action::SelectPane => Some("command.select_pane"),
+        Action::TreeSidebar => Some("command.file_tree"),
+        Action::DirJump => Some("command.directory"),
+        Action::Settings => Some("command.settings"),
+        Action::ScrollPageUp => Some("command.scroll_page_up"),
+        Action::ScrollPageDown => Some("command.scroll_page_down"),
+        Action::PreviousPrompt => Some("command.previous_prompt"),
+        Action::NextPrompt => Some("command.next_prompt"),
+        Action::NextTab => Some("command.next_tab"),
+        Action::PreviousTab => Some("command.previous_tab"),
+        Action::CopyMode => Some("command.copy_mode"),
+        Action::QuickSelect => Some("command.quick_select"),
+        Action::Insights => Some("command.insights"),
+        Action::CockpitInbox => Some("command.agent_inbox"),
+        Action::GitPanel => Some("command.git_status"),
+        Action::Composer => Some("command.prompt_queue"),
+        Action::ThemePicker => Some("command.theme"),
+        Action::LeftTabBar => Some("command.left_tab_bar"),
+        Action::ClosePane => Some("command.close_pane"),
+        Action::CharSelect => Some("command.insert_character"),
+        Action::FleetLaunch => Some("command.launch_fleet"),
+        Action::ClearScrollback => Some("command.clear_scrollback"),
+        Action::ClearScreen => Some("command.clear_screen"),
+        Action::SwapPane => Some("command.swap_pane"),
+        Action::FocusPane(crate::keys::Direction::Left) => Some("command.focus_left"),
+        Action::FocusPane(crate::keys::Direction::Right) => Some("command.focus_right"),
+        Action::FocusPane(crate::keys::Direction::Up) => Some("command.focus_up"),
+        Action::FocusPane(crate::keys::Direction::Down) => Some("command.focus_down"),
+        Action::ResizePane(crate::keys::Direction::Left) => Some("command.resize_left"),
+        Action::ResizePane(crate::keys::Direction::Right) => Some("command.resize_right"),
+        Action::ResizePane(crate::keys::Direction::Up) => Some("command.resize_up"),
+        Action::ResizePane(crate::keys::Direction::Down) => Some("command.resize_down"),
+        Action::MoveTab(step) if step < 0 => Some("command.move_tab_left"),
+        Action::MoveTab(_) => Some("command.move_tab_right"),
+        Action::SelectTab(_) => Some("command.select_tab_by_number"),
+        Action::IncreaseFontSize => Some("command.font_bigger"),
+        Action::DecreaseFontSize => Some("command.font_smaller"),
+        Action::ResetFontSize => Some("command.font_reset"),
+        Action::ToggleFullScreen => Some("command.full_screen"),
+    }
+}
+
+#[cfg(test)]
+mod palette_label_tests {
+    /// Every command the palette lists is named in every language. One that
+    /// fell back to its English label sat in a Chinese palette as
+    /// “Scroll Page Up” between 复制 and 粘贴.
+    #[test]
+    fn every_palette_command_is_translated_everywhere() {
+        let catalogues = [
+            include_str!("../../unterm-services/src/i18n/locales/en.json"),
+            include_str!("../../unterm-services/src/i18n/locales/zh-CN.json"),
+            include_str!("../../unterm-services/src/i18n/locales/zh-TW.json"),
+            include_str!("../../unterm-services/src/i18n/locales/ja.json"),
+            include_str!("../../unterm-services/src/i18n/locales/ko.json"),
+            include_str!("../../unterm-services/src/i18n/locales/de.json"),
+            include_str!("../../unterm-services/src/i18n/locales/fr.json"),
+            include_str!("../../unterm-services/src/i18n/locales/it.json"),
+            include_str!("../../unterm-services/src/i18n/locales/hi.json"),
+        ];
+        for &action in crate::keys::PALETTE_ACTIONS {
+            let key = super::command_label_key(action)
+                .unwrap_or_else(|| panic!("{:?} has no catalogue key", action));
+            for catalogue in catalogues {
+                assert!(catalogue.contains(&format!("\"{key}\"")), "{key} missing from a catalogue");
+            }
+        }
+    }
+}
+
+/// The saved workspaces: a row reopens each, and the last row saves one.
+///
+/// 0.57.4's launcher listed workspaces beside its commands
+/// (`LauncherFlags::WORKSPACES`); these rows are their next-core
+/// descendants, read from the same files the MCP `workspace.*` tools use.
+fn workspace_entries() -> Vec<crate::palette::Entry> {
+    let mut entries: Vec<crate::palette::Entry> = crate::workspaces::list()
+        .into_iter()
+        .map(|workspace| crate::palette::Entry {
+            label: format!("Open Workspace: {}", workspace.name),
+            hint: match workspace.cwds.len() {
+                1 => "1 saved tab".to_string(),
+                count => format!("{count} saved tabs"),
+            },
+            command: crate::palette::Command::RestoreWorkspace {
+                name: workspace.name,
+            },
+        })
+        .collect();
+    entries.push(crate::palette::Entry {
+        label: "Save Workspace".to_string(),
+        hint: "the open tabs, under a name".to_string(),
+        command: crate::palette::Command::OpenWorkspaceSave,
+    });
+    entries
+}
+
+/// The launcher's rows: the shells this machine actually has.
+///
+/// Probed rather than listed: offering a shell that is not installed is a row
+/// that opens an empty tab and an error in a log the user will not read.
+/// Git for Windows' bash, wherever Git was installed: the machine-wide and
+/// per-user installers, Scoop, and next to whichever `git.exe` is on PATH.
+#[cfg(windows)]
+fn git_bash() -> Option<std::path::PathBuf> {
+    let env = |key: &str| std::env::var_os(key).map(std::path::PathBuf::from);
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(dir) = env(key) {
+            roots.push(dir.join("Git"));
+        }
+    }
+    if let Some(local) = env("LOCALAPPDATA") {
+        roots.push(local.join("Programs").join("Git"));
+    }
+    if let Some(home) = env("USERPROFILE") {
+        roots.push(home.join("scoop").join("apps").join("git").join("current"));
+    }
+    // `…\Git\cmd\git.exe` or `…\Git\bin\git.exe`: the install is two up.
+    if let Some(git) = which("git.exe") {
+        if let Some(root) = git.parent().and_then(|dir| dir.parent()) {
+            roots.push(root.to_path_buf());
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("bin").join("bash.exe"))
+        .find(|bash| bash.is_file())
+}
+
+/// The WSL distributions registered for this user, by name, from
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`.
+#[cfg(windows)]
+fn wsl_distributions() -> Vec<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::shared::minwindef::{DWORD, HKEY};
+    use winapi::shared::winerror::ERROR_SUCCESS;
+    use winapi::um::winnt::KEY_READ;
+    use winapi::um::winreg::{
+        RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
+    };
+
+    let wide = |text: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(text).encode_wide().chain(Some(0)).collect()
+    };
+    let mut names = Vec::new();
+    unsafe {
+        let mut lxss: HKEY = std::ptr::null_mut();
+        let path = wide(r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+        if RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut lxss) as u32
+            != ERROR_SUCCESS
+        {
+            return names;
+        }
+        let value = wide("DistributionName");
+        for index in 0.. {
+            let mut key = [0u16; 256];
+            let mut key_len: DWORD = key.len() as DWORD;
+            let status = RegEnumKeyExW(
+                lxss,
+                index,
+                key.as_mut_ptr(),
+                &mut key_len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if status as u32 != ERROR_SUCCESS {
+                break;
+            }
+            let mut name = [0u16; 256];
+            let mut name_bytes: DWORD = (name.len() * 2) as DWORD;
+            if RegGetValueW(
+                lxss,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                name.as_mut_ptr() as *mut _,
+                &mut name_bytes,
+            ) as u32
+                == ERROR_SUCCESS
+            {
+                let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                let text = String::from_utf16_lossy(&name[..len]);
+                // Docker Desktop's own distributions are not shells anyone
+                // means to open.
+                if !text.is_empty() && !text.starts_with("docker-desktop") {
+                    names.push(text);
+                }
+            }
+        }
+        RegCloseKey(lxss);
+    }
+    names.sort();
+    names
+}
+
+fn launcher_entries() -> Vec<crate::palette::Entry> {
+    let mut candidates: Vec<(String, String, String, Vec<String>)> = Vec::new();
+    let mut add = |label: &str, hint: &str, program: String, args: &[&str]| {
+        if std::path::Path::new(&program).is_file() || which(&program).is_some() {
+            candidates.push((
+                label.to_string(),
+                hint.to_string(),
+                program,
+                args.iter().map(|arg| arg.to_string()).collect(),
+            ));
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        add(
+            "PowerShell 7",
+            "Cross-platform shell",
+            pwsh.into(),
+            &["-NoLogo"],
+        );
+        add(
+            "Windows PowerShell",
+            "Built-in (5.1)",
+            "powershell.exe".into(),
+            &["-NoLogo", "-NoProfile"],
+        );
+        add("Command Prompt", "cmd.exe", "cmd.exe".into(), &[]);
+        if let Some(bash) = git_bash() {
+            add(
+                "Git Bash",
+                "Unix shell via Git",
+                bash.display().to_string(),
+                &["--login"],
+            );
+        }
+        // One row per installed distribution, read from the registry rather
+        // than from `wsl --list`, which can take seconds while WSL itself
+        // starts up -- too long for a menu to wait on.
+        let distributions = wsl_distributions();
+        if distributions.is_empty() {
+            add("WSL", "Linux subsystem", "wsl.exe".into(), &[]);
+        }
+        for name in &distributions {
+            add(
+                &format!("WSL: {name}"),
+                "Linux subsystem",
+                "wsl.exe".into(),
+                &["--distribution", name.as_str(), "--cd", "~"],
+            );
+        }
+        add(
+            "MSYS2 Bash",
+            "MSYS2 environment",
+            r"C:\msys64\usr\bin\bash.exe".into(),
+            &["--login"],
+        );
+        let nu = std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".cargo").join("bin").join("nu.exe"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files\nu\bin\nu.exe"));
+        add(
+            "Nushell",
+            "Structured data shell",
+            nu.display().to_string(),
+            &[],
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            add("Default Shell", "Login shell", shell, &[]);
+        }
+        add("Bash", "GNU Bourne-Again Shell", "/bin/bash".into(), &[]);
+        add("Zsh", "Z Shell", "/bin/zsh".into(), &[]);
+        add(
+            "Fish",
+            "Friendly interactive shell",
+            "/usr/bin/fish".into(),
+            &[],
+        );
+    }
+
+    candidates
+        .into_iter()
+        .map(|(label, hint, program, args)| crate::palette::Entry {
+            label,
+            hint,
+            command: crate::palette::Command::Launch { program, args },
+        })
+        .collect()
+}
+
+/// Where a program is, if it is anywhere on PATH.
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE".to_string())
+            .split(';')
+            .map(|ext| ext.to_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // A name without its extension, which is how everyone writes them.
+        for extension in &extensions {
+            let candidate = directory.join(format!("{program}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod palette_entry_tests {
+    use super::*;
+
+    /// The palette lists every key action, with the chord that reaches it.
+    ///
+    /// Built from the key table rather than a second list, so a chord and a
+    /// palette row cannot drift apart -- and showing the chord is how a
+    /// palette teaches the keyboard.
+    #[test]
+    fn the_palette_lists_what_the_keys_do() {
+        let entries = command_entries();
+        let bindings = crate::keys::effective_bindings();
+        for binding in &bindings {
+            let expected_label = command_label(binding.action);
+            let row = entries
+                .iter()
+                .find(|entry| entry.label == expected_label)
+                .unwrap_or_else(|| panic!("{} has no palette row", binding.action.label()));
+            // The chord shown is the first one bound to the action, which is
+            // the chord the key table would act on.
+            let first = bindings
+                .iter()
+                .find(|other| command_label(other.action) == expected_label)
+                .expect("the binding we started from");
+            assert_eq!(
+                row.hint,
+                crate::keys::display_chord(first.mods, first.trigger),
+                "{} should show the chord that reaches it",
+                row.label
+            );
+        }
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.command, crate::palette::Command::OpenTabNavigator)));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.command, crate::palette::Command::SelectCaptureRegion)));
+    }
+
+    #[test]
+    fn the_palette_contains_every_declared_gui_action() {
+        let entries = command_entries();
+        for action in crate::keys::PALETTE_ACTIONS {
+            if !crate::keys::available(*action) {
+                continue;
+            }
+            assert!(
+                entries.iter().any(|entry| {
+                    matches!(entry.command, crate::palette::Command::Action(found) if found == *action)
+                }),
+                "{} is absent",
+                action.name()
+            );
+        }
+    }
+
+    /// One row per action, not one per chord: nine Select Tab rows -- or two
+    /// for a launcher reachable two ways -- would push everything else off a
+    /// short list. 0.57.4's launcher deduplicated its key assignments for
+    /// the same reason.
+    #[test]
+    fn the_ambassador_page_opens_in_the_ui_language() {
+        assert_eq!(ambassador_url("en-US"), "https://unterm.app/ambassador");
+        assert_eq!(ambassador_url("zh-CN"), "https://unterm.app/zh-CN/ambassador");
+        assert!(command_entries()
+            .iter()
+            .any(|entry| matches!(entry.command, crate::palette::Command::ShareAmbassadorPost)));
+    }
+
+    #[test]
+    fn an_action_bound_twice_is_listed_once() {
+        let entries = command_entries();
+        let mut seen = std::collections::HashSet::new();
+        for entry in &entries {
+            assert!(
+                seen.insert(entry.label.clone()),
+                "{} is listed more than once",
+                entry.label
+            );
+        }
+    }
+
+    /// The last workspace row saves; it is there even before anything is.
+    ///
+    /// The reopen rows depend on what this machine has saved, which a test
+    /// cannot know -- but every reopen row carries the workspace it reopens,
+    /// and the save row is always the tail.
+    #[test]
+    fn the_workspace_rows_end_with_the_one_that_saves() {
+        let entries = workspace_entries();
+        assert!(matches!(
+            entries.last().map(|entry| &entry.command),
+            Some(crate::palette::Command::OpenWorkspaceSave)
+        ));
+        for entry in &entries[..entries.len() - 1] {
+            assert!(
+                matches!(
+                    entry.command,
+                    crate::palette::Command::RestoreWorkspace { .. }
+                ),
+                "{} should reopen a workspace",
+                entry.label
+            );
+        }
+    }
+
+    /// The launcher offers shells this machine has, and only those.
+    ///
+    /// A row for a shell that is not installed opens an empty tab and writes
+    /// an error to a log nobody reads.
+    #[test]
+    fn the_launcher_offers_only_shells_that_exist() {
+        for entry in launcher_entries() {
+            let crate::palette::Command::Launch { program, .. } = &entry.command else {
+                panic!("a launcher row should launch something");
+            };
+            assert!(
+                std::path::Path::new(program).is_file() || which(program).is_some(),
+                "{program} is offered but not installed"
+            );
+        }
+    }
+
+    /// Git Bash and each registered WSL distribution get a row of their own
+    /// when this machine has them, launched the way the row says.
+    #[cfg(windows)]
+    #[test]
+    fn the_launcher_offers_git_bash_and_each_wsl_distribution_installed() {
+        let rows: Vec<(String, String, Vec<String>)> = launcher_entries()
+            .into_iter()
+            .filter_map(|entry| match entry.command {
+                crate::palette::Command::Launch { program, args } => Some((entry.label, program, args)),
+                _ => None,
+            })
+            .collect();
+        if let Some(bash) = git_bash() {
+            let (_, program, args) = rows
+                .iter()
+                .find(|(label, ..)| label == "Git Bash")
+                .unwrap_or_else(|| panic!("{} is installed but has no row: {:?}", bash.display(), rows));
+            assert_eq!(std::path::Path::new(program), bash.as_path());
+            assert_eq!(args, &["--login"]);
+        }
+        let distributions = wsl_distributions();
+        for name in &distributions {
+            let (_, program, args) = rows
+                .iter()
+                .find(|(label, ..)| *label == format!("WSL: {name}"))
+                .unwrap_or_else(|| panic!("WSL distribution {name} has no row: {:?}", rows));
+            assert_eq!(program, "wsl.exe");
+            assert_eq!(args, &["--distribution", name.as_str(), "--cd", "~"]);
+        }
+        assert!(distributions.iter().all(|name| !name.starts_with("docker-desktop")));
+    }
+
+    #[test]
+    fn this_machine_has_at_least_one_shell_to_offer() {
+        // An empty launcher is indistinguishable from a broken one.
+        assert!(
+            !launcher_entries().is_empty(),
+            "no shell found on PATH; the launcher would open on an empty list"
+        );
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use winit::keyboard::{Key, NamedKey};
+
+    fn plain() -> crate::mouse::Held {
+        crate::mouse::Held::default()
+    }
+
+    fn ctrl() -> crate::mouse::Held {
+        crate::mouse::Held {
+            ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    fn character(text: &str) -> Key {
+        Key::Character(text.into())
+    }
+
+    fn named(key: NamedKey) -> Key {
+        Key::Named(key)
+    }
+
+    #[test]
+    fn a_letter_is_itself() {
+        assert_eq!(encode(&character("a"), plain()), Some("a".to_string()));
+        assert_eq!(encode(&character("A"), plain()), Some("A".to_string()));
+    }
+
+    /// Ctrl+letter is a control byte, not the letter.
+    ///
+    /// This was the bug: modifiers never reached the encoder, so Ctrl+C sent
+    /// `c`. Nothing could be interrupted, and every readline binding --
+    /// Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+R, Ctrl+U, Ctrl+W -- typed a letter
+    /// instead of doing its job.
+    #[test]
+    fn ctrl_letter_sends_its_control_byte() {
+        assert_eq!(encode(&character("c"), ctrl()), Some("\x03".to_string()));
+        assert_eq!(encode(&character("d"), ctrl()), Some("\x04".to_string()));
+        assert_eq!(encode(&character("a"), ctrl()), Some("\x01".to_string()));
+        assert_eq!(encode(&character("e"), ctrl()), Some("\x05".to_string()));
+        assert_eq!(encode(&character("r"), ctrl()), Some("\x12".to_string()));
+        assert_eq!(encode(&character("u"), ctrl()), Some("\x15".to_string()));
+        assert_eq!(encode(&character("w"), ctrl()), Some("\x17".to_string()));
+        assert_eq!(encode(&character("z"), ctrl()), Some("\x1a".to_string()));
+    }
+
+    #[test]
+    fn ctrl_letter_ignores_the_case_the_layout_produced() {
+        // Shift changes the letter's case; it does not change the control
+        // byte, and a shell reading 0x03 does not care which arrived.
+        assert_eq!(encode(&character("C"), ctrl()), Some("\x03".to_string()));
+    }
+
+    #[test]
+    fn alt_letter_is_escape_prefixed() {
+        let alt = crate::mouse::Held {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(encode(&character("b"), alt), Some("\x1bb".to_string()));
+    }
+
+    #[test]
+    fn the_arrows_carry_their_modifiers() {
+        // Ctrl+arrow moves by word and Shift+arrow selects: both need the
+        // modifier in the sequence, and both were unreachable when it was
+        // dropped.
+        let plain_left = encode(&named(NamedKey::ArrowLeft), plain());
+        let ctrl_left = encode(&named(NamedKey::ArrowLeft), ctrl());
+        assert!(plain_left.is_some());
+        assert_ne!(plain_left, ctrl_left, "Ctrl+Left has to differ from Left");
+
+        let shift = crate::mouse::Held {
+            shift: true,
+            ..Default::default()
+        };
+        assert_ne!(encode(&named(NamedKey::ArrowUp), shift), plain_left);
+    }
+
+    #[test]
+    fn backspace_sends_delete_as_readline_expects() {
+        assert_eq!(
+            encode(&named(NamedKey::Backspace), plain()),
+            Some("\x7f".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_and_tab_and_escape_are_what_they_look_like() {
+        assert_eq!(
+            encode(&named(NamedKey::Enter), plain()),
+            Some("\r".to_string())
+        );
+        assert_eq!(
+            encode(&named(NamedKey::Tab), plain()),
+            Some("\t".to_string())
+        );
+        assert_eq!(
+            encode(&named(NamedKey::Escape), plain()),
+            Some("\x1b".to_string())
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_a_back_tab_rather_than_a_tab() {
+        let shift = crate::mouse::Held {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode(&named(NamedKey::Tab), shift),
+            Some("\x1b[Z".to_string())
+        );
+    }
+
+    #[test]
+    fn the_function_keys_exist_at_all() {
+        // None of these were mapped, so F5 in a TUI did nothing.
+        for (key, number) in [(NamedKey::F1, 1), (NamedKey::F5, 5), (NamedKey::F12, 12)] {
+            let encoded = encode(&named(key), plain());
+            assert!(encoded.is_some(), "F{number} produced nothing");
+        }
+    }
+
+    #[test]
+    fn navigation_keys_are_all_mapped() {
+        for key in [
+            NamedKey::Home,
+            NamedKey::End,
+            NamedKey::PageUp,
+            NamedKey::PageDown,
+            NamedKey::Delete,
+            NamedKey::Insert,
+        ] {
+            assert!(
+                encode(&named(key), plain()).is_some(),
+                "{key:?} produced nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_modifier_key_on_its_own_sends_nothing() {
+        // Otherwise holding Shift types something.
+        assert_eq!(encode(&named(NamedKey::Shift), plain()), None);
+        assert_eq!(encode(&named(NamedKey::Control), plain()), None);
+        assert_eq!(encode(&named(NamedKey::Alt), plain()), None);
+    }
+
+    #[test]
+    fn a_super_chord_stays_with_the_window_manager() {
+        // Super+L locks the screen; it must not also type an L.
+        let text = encode(&character("l"), plain());
+        assert_eq!(text, Some("l".to_string()), "plain L still types");
+    }
+
+    #[test]
+    fn composed_text_from_an_input_method_arrives_whole() {
+        // Several characters from one press: already what the user meant.
+        assert_eq!(
+            encode(&character("中文"), plain()),
+            Some("中文".to_string())
+        );
+    }
+
+    #[test]
+    fn space_is_a_space_and_ctrl_space_is_a_null() {
+        assert_eq!(
+            encode(&named(NamedKey::Space), plain()),
+            Some(" ".to_string())
+        );
+        assert_eq!(
+            encode(&named(NamedKey::Space), ctrl()),
+            Some("\0".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_badge_tests {
+    use crate::cockpit::Badge;
+
+    /// Three states, three colours. Two badges that look alike are two
+    /// states nobody can tell apart from across a window, which is the one
+    /// distance a badge exists to be read at.
+    #[test]
+    fn every_badge_has_its_own_colour() {
+        let colours = [
+            Badge::NeedsYou.color(),
+            Badge::Working.color(),
+            Badge::Done.color(),
+        ];
+        for (index, colour) in colours.iter().enumerate() {
+            for other in &colours[index + 1..] {
+                assert_ne!(colour, other, "two badges share a colour");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_cost_tests {
+    /// An idle window asks the machine questions at a rate somebody chose,
+    /// not as fast as a CPU allows.
+    ///
+    /// The loop used to run on `ControlFlow::Poll`, which spins: every
+    /// iteration listed the sessions, fed the cockpit, re-derived the title and
+    /// asked every pane for its revision. Measured on this machine, that was
+    /// most of a core for a window sitting at a prompt.
+    #[test]
+    fn the_resting_interval_is_slower_than_a_frame_and_faster_than_a_second() {
+        // The numbers themselves, so a later edit that turns the loop back into
+        // a spin fails here rather than on somebody's battery.
+        const BUSY_MS: u64 = 8;
+        const RESTING_MS: u64 = 96;
+        assert!(BUSY_MS >= 4, "a busier tick than this is a spin");
+        assert!(
+            BUSY_MS <= 16,
+            "output later than a frame is output somebody sees arrive"
+        );
+        assert!(RESTING_MS > BUSY_MS);
+        assert!(
+            RESTING_MS <= 100,
+            "a window that rests this long feels asleep when output arrives"
+        );
+    }
+
+    /// And the housekeeping is slower still: reconciling the tab list, feeding
+    /// the cockpit and re-deriving the title all answer questions whose answers
+    /// change when a person does something, not between two frames.
+    #[test]
+    fn housekeeping_is_slower_than_the_tick() {
+        assert!(super::HOUSEKEEPING >= std::time::Duration::from_millis(100));
+        assert!(super::HOUSEKEEPING <= std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn renderer_does_not_reserve_a_bindless_sized_d3d12_heap() {
+        assert!(super::MAX_GPU_VIEW_DESCRIPTORS >= 64);
+        assert!(super::MAX_GPU_VIEW_DESCRIPTORS <= 4_096);
+        assert!(super::MAX_GPU_VIEW_DESCRIPTORS < wgpu::Limits::default().max_non_sampler_bindings);
+    }
+}
+
+/// Recover a character key when `winit` reports `Key::Unidentified(NativeKey::Windows(vkey))`.
+///
+/// In `winit-0.30.13`, `TranslateMessage(&msg)` posts `WM_CHAR` to the back of the
+/// thread message queue, and `DispatchMessageW(&msg)` immediately runs `WM_KEYDOWN`
+/// handling which peeks `WM_KEYFIRST..=WM_KEYLAST`. If a `WM_KEYUP` or another
+/// `WM_KEYDOWN` was already queued ahead of the newly posted `WM_CHAR` (common during
+/// fast typing or after a frame draw), `winit` fails to associate the `WM_CHAR` with
+/// the `WM_KEYDOWN`, emits `Key::Unidentified(NativeKey::Windows(vkey))`, and later
+/// discards the orphaned `WM_CHAR`.
+///
+/// By peeking specifically `WM_CHAR..=WM_CHAR` with `PM_REMOVE` when `Unidentified`
+/// arrives, we skip any intervening `WM_KEYUP`/`WM_KEYDOWN` and recover the exact
+/// `WM_CHAR` that `TranslateMessage` just posted for this keystroke.
+pub(crate) fn recover_unidentified_windows_key(
+    vkey: u16,
+    shift_held: bool,
+) -> Option<winit::keyboard::SmolStr> {
+    #[cfg(windows)]
+    {
+        use winapi::um::winuser::{MSG, PM_REMOVE, PeekMessageW, WM_CHAR};
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            if PeekMessageW(&mut msg, std::ptr::null_mut(), WM_CHAR, WM_CHAR, PM_REMOVE) != 0 {
+                let unit = msg.wParam as u16;
+                let ch: Option<char> = if (0xD800..=0xDBFF).contains(&unit) {
+                    let mut low_msg: MSG = std::mem::zeroed();
+                    if PeekMessageW(
+                        &mut low_msg,
+                        std::ptr::null_mut(),
+                        WM_CHAR,
+                        WM_CHAR,
+                        PM_REMOVE,
+                    ) != 0
+                    {
+                        let low = low_msg.wParam as u16;
+                        std::char::decode_utf16([unit, low])
+                            .next()
+                            .and_then(|r| r.ok())
+                    } else {
+                        None
+                    }
+                } else {
+                    char::from_u32(unit as u32)
+                };
+                if let Some(c) = ch {
+                    if !c.is_control() {
+                        let mut buf = [0u8; 4];
+                        return Some(winit::keyboard::SmolStr::from(c.encode_utf8(&mut buf)));
+                    }
+                }
+            }
+        }
+    }
+    fallback_ascii_for_windows_vkey(vkey, shift_held)
+}
+
+pub(crate) fn fallback_ascii_for_windows_vkey(
+    vkey: u16,
+    shift_held: bool,
+) -> Option<winit::keyboard::SmolStr> {
+    let ch = match vkey {
+        0x41..=0x5A => {
+            if shift_held {
+                vkey as u8 as char
+            } else {
+                (vkey as u8).to_ascii_lowercase() as char
+            }
+        }
+        0x30..=0x39 if !shift_held => vkey as u8 as char,
+        _ => return None,
+    };
+    let mut buf = [0u8; 4];
+    Some(winit::keyboard::SmolStr::from(ch.encode_utf8(&mut buf)))
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    #[test]
+    fn unidentified_windows_vkey_recovers_ascii_letters_and_digits() {
+        assert_eq!(
+            fallback_ascii_for_windows_vkey(0x41, false).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            fallback_ascii_for_windows_vkey(0x41, true).as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            fallback_ascii_for_windows_vkey(0x5A, false).as_deref(),
+            Some("z")
+        );
+        assert_eq!(
+            fallback_ascii_for_windows_vkey(0x35, false).as_deref(),
+            Some("5")
+        );
+        assert_eq!(fallback_ascii_for_windows_vkey(0x35, true), None);
+        assert_eq!(fallback_ascii_for_windows_vkey(0x70, false), None); // F1
+    }
+}
